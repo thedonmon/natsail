@@ -4,6 +4,8 @@ NATSail uses Changesets for versions and changelogs. The release workflow publis
 
 The workflow does not use an npm token. npm creates provenance automatically for trusted publication from this public repository.
 
+NATSail used the manual bootstrap path for version `0.1.0`. Trusted publishing is active for later releases.
+
 ## One-time bootstrap
 
 1. Create the npm organization named `natsail` while signed in as `0xdon0`. This organization owns the `@natsail` scope.

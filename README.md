@@ -6,9 +6,9 @@ NATSail provides reliable NATS sessions from the edge to the user interface.
 
 The runtime uses one NATS connection for many logical subscriptions. Core NATS works without JetStream. JetStream support is an optional package.
 
-Package names and interfaces can change before the first release.
+The packages use version `0.x`. Their interfaces can change before version `1.0.0`.
 
-The source repository is public. The six packages are public-release candidates at version `0.0.0`, but they are not published yet.
+The source repository is public. All six packages are available on npm at version `0.1.0`.
 
 See the [resumable-stream research](docs/research/nats-resumable-streams.md) and [architecture proposal](docs/architecture/nats-resumable-streams-proposal.md) for the design evidence.
 
@@ -47,7 +47,7 @@ See the [resumable-stream research](docs/research/nats-resumable-streams.md) and
 | Guided shadcn workbenches with visible proof receipts   | Example     |
 | Native AI SDK `ChatTransport` over Core and JetStream   | Example     |
 | Native TanStack AI adapter over Core and JetStream      | Example     |
-| Public npm metadata and tarball installation            | Tested      |
+| Six public npm packages and tarball installation        | Released    |
 
 The integration tests use NATS 2.14.4. Separate fixtures cover anonymous, token, user/password, NKey, operator JWT, and TLS connections.
 
@@ -63,14 +63,14 @@ The integration tests use NATS 2.14.4. Separate fixtures cover anonymous, token,
 
 ## Packages
 
-| Package                | Purpose                                    | Required dependencies                                  |
-| ---------------------- | ------------------------------------------ | ------------------------------------------------------ |
-| `@natsail/core`        | Shared runtime and Core NATS subscriptions | `@nats-io/nats-core`                                   |
-| `@natsail/checkpoints` | Memory and IndexedDB checkpoint stores     | None                                                   |
-| `@natsail/jetstream`   | Ordered JetStream replay and resume        | Core package, checkpoint package, `@nats-io/jetstream` |
-| `@natsail/session`     | Keyed session sharing and lifecycle        | Core package                                           |
-| `@natsail/react`       | React provider, status, and session hooks  | Core, session package, React peer                      |
-| `@natsail/rxjs`        | Runtime and session Observable bindings    | Core, session package, RxJS peer                       |
+| Package                                                                      | Purpose                                    | Required dependencies                                  |
+| ---------------------------------------------------------------------------- | ------------------------------------------ | ------------------------------------------------------ |
+| [`@natsail/core`](https://www.npmjs.com/package/@natsail/core)               | Shared runtime and Core NATS subscriptions | `@nats-io/nats-core`                                   |
+| [`@natsail/checkpoints`](https://www.npmjs.com/package/@natsail/checkpoints) | Memory and IndexedDB checkpoint stores     | None                                                   |
+| [`@natsail/jetstream`](https://www.npmjs.com/package/@natsail/jetstream)     | Ordered JetStream replay and resume        | Core package, checkpoint package, `@nats-io/jetstream` |
+| [`@natsail/session`](https://www.npmjs.com/package/@natsail/session)         | Keyed session sharing and lifecycle        | Core package                                           |
+| [`@natsail/react`](https://www.npmjs.com/package/@natsail/react)             | React provider, status, and session hooks  | Core, session package, React peer                      |
+| [`@natsail/rxjs`](https://www.npmjs.com/package/@natsail/rxjs)               | Runtime and session Observable bindings    | Core, session package, RxJS peer                       |
 
 Applications install only the packages that they use.
 
@@ -88,7 +88,7 @@ Each package sets `sideEffects` to `false`. Each package also has a separate exp
 
 A React application can install both adapter packages. Neither adapter owns the NATS connection, checkpoints, or the logical-session registry. Those features stay in a framework-neutral module below both adapters. React hooks and RxJS Observables can then attach to the same logical session without opening duplicate NATS consumers.
 
-The first release does not need a React–RxJS bridge package. A bridge earns a package only after repeated integration logic appears in more than one application.
+The `0.1.x` package set does not include a React–RxJS bridge. A bridge earns a package after repeated integration logic appears in multiple applications.
 
 The local Wrangler proof passes with official NATS `wsconnect()` and with the official Node transport on Cloudflare's current `node:net` compatibility layer. NATSail does not need a custom Cloudflare transport package yet.
 
@@ -411,13 +411,13 @@ The current packages solve client runtime, replay, checkpoint, session, React, a
 | Cloudflare transport         | Official NATS WebSocket and Node TCP transports in local workerd.                                               | Remote endpoint, production authentication, and Workers VPC validation.                                   |
 | Cross-tab connection sharing | A `SharedWorker` harness proves that two tabs can share one connection.                                         | A supported browser-broker protocol with defined authentication, lifecycle, and failure behavior.         |
 | Adapter ergonomics           | Direct Core NATS helpers for React and RxJS; framework-neutral sessions can wrap JetStream or other sources.    | Direct JetStream convenience helpers and a full RxJS application example.                                 |
-| Package availability         | Public package metadata, Changesets, installable tarballs, and gated trusted-publishing automation.             | Published `@natsail/*` versions until the npm organization and first release are complete.                |
+| Package availability         | Six public packages at `0.1.0`, Changesets versioning, and active trusted-publishing automation.                | A completed OIDC publication and npm provenance record. Version `0.1.0` used the manual bootstrap path.   |
 
 These boundaries define the next proofs. They do not block continued experimentation in the examples and prototypes.
 
 ## Roadmap
 
-1. Create the `natsail` npm organization, publish the six packages at version `0.1.0`, register `release.yml` as their trusted publisher, and enable release automation.
+1. Use the next consumer-visible change to prove OIDC publication. Confirm the npm provenance records, package tags, and GitHub releases.
 2. Prove a separate named durable-consumer API with explicit acknowledgement, redelivery, ownership, and shutdown semantics. Keep `consumeJetStream()` focused on ordered replay.
 3. Add a full-page AI recovery scenario that restores framework state and resumes after the last processed checkpoint.
 4. Prove an atomic client catch-up-to-live handoff in the Durable Object gateway. Add authentication, byte limits, backpressure, forced-eviction tests, and cost measurements before package promotion.
