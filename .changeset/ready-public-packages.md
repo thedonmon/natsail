@@ -7,4 +7,4 @@
 '@natsail/session': minor
 ---
 
-Prepare the first public NATSail package set with npm metadata, verified tarballs, Changesets versioning, and provenance-aware release automation.
+Prepare the first public NATSail package set with npm metadata, verified tarballs, Changesets versioning, bootstrap publication, and provenance-aware release automation.

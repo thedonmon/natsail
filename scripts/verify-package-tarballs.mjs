@@ -63,7 +63,12 @@ try {
     assert.equal(manifest.name, packageInfo.name)
     assert.notEqual(manifest.private, true)
     assert.equal(manifest.publishConfig?.access, 'public')
-    assert.equal(manifest.publishConfig?.provenance, true)
+    assert.equal(manifest.publishConfig?.registry, 'https://registry.npmjs.org/')
+    assert.equal(manifest.repository?.url, 'git+https://github.com/thedonmon/natsail.git')
+    assert(
+      !Object.hasOwn(manifest.publishConfig ?? {}, 'provenance'),
+      `${packageInfo.name} must allow the manual bootstrap publication`
+    )
 
     for (const dependencyGroup of ['dependencies', 'optionalDependencies', 'peerDependencies']) {
       for (const version of Object.values(manifest[dependencyGroup] ?? {})) {

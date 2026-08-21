@@ -32,14 +32,13 @@ describe('package publishing', () => {
     expect(manifest.types).toBe('./dist/index.d.ts')
     expect(manifest.repository).toEqual({
       type: 'git',
-      url: 'https://github.com/thedonmon/natsail.git',
+      url: 'git+https://github.com/thedonmon/natsail.git',
       directory: `packages/${directory}`,
     })
     expect(manifest.homepage).toContain('https://github.com/thedonmon/natsail/')
     expect(manifest.bugs?.url).toBe('https://github.com/thedonmon/natsail/issues')
     expect(manifest.publishConfig).toEqual({
       access: 'public',
-      provenance: true,
       registry: 'https://registry.npmjs.org/',
     })
     expect(manifest.scripts?.prepack).toBe('pnpm build')

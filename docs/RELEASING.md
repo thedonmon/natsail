@@ -8,21 +8,29 @@ The workflow does not use an npm token. npm creates provenance automatically for
 
 1. Create the npm organization named `natsail` while signed in as `0xdon0`. This organization owns the `@natsail` scope.
 2. Keep `0xdon0` as an organization owner for the first publication.
-3. Mark the Changesets version pull request as ready, and merge it after its checks pass.
-4. Use a clean checkout of the new `main` commit.
-5. Install the exact workspace dependencies.
+3. Refresh the npm login for the owner account.
+
+   ```sh
+   npm login --auth-type=web
+   npm whoami
+   npm org ls natsail 0xdon0
+   ```
+
+4. Mark the Changesets version pull request as ready, and merge it after its checks pass.
+5. Use a clean checkout of the new `main` commit.
+6. Install the exact workspace dependencies.
 
    ```sh
    pnpm install --frozen-lockfile
    ```
 
-6. Run the complete release test.
+7. Run the complete release test.
 
    ```sh
    pnpm release:check
    ```
 
-7. Publish the first package versions with an npm account that uses two-factor authentication.
+8. Publish the first package versions with an npm account that uses two-factor authentication.
 
    ```sh
    npm whoami
@@ -30,20 +38,23 @@ The workflow does not use an npm token. npm creates provenance automatically for
    git push --follow-tags
    ```
 
-8. Open the settings for each published package on npm.
-9. Add a GitHub Actions trusted publisher with these exact values:
-   - Organization or user: `thedonmon`
-   - Repository: `natsail`
-   - Workflow filename: `release.yml`
-   - Allowed action: `npm publish`
+   The manual bootstrap publication does not include provenance. Trusted publications add provenance automatically.
 
-10. Enable automated publication in the GitHub repository.
+9. Open the settings for each published package on npm.
+10. Add a GitHub Actions trusted publisher with these exact values:
+    - Organization or user: `thedonmon`
+    - Repository: `natsail`
+    - Workflow filename: `release.yml`
+    - Environment name: leave blank
+    - Allowed action: `npm publish`
+
+11. Enable automated publication in the GitHub repository.
 
     ```sh
     gh variable set NPM_RELEASES_ENABLED --body true --repo thedonmon/natsail
     ```
 
-11. Set each npm package to require two-factor authentication and disallow tokens.
+12. Set each npm package to require two-factor authentication and disallow tokens.
 
 Read the [npm trusted-publishing guide](https://docs.npmjs.com/trusted-publishers/) before you configure the package settings.
 
@@ -72,7 +83,7 @@ The publish step requires all of these conditions:
 - The workflow runs from `main` on a GitHub-hosted runner.
 - The workflow has `id-token: write` permission.
 - Each package trusts `release.yml` on npm.
-- The package repository URL matches `https://github.com/thedonmon/natsail.git`.
+- Each package repository URL is `git+https://github.com/thedonmon/natsail.git`.
 
 If a publication stops after some packages succeed, do not change those versions. Correct the failure and run the workflow again.
 
