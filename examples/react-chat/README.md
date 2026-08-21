@@ -1,6 +1,6 @@
 # React rooms/chat example
 
-> PRIVATE EXAMPLE — repository application that uses `@natsail/react` directly. It is not published.
+> REPOSITORY EXAMPLE — included in the public repository. It is not published as an npm package.
 
 ## Run
 

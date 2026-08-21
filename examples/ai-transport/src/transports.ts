@@ -3,14 +3,15 @@ import type { ModelMessage, StreamChunk } from '@tanstack/ai'
 import type { UIMessage as TanStackUIMessage } from '@tanstack/ai-client'
 import type { RunAgentInputContext, SubscribeConnectionAdapter } from '@tanstack/ai-react'
 
-import { createMemoryCheckpointStore } from '@natsail/checkpoints'
+import { createIndexedDbCheckpointStore } from '@natsail/checkpoints'
 import type { NatsRuntime, SubscriptionLease } from '@natsail/core'
 import { consumeJetStream, type JetStreamDuplicateDeliveryPolicy } from '@natsail/jetstream'
+import { clearActiveRun, loadActiveRun, saveActiveRun } from './chat-persistence'
 
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
 const requestSubject = 'natsail.examples.ai.requests'
-const checkpoints = createMemoryCheckpointStore()
+const checkpoints = createIndexedDbCheckpointStore({ databaseName: 'natsail-ai-example' })
 
 export const aiResponseStream = 'NATSAIL_AI_RESPONSES'
 export const aiResponseStreamSubjects = 'natsail.examples.ai.responses.jetstream.>'
@@ -28,6 +29,17 @@ export interface TransportReceipt {
   duplicate?: boolean
   publishedAt?: number
 }
+
+export type PageRecoveryStrategy = 'full-run-replay' | 'checkpoint-continuation'
+
+export interface PageRecoveryState {
+  phase: 'idle' | 'restoring' | 'restored'
+  strategy?: PageRecoveryStrategy
+  checkpointSequence?: number
+  firstRecoveredSequence?: number
+}
+
+export type PageRecoveryListener = (state: PageRecoveryState) => void
 
 interface WireChunkFrame {
   type: 'chunk'
@@ -80,12 +92,17 @@ export interface JetStreamTransportOptions {
   maxBufferedMessages?: number
 }
 
+type JetStreamSubscriptionMode = 'checkpoint' | 'full-run-replay'
+
+const checkpointKey = (replySubject: string): string => `ai-chat:${replySubject}`
+
 const subscribeToFrames = (
   runtime: NatsRuntime,
   delivery: DeliveryKind,
   replySubject: string,
   jetStreamOptions: JetStreamTransportOptions,
-  handler: (frame: WireFrame, metadata: DeliveryMetadata) => void | Promise<void>
+  handler: (frame: WireFrame, metadata: DeliveryMetadata) => void | Promise<void>,
+  mode: JetStreamSubscriptionMode = 'checkpoint'
 ): SubscriptionLease => {
   if (delivery === 'core') {
     return runtime.subscribe<WireFrame>(
@@ -102,13 +119,17 @@ const subscribeToFrames = (
     {
       stream: aiResponseStream,
       filter: replySubject,
-      start: 'new',
+      start: mode === 'full-run-replay' ? 'all' : 'new',
       maxBufferedMessages: jetStreamOptions.maxBufferedMessages ?? 128,
       duplicateDeliveryPolicy: jetStreamOptions.duplicateDeliveryPolicy ?? 'drop',
-      resume: {
-        key: `ai-chat:${replySubject}`,
-        store: checkpoints,
-      },
+      ...(mode === 'checkpoint'
+        ? {
+            resume: {
+              key: checkpointKey(replySubject),
+              store: checkpoints,
+            },
+          }
+        : {}),
       decode: (message) => decodeWireFrame(message.data),
     },
     (frame) =>
@@ -133,7 +154,8 @@ export class NatsAiSdkChatTransport<UI_MESSAGE extends UIMessage = UIMessage>
     private readonly clientId: string,
     private readonly delivery: DeliveryKind,
     private readonly jetStreamOptions: JetStreamTransportOptions = {},
-    private readonly onReceipt?: (receipt: TransportReceipt) => void
+    private readonly onReceipt?: (receipt: TransportReceipt) => void,
+    private readonly onPageRecovery?: PageRecoveryListener
   ) {}
 
   sendMessages = async (
@@ -171,6 +193,7 @@ export class NatsAiSdkChatTransport<UI_MESSAGE extends UIMessage = UIMessage>
             return
           }
           if (frame.type === 'error') {
+            clearActiveRun('ai-sdk', this.delivery)
             controller.error(new Error(frame.message))
             void release().catch(() => undefined)
             return
@@ -184,6 +207,7 @@ export class NatsAiSdkChatTransport<UI_MESSAGE extends UIMessage = UIMessage>
             ...metadata,
             ...(frame.publishedAt === undefined ? {} : { publishedAt: frame.publishedAt }),
           })
+          clearActiveRun('ai-sdk', this.delivery)
           controller.close()
           void release().catch(() => undefined)
         }
@@ -221,6 +245,15 @@ export class NatsAiSdkChatTransport<UI_MESSAGE extends UIMessage = UIMessage>
             event: options.trigger,
             subject: requestSubject,
           })
+          if (this.delivery === 'jetstream') {
+            saveActiveRun({
+              framework: 'ai-sdk',
+              delivery: this.delivery,
+              chatId: options.chatId,
+              replySubject,
+              startedAt: Date.now(),
+            })
+          }
           await this.runtime.publish(
             requestSubject,
             encoder.encode(
@@ -238,6 +271,7 @@ export class NatsAiSdkChatTransport<UI_MESSAGE extends UIMessage = UIMessage>
             )
           )
         } catch (error) {
+          clearActiveRun('ai-sdk', this.delivery)
           controller.error(error)
           void release().catch(() => undefined)
         }
@@ -251,7 +285,109 @@ export class NatsAiSdkChatTransport<UI_MESSAGE extends UIMessage = UIMessage>
     await this.interruptStream(durationMs)
   }
 
-  reconnectToStream = async (): Promise<ReadableStream<UIMessageChunk> | null> => null
+  reconnectToStream = async ({
+    chatId,
+    abortSignal,
+  }: {
+    chatId: string
+    abortSignal?: AbortSignal
+  }): Promise<ReadableStream<UIMessageChunk> | null> => {
+    if (this.delivery !== 'jetstream') return null
+    const activeRun = loadActiveRun('ai-sdk', this.delivery)
+    if (!activeRun || activeRun.chatId !== chatId) return null
+
+    const checkpoint = await checkpoints.load(checkpointKey(activeRun.replySubject))
+    let firstRecoveredSequence: number | undefined
+    this.onPageRecovery?.({
+      phase: 'restoring',
+      strategy: 'full-run-replay',
+      ...(checkpoint ? { checkpointSequence: checkpoint.sequence } : {}),
+    })
+
+    return new ReadableStream<UIMessageChunk>({
+      start: async (controller) => {
+        let lease: SubscriptionLease | undefined
+        let finished = false
+        let abortListener: (() => void) | undefined
+        const release = async () => {
+          if (finished) return
+          finished = true
+          if (abortListener) abortSignal?.removeEventListener('abort', abortListener)
+          await lease?.close()
+        }
+        const finishRecovery = () => {
+          clearActiveRun('ai-sdk', this.delivery)
+          this.onPageRecovery?.({
+            phase: 'restored',
+            strategy: 'full-run-replay',
+            ...(checkpoint ? { checkpointSequence: checkpoint.sequence } : {}),
+            ...(firstRecoveredSequence === undefined ? {} : { firstRecoveredSequence }),
+          })
+        }
+
+        try {
+          lease = subscribeToFrames(
+            this.runtime,
+            this.delivery,
+            activeRun.replySubject,
+            this.jetStreamOptions,
+            (frame, metadata) => {
+              if (firstRecoveredSequence === undefined && metadata.sequence !== undefined) {
+                firstRecoveredSequence = metadata.sequence
+                this.onPageRecovery?.({
+                  phase: 'restoring',
+                  strategy: 'full-run-replay',
+                  ...(checkpoint ? { checkpointSequence: checkpoint.sequence } : {}),
+                  firstRecoveredSequence,
+                })
+              }
+              if (frame.type === 'chunk') {
+                const chunk = frame.chunk as UIMessageChunk
+                this.onReceipt?.({
+                  framework: 'ai-sdk',
+                  delivery: this.delivery,
+                  direction: 'receive',
+                  event: eventType(chunk),
+                  subject: activeRun.replySubject,
+                  ...metadata,
+                  ...(frame.publishedAt === undefined ? {} : { publishedAt: frame.publishedAt }),
+                })
+                controller.enqueue(chunk)
+              } else if (frame.type === 'error') {
+                clearActiveRun('ai-sdk', this.delivery)
+                controller.error(new Error(frame.message))
+                void release().catch(() => undefined)
+              } else {
+                this.onReceipt?.({
+                  framework: 'ai-sdk',
+                  delivery: this.delivery,
+                  direction: 'complete',
+                  event: 'page recovery complete',
+                  subject: activeRun.replySubject,
+                  ...metadata,
+                  ...(frame.publishedAt === undefined ? {} : { publishedAt: frame.publishedAt }),
+                })
+                finishRecovery()
+                controller.close()
+                void release().catch(() => undefined)
+              }
+            },
+            'full-run-replay'
+          )
+          await lease.ready
+          if (abortSignal?.aborted) throw abortError()
+          abortListener = () => {
+            controller.error(abortError())
+            void release().catch(() => undefined)
+          }
+          abortSignal?.addEventListener('abort', abortListener, { once: true })
+        } catch (error) {
+          controller.error(error)
+          void release().catch(() => undefined)
+        }
+      },
+    })
+  }
 }
 
 class AsyncEventQueue<T> {
@@ -296,25 +432,64 @@ export class NatsTanStackConnection implements SubscribeConnectionAdapter {
   private readonly replySubject: string
   private lease: SubscriptionLease | undefined
   private ready: Promise<void> | undefined
+  private pageRecoveryActive: boolean
+  private recoveryCheckpointSequence: number | undefined
+  private firstRecoveredSequence: number | undefined
 
   constructor(
     private readonly runtime: NatsRuntime,
     clientId: string,
+    private readonly chatId: string,
     private readonly delivery: DeliveryKind,
     private readonly jetStreamOptions: JetStreamTransportOptions = {},
-    private readonly onReceipt?: (receipt: TransportReceipt) => void
+    private readonly onReceipt?: (receipt: TransportReceipt) => void,
+    private readonly onPageRecovery?: PageRecoveryListener
   ) {
     this.replySubject = `natsail.examples.ai.responses.${delivery}.tanstack-ai.${clientId}`
+    const activeRun = loadActiveRun('tanstack-ai', delivery)
+    this.pageRecoveryActive =
+      delivery === 'jetstream' &&
+      activeRun?.chatId === chatId &&
+      activeRun.replySubject === this.replySubject
   }
 
   private ensureSubscription(): Promise<void> {
     if (this.ready) return this.ready
+    this.ready = this.openSubscription()
+    return this.ready
+  }
+
+  private async openSubscription(): Promise<void> {
+    if (this.pageRecoveryActive) {
+      const checkpoint = await checkpoints.load(checkpointKey(this.replySubject))
+      this.recoveryCheckpointSequence = checkpoint?.sequence
+      this.onPageRecovery?.({
+        phase: 'restoring',
+        strategy: 'checkpoint-continuation',
+        ...(checkpoint ? { checkpointSequence: checkpoint.sequence } : {}),
+      })
+    }
     this.lease = subscribeToFrames(
       this.runtime,
       this.delivery,
       this.replySubject,
       this.jetStreamOptions,
       (frame, metadata) => {
+        if (
+          this.pageRecoveryActive &&
+          this.firstRecoveredSequence === undefined &&
+          metadata.sequence !== undefined
+        ) {
+          this.firstRecoveredSequence = metadata.sequence
+          this.onPageRecovery?.({
+            phase: 'restoring',
+            strategy: 'checkpoint-continuation',
+            ...(this.recoveryCheckpointSequence === undefined
+              ? {}
+              : { checkpointSequence: this.recoveryCheckpointSequence }),
+            firstRecoveredSequence: this.firstRecoveredSequence,
+          })
+        }
         if (frame.type === 'chunk') {
           const chunk = frame.chunk as StreamChunk
           this.onReceipt?.({
@@ -328,6 +503,7 @@ export class NatsTanStackConnection implements SubscribeConnectionAdapter {
           })
           this.queue.push(chunk)
         } else if (frame.type === 'error') {
+          clearActiveRun('tanstack-ai', this.delivery)
           this.queue.fail(new Error(frame.message))
         } else {
           this.onReceipt?.({
@@ -339,12 +515,25 @@ export class NatsTanStackConnection implements SubscribeConnectionAdapter {
             ...metadata,
             ...(frame.publishedAt === undefined ? {} : { publishedAt: frame.publishedAt }),
           })
+          clearActiveRun('tanstack-ai', this.delivery)
+          if (this.pageRecoveryActive) {
+            this.pageRecoveryActive = false
+            this.onPageRecovery?.({
+              phase: 'restored',
+              strategy: 'checkpoint-continuation',
+              ...(this.recoveryCheckpointSequence === undefined
+                ? {}
+                : { checkpointSequence: this.recoveryCheckpointSequence }),
+              ...(this.firstRecoveredSequence === undefined
+                ? {}
+                : { firstRecoveredSequence: this.firstRecoveredSequence }),
+            })
+          }
         }
       }
     )
     this.lease.closed.catch((error) => this.queue.fail(error))
-    this.ready = this.lease.ready
-    return this.ready
+    await this.lease.ready
   }
 
   interruptActiveStream = async (durationMs: number): Promise<void> => {
@@ -390,21 +579,35 @@ export class NatsTanStackConnection implements SubscribeConnectionAdapter {
       event: 'send',
       subject: requestSubject,
     })
-    await this.runtime.publish(
-      requestSubject,
-      encoder.encode(
-        JSON.stringify({
-          framework: 'tanstack-ai',
-          delivery: this.delivery,
-          replySubject: this.replySubject,
-          payload: {
-            messages,
-            data,
-            runContext,
-          },
-        })
+    if (this.delivery === 'jetstream') {
+      saveActiveRun({
+        framework: 'tanstack-ai',
+        delivery: this.delivery,
+        chatId: this.chatId,
+        replySubject: this.replySubject,
+        startedAt: Date.now(),
+      })
+    }
+    try {
+      await this.runtime.publish(
+        requestSubject,
+        encoder.encode(
+          JSON.stringify({
+            framework: 'tanstack-ai',
+            delivery: this.delivery,
+            replySubject: this.replySubject,
+            payload: {
+              messages,
+              data,
+              runContext,
+            },
+          })
+        )
       )
-    )
+    } catch (error) {
+      clearActiveRun('tanstack-ai', this.delivery)
+      throw error
+    }
   }
 
   close = async (): Promise<void> => {

@@ -1,4 +1,4 @@
-// PRIVATE EXAMPLE — real-browser proof for the direct @natsail/react rooms app.
+// REPOSITORY EXAMPLE — real-browser proof for the direct @natsail/react rooms app.
 
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'

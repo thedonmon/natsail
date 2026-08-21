@@ -1,4 +1,4 @@
-// PRIVATE EXAMPLE — real-browser verification for the AI chat experience.
+// REPOSITORY EXAMPLE — real-browser verification for the AI chat experience.
 
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
@@ -37,6 +37,20 @@ const stop = async (child) => {
   child.kill('SIGTERM')
   await Promise.race([exited, delay(6_000)])
   if (child.exitCode === null) child.kill('SIGKILL')
+}
+
+const reloadDuringReply = async (page) => {
+  const reload = page.getByRole('button', { name: 'Reload page mid-reply' })
+  await expect(reload).toBeEnabled({ timeout: 10_000 })
+  await Promise.all([page.waitForNavigation({ waitUntil: 'domcontentloaded' }), reload.click()])
+  await expect(page.getByText('Online', { exact: true })).toBeVisible({ timeout: 10_000 })
+}
+
+const expectPageRecovery = async (page, strategy) => {
+  const recovered = page.locator('[data-page-recovery="restored"]')
+  await expect(recovered).toBeVisible({ timeout: 15_000 })
+  await expect(recovered).toHaveAttribute('data-recovery-strategy', strategy)
+  return recovered
 }
 
 let output = ''
@@ -94,11 +108,17 @@ try {
   await page.screenshot({ path: screenshot })
 
   await page.getByRole('button', { name: reconnectPrompt }).click()
+  await reloadDuringReply(page)
+  const aiSdkPageRecovery = await expectPageRecovery(page, 'full-run-replay')
+  await expect(aiSdkPageRecovery).toHaveAttribute('data-checkpoint-sequence', /^\d+$/)
+  await expect(aiSdkPageRecovery).toHaveAttribute('data-first-recovered-sequence', /^\d+$/)
   await expect(
     page.getByText(/ordered consumer resumes strictly after its last processed cursor/)
   ).toBeVisible({
     timeout: 15_000,
   })
+  await expect(page.getByText(reconnectPrompt, { exact: true })).toHaveCount(1)
+  await expect(page.getByRole('textbox', { name: 'Message NATSail Assistant' })).toBeEnabled()
 
   await page.locator('details.chat-developer > summary').click()
   await expect(page.getByText('Native chunks', { exact: true })).toBeVisible()
@@ -118,16 +138,23 @@ try {
   await expect(page.getByText(/JetStream · sequence \d+/)).toHaveCount(3)
   await page.getByRole('button', { name: 'TanStack AI' }).click()
   await page.getByRole('button', { name: gatewayPrompt }).click()
-  const tanStackReconnect = page.getByRole('button', { name: 'Run recovery test' })
-  await expect(tanStackReconnect).toBeEnabled({ timeout: 10_000 })
-  await tanStackReconnect.click()
-  await expect(page.locator('[data-reconnect-state="reconnected"]')).toHaveAttribute(
-    'data-retained-frames',
-    /^[1-9]\d*$/
+  await reloadDuringReply(page)
+  const tanStackPageRecovery = await expectPageRecovery(page, 'checkpoint-continuation')
+  const checkpointSequence = Number(
+    await tanStackPageRecovery.getAttribute('data-checkpoint-sequence')
   )
+  const firstRecoveredSequence = Number(
+    await tanStackPageRecovery.getAttribute('data-first-recovered-sequence')
+  )
+  if (!Number.isSafeInteger(checkpointSequence) || firstRecoveredSequence <= checkpointSequence) {
+    throw new Error(
+      `TanStack recovery did not continue strictly after its checkpoint: ${checkpointSequence} -> ${firstRecoveredSequence}`
+    )
+  }
   await expect(page.getByText(/without asking the user to reload\./)).toBeVisible({
     timeout: 15_000,
   })
+  await expect(page.getByText(gatewayPrompt, { exact: true })).toHaveCount(1)
   await expect(page.getByText('Delivered', { exact: true })).toBeVisible()
 
   await page.locator('details.chat-developer > summary').click()
@@ -146,6 +173,8 @@ try {
           'AI SDK receives the complete retained stream after its ordered consumer reconnects',
           'TanStack AI receives the same native stream shape through an ordered consumer',
           'the transcript remains intact while retained chunks cross the disconnected gap',
+          'AI SDK restores persisted messages and rebuilds an active answer by replaying its retained native run',
+          'TanStack AI restores persisted messages and continues strictly after its IndexedDB checkpoint',
           'the app loads earlier conversation messages from stream sequence history',
           'a random local message can be injected into the live conversation stream',
           'AckPolicy.None and duplicate-policy configuration are explicit',
@@ -153,7 +182,7 @@ try {
           'the deterministic responder needs no model, route, API key, or network API',
         ],
         currentBoundary:
-          'active-run gap recovery is proven; full page reload still needs persisted framework and run state',
+          'AI SDK needs full retained-run replay to reconstruct transient part state; TanStack AI can continue after the raw checkpoint',
         screenshot,
       },
       null,

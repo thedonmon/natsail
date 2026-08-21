@@ -47,6 +47,7 @@ See the [resumable-stream research](docs/research/nats-resumable-streams.md) and
 | Guided shadcn workbenches with visible proof receipts   | Example     |
 | Native AI SDK `ChatTransport` over Core and JetStream   | Example     |
 | Native TanStack AI adapter over Core and JetStream      | Example     |
+| Full-page AI reply recovery with persisted chat state   | Example     |
 | Six public npm packages and tarball installation        | Released    |
 
 The integration tests use NATS 2.14.4. Separate fixtures cover anonymous, token, user/password, NKey, operator JWT, and TLS connections.
@@ -96,9 +97,17 @@ The [Durable Object gateway prototype](prototypes/cloudflare-durable-object-gate
 
 The [gateway chat example](examples/gateway-chat/README.md) exercises that path in a real TanStack application. One tab disconnects, another publishes, and the stale tab applies its missing retained delivery before rejoining the shared live feed. This behavior belongs in a separate Cloudflare package because it owns lifecycle, cost, authorization, multiplexing, and downstream replay policy.
 
-The [direct React chat example](examples/react-chat/README.md) uses `NatsProvider`, `useNatsRuntimeStatus()`, and `useNatsCoreSubscriptionReducer()` against the local NATS WebSocket without the gateway. Both rooms applications use a guided private [chat UI package](examples/chat-ui/README.md) built from shadcn primitives.
+The [direct React chat example](examples/react-chat/README.md) uses `NatsProvider`, `useNatsRuntimeStatus()`, and `useNatsCoreSubscriptionReducer()` against the local NATS WebSocket. Both rooms applications use the repository [chat UI package](examples/chat-ui/README.md), which contains shadcn primitives.
 
-The private [AI chat example](examples/ai-transport/README.md) is a real multi-turn conversation that loads earlier messages from a JetStream conversation subject and carries native AI SDK `UIMessageChunk` or TanStack AI AG-UI reply events through Core NATS or JetStream. Each framework's real `useChat` hook owns the active message state. **Run recovery test** pauses and recreates the ordered reply consumer from its processed checkpoint while the responder keeps publishing, making retained-frame recovery visible for two seconds. The collapsed details panel can inject a random live stream message, compare global history/reply sequences, and select the duplicate policy. Core remains available as the live-only comparison. The deterministic responder uses `@shadcn/helpers`, so no model, external API, route, or key is required. Nothing under `examples/` is published.
+The repository [AI chat example](examples/ai-transport/README.md) loads earlier messages from a JetStream conversation subject. Native AI SDK or TanStack AI events carry each new answer.
+
+The **Run recovery test** action pauses and recreates the ordered consumer. The **Reload page mid-reply** action restores the complete chat after a page reload.
+
+AI SDK rebuilds the active answer from its retained native run. TanStack AI continues after its IndexedDB checkpoint.
+
+Core NATS remains the live-only comparison. The deterministic responder uses `@shadcn/helpers`, so no model, route, external API, or API key is necessary.
+
+The public repository contains all examples. The workspace does not publish them as npm packages.
 
 ```text
 application
@@ -171,7 +180,9 @@ Run the real chat example over the AI SDK and TanStack AI transports:
 pnpm example:ai-transport
 ```
 
-Open <http://127.0.0.1:4176>, watch the earlier conversation load from JetStream, send the suggested message, and click **Run recovery test** while the answer is streaming. The optional **Transport details** panel switches frameworks, compares JetStream with Core, configures duplicates, and injects a random stream message.
+Open <http://127.0.0.1:4176> and send the suggested message. During the answer, select **Run recovery test** or **Reload page mid-reply**.
+
+The optional **Transport details** panel changes frameworks, compares JetStream with Core NATS, configures duplicates, and injects a random stream message.
 
 Each command starts the local NATS fixtures when necessary and stops only fixtures that it started. See the [examples index](examples/README.md) for the behavioral difference.
 
@@ -402,16 +413,16 @@ The session key identifies the source configuration. If the source configuration
 
 The current packages solve client runtime, replay, checkpoint, session, React, and RxJS concerns. They do not yet solve every delivery or deployment model.
 
-| Boundary                     | Supported now                                                                                                   | Not supported yet                                                                                         |
-| ---------------------------- | --------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| JetStream consumer model     | Ordered consumers, `AckPolicy.None`, application checkpoints, duplicate policies, and retention-gap detection.  | Named durable consumers, explicit server acknowledgements, redelivery controls, and work-queue ownership. |
-| Checkpoint coordination      | Monotonic memory and IndexedDB checkpoints for one client-side backing store.                                   | Distributed coordination between multiple writers or a server-owned acknowledgement record.               |
-| Framework stream restoration | The AI example recreates a consumer from its processed checkpoint while the page stays open.                    | Complete AI SDK or TanStack AI message and run restoration after a page reload.                           |
-| Cloudflare gateway           | Local Durable Object fan-out, storage-backed upstream checkpoints, restart replay, and bounded client catch-up. | A published gateway package with production authentication, backpressure, eviction, and cost policy.      |
-| Cloudflare transport         | Official NATS WebSocket and Node TCP transports in local workerd.                                               | Remote endpoint, production authentication, and Workers VPC validation.                                   |
-| Cross-tab connection sharing | A `SharedWorker` harness proves that two tabs can share one connection.                                         | A supported browser-broker protocol with defined authentication, lifecycle, and failure behavior.         |
-| Adapter ergonomics           | Direct Core NATS helpers for React and RxJS; framework-neutral sessions can wrap JetStream or other sources.    | Direct JetStream convenience helpers and a full RxJS application example.                                 |
-| Package availability         | Six public packages at `0.1.0`, Changesets versioning, and active trusted-publishing automation.                | A completed OIDC publication and npm provenance record. Version `0.1.0` used the manual bootstrap path.   |
+| Boundary                     | Supported now                                                                                                                                                          | Not supported yet                                                                                                                        |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| JetStream consumer model     | Ordered consumers, `AckPolicy.None`, application checkpoints, duplicate policies, and retention-gap detection.                                                         | Named durable consumers, explicit server acknowledgements, redelivery controls, and work-queue ownership.                                |
+| Checkpoint coordination      | Monotonic memory and IndexedDB checkpoints for one client-side backing store.                                                                                          | Distributed coordination between multiple writers or a server-owned acknowledgement record.                                              |
+| Framework stream restoration | The AI example restores framework messages and active runs after a page reload. AI SDK replays one retained run. TanStack AI continues after its IndexedDB checkpoint. | A server-owned run registry and cross-device recovery. AI SDK cannot continue from an arbitrary native chunk without earlier run events. |
+| Cloudflare gateway           | Local Durable Object fan-out, storage-backed upstream checkpoints, restart replay, and bounded client catch-up.                                                        | A published gateway package with production authentication, backpressure, eviction, and cost policy.                                     |
+| Cloudflare transport         | Official NATS WebSocket and Node TCP transports in local workerd.                                                                                                      | Remote endpoint, production authentication, and Workers VPC validation.                                                                  |
+| Cross-tab connection sharing | A `SharedWorker` harness proves that two tabs can share one connection.                                                                                                | A supported browser-broker protocol with defined authentication, lifecycle, and failure behavior.                                        |
+| Adapter ergonomics           | Direct Core NATS helpers for React and RxJS. Framework-neutral sessions can wrap JetStream or other sources.                                                           | Direct JetStream convenience helpers and a full RxJS application example.                                                                |
+| Package availability         | Six public packages at `0.1.0`, Changesets versioning, and active trusted-publishing automation.                                                                       | A completed OIDC publication and npm provenance record. Version `0.1.0` used the manual bootstrap path.                                  |
 
 These boundaries define the next proofs. They do not block continued experimentation in the examples and prototypes.
 
@@ -419,11 +430,10 @@ These boundaries define the next proofs. They do not block continued experimenta
 
 1. Use the next consumer-visible change to prove OIDC publication. Confirm the npm provenance records, package tags, and GitHub releases.
 2. Prove a separate named durable-consumer API with explicit acknowledgement, redelivery, ownership, and shutdown semantics. Keep `consumeJetStream()` focused on ordered replay.
-3. Add a full-page AI recovery scenario that restores framework state and resumes after the last processed checkpoint.
-4. Prove an atomic client catch-up-to-live handoff in the Durable Object gateway. Add authentication, byte limits, backpressure, forced-eviction tests, and cost measurements before package promotion.
-5. Deploy the Cloudflare examples against a remote NATS endpoint. Test authentication, reconnect, JetStream resume, and Workers VPC independently.
-6. Build a full RxJS rooms or chat example. Use it to find missing composition APIs and add direct JetStream helpers where they remove repeated application code.
-7. Turn the `SharedWorker` harness into a supported browser broker after its protocol, authentication, lifecycle, and failure tests are explicit.
+3. Prove an atomic client catch-up-to-live handoff in the Durable Object gateway. Add authentication, byte limits, backpressure, forced-eviction tests, and cost measurements before package promotion.
+4. Deploy the Cloudflare examples against a remote NATS endpoint. Test authentication, reconnect, JetStream resume, and Workers VPC independently.
+5. Build a full RxJS rooms or chat example. Use it to find missing composition APIs and add direct JetStream helpers where they remove repeated application code.
+6. Turn the `SharedWorker` harness into a supported browser broker after its protocol, authentication, lifecycle, and failure tests are explicit.
 
 ## License
 

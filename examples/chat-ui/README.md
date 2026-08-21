@@ -1,6 +1,6 @@
 # Shared chat example UI
 
-> PRIVATE EXAMPLE PACKAGE — not published.
+> REPOSITORY EXAMPLE PACKAGE — included in the public repository. It is not published to npm.
 
 This package holds the room model, transport-visible timeline types, guided rooms workbench, and shadcn primitives shared by the examples. The AI example composes the primitives into a focused chat window instead of using the rooms workbench.
 

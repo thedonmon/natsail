@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react'
 import { useChat as useAiSdkChat } from '@ai-sdk/react'
 import { useChat as useTanStackChat } from '@tanstack/ai-react'
+import type { UIMessage as AiSdkMessage } from 'ai'
 import type { NatsRuntimeConnectionState } from '@natsail/core'
 import { consumeJetStream, type JetStreamDuplicateDeliveryPolicy } from '@natsail/jetstream'
 import {
@@ -57,10 +58,22 @@ import { ToggleGroup, ToggleGroupItem } from '@natsail/example-chat-ui/ui/toggle
 import { useNatsRuntimeStatus } from '@natsail/react'
 import { runtime } from './runtime'
 import {
+  aiSdkChatId,
+  getOrCreateClientId,
+  loadActiveRun,
+  loadAiSdkMessages,
+  loadPreferences,
+  saveAiSdkMessages,
+  savePreferences,
+  tanStackChatId,
+  tanStackPersistence,
+} from './chat-persistence'
+import {
   NatsAiSdkChatTransport,
   NatsTanStackConnection,
   type DeliveryKind,
   type FrameworkKind,
+  type PageRecoveryState,
   type TransportReceipt,
 } from './transports'
 
@@ -68,7 +81,7 @@ const gatewayPrompt = 'Help me plan the gateway release.'
 const reconnectPrompt = "What happens if the connection drops while you're answering?"
 const conversationStream = 'NATSAIL_AI_CONVERSATIONS'
 const conversationSubject = 'natsail.examples.ai.conversations.release-room'
-const clientId = `ai-chat-${crypto.randomUUID().slice(0, 8)}`
+const clientId = getOrCreateClientId()
 const encoder = new TextEncoder()
 
 interface Receipt extends TransportReceipt {
@@ -343,6 +356,36 @@ function ConnectionMarker({
   )
 }
 
+function PageRecoveryMarker({ recovery }: { recovery: PageRecoveryState }) {
+  if (recovery.phase === 'idle') return null
+  const checkpoint = recovery.checkpointSequence
+  const sequence = recovery.firstRecoveredSequence
+  return (
+    <MessageScrollerItem messageId={`page-recovery-${recovery.phase}`}>
+      <Marker
+        variant="separator"
+        data-page-recovery={recovery.phase}
+        data-recovery-strategy={recovery.strategy}
+        data-checkpoint-sequence={checkpoint}
+        data-first-recovered-sequence={sequence}
+      >
+        <MarkerIcon>
+          {recovery.phase === 'restoring' ? <RefreshCwIcon /> : <CheckIcon />}
+        </MarkerIcon>
+        <MarkerContent>
+          {recovery.phase === 'restoring'
+            ? recovery.strategy === 'checkpoint-continuation'
+              ? `Page reloaded · continuing this answer after checkpoint ${checkpoint ?? '…'}.`
+              : 'Page reloaded · rebuilding this answer from its retained native stream.'
+            : recovery.strategy === 'checkpoint-continuation'
+              ? `Page recovery complete · continued after checkpoint ${checkpoint ?? '…'}.`
+              : 'Page recovery complete · rebuilt the active reply from its retained run.'}
+        </MarkerContent>
+      </Marker>
+    </MessageScrollerItem>
+  )
+}
+
 function TranscriptMessage({
   message,
   connected,
@@ -400,6 +443,7 @@ function NativeTranscript({
   conversation,
   retainedFrames,
   gapDurationMs,
+  pageRecovery,
   onSend,
 }: {
   messages: ReadonlyArray<unknown>
@@ -410,6 +454,7 @@ function NativeTranscript({
   conversation: ConversationStreamState
   retainedFrames: number
   gapDurationMs?: number
+  pageRecovery: PageRecoveryState
   onSend: (message: string) => Promise<void>
 }) {
   const displayMessages = toDisplayMessages(messages)
@@ -485,6 +530,7 @@ function NativeTranscript({
               retainedFrames={retainedFrames}
               {...(gapDurationMs === undefined ? {} : { gapDurationMs })}
             />
+            <PageRecoveryMarker recovery={pageRecovery} />
           </MessageScrollerContent>
         </MessageScrollerViewport>
         <MessageScrollerButton />
@@ -750,6 +796,7 @@ interface ChatExperienceProps {
   conversation: ConversationStreamState
   messages: ReadonlyArray<unknown>
   busy: boolean
+  pageRecovery: PageRecoveryState
   error?: Error
   receipts: Receipt[]
   onSend: (message: string) => Promise<void>
@@ -787,6 +834,12 @@ function ChatExperience(props: ChatExperienceProps) {
     props.busy &&
     activeTextChunks >= 6 &&
     reconnectPhase === 'idle'
+  const pageReloadReady =
+    connected &&
+    props.delivery === 'jetstream' &&
+    props.busy &&
+    activeTextChunks >= 6 &&
+    props.pageRecovery.phase === 'idle'
   const retainedFrames = reconnectWindow?.endedAt
     ? props.receipts.filter(
         (receipt) =>
@@ -850,7 +903,7 @@ function ChatExperience(props: ChatExperienceProps) {
           </span>
           <div>
             <strong>NATSail Chat</strong>
-            <span>Private example</span>
+            <span>Repository example</span>
           </div>
         </div>
         <Badge
@@ -878,8 +931,8 @@ function ChatExperience(props: ChatExperienceProps) {
           <div className="chat-window__actions">
             <span>
               {props.delivery === 'jetstream'
-                ? 'Pauses the ordered consumer for two seconds while publishing continues'
-                : 'Switch to JetStream to test gap recovery'}
+                ? 'Interrupt the consumer or reload the whole page during an answer'
+                : 'Switch to JetStream to test recovery'}
             </span>
             <Button
               type="button"
@@ -901,6 +954,16 @@ function ChatExperience(props: ChatExperienceProps) {
                     ? 'Recovery complete'
                     : 'Run recovery test'}
             </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={!pageReloadReady}
+              onClick={() => window.location.reload()}
+            >
+              <RefreshCwIcon data-icon="inline-start" />
+              Reload page mid-reply
+            </Button>
           </div>
         </header>
 
@@ -912,6 +975,7 @@ function ChatExperience(props: ChatExperienceProps) {
           delivery={props.delivery}
           conversation={props.conversation}
           retainedFrames={retainedFrames}
+          pageRecovery={props.pageRecovery}
           {...(gapDurationMs === undefined ? {} : { gapDurationMs })}
           onSend={send}
         />
@@ -983,6 +1047,12 @@ function AiSdkChat({
   onDeliveryChange: (delivery: DeliveryKind) => void
   onDuplicatePolicyChange: (policy: JetStreamDuplicateDeliveryPolicy) => void
 }) {
+  const [pageRecovery, setPageRecovery] = useState<PageRecoveryState>({ phase: 'idle' })
+  const initialMessages = useMemo(() => loadAiSdkMessages(delivery), [delivery])
+  const resume = useMemo(
+    () => delivery === 'jetstream' && loadActiveRun('ai-sdk', delivery)?.chatId === aiSdkChatId,
+    [delivery]
+  )
   const transport = useMemo(
     () =>
       new NatsAiSdkChatTransport(
@@ -990,15 +1060,22 @@ function AiSdkChat({
         clientId,
         delivery,
         { duplicateDeliveryPolicy: duplicatePolicy },
-        onReceipt
+        onReceipt,
+        setPageRecovery
       ),
     [delivery, duplicatePolicy, onReceipt]
   )
   const { messages, sendMessage, status, error } = useAiSdkChat({
-    id: 'natsail-ai-sdk-chat',
+    id: aiSdkChatId,
     transport,
+    messages: initialMessages,
+    resume,
   })
-  const busy = status === 'submitted' || status === 'streaming'
+  useEffect(() => {
+    saveAiSdkMessages(delivery, messages as AiSdkMessage[])
+  }, [delivery, messages])
+  const busy =
+    status === 'submitted' || status === 'streaming' || pageRecovery.phase === 'restoring'
   return (
     <ChatExperience
       framework="ai-sdk"
@@ -1007,6 +1084,7 @@ function AiSdkChat({
       conversation={conversation}
       messages={messages}
       busy={busy}
+      pageRecovery={pageRecovery}
       {...(error ? { error } : {})}
       receipts={receipts}
       onSend={(message) => sendMessage({ text: message })}
@@ -1037,21 +1115,28 @@ function TanStackChat({
   onDeliveryChange: (delivery: DeliveryKind) => void
   onDuplicatePolicyChange: (policy: JetStreamDuplicateDeliveryPolicy) => void
 }) {
+  const [pageRecovery, setPageRecovery] = useState<PageRecoveryState>({ phase: 'idle' })
+  const persistence = useMemo(() => tanStackPersistence(delivery), [delivery])
   const connection = useMemo(
     () =>
       new NatsTanStackConnection(
         runtime,
         clientId,
+        tanStackChatId,
         delivery,
         { duplicateDeliveryPolicy: duplicatePolicy },
-        onReceipt
+        onReceipt,
+        setPageRecovery
       ),
     [delivery, duplicatePolicy, onReceipt]
   )
   useEffect(() => () => void connection.close(), [connection])
   const { messages, sendMessage, isLoading, error } = useTanStackChat({
-    id: 'natsail-tanstack-ai-chat',
+    id: tanStackChatId,
     connection,
+    persistence,
+    threadId: tanStackChatId,
+    live: true,
   })
   return (
     <ChatExperience
@@ -1060,7 +1145,8 @@ function TanStackChat({
       duplicatePolicy={duplicatePolicy}
       conversation={conversation}
       messages={messages}
-      busy={isLoading}
+      busy={isLoading || pageRecovery.phase === 'restoring'}
+      pageRecovery={pageRecovery}
       {...(error ? { error } : {})}
       receipts={receipts}
       onSend={(message) => sendMessage(message)}
@@ -1073,15 +1159,22 @@ function TanStackChat({
 }
 
 export function App() {
-  const [framework, setFramework] = useState<FrameworkKind>('ai-sdk')
-  const [delivery, setDelivery] = useState<DeliveryKind>('jetstream')
-  const [duplicatePolicy, setDuplicatePolicy] = useState<JetStreamDuplicateDeliveryPolicy>('drop')
+  const initialPreferences = useMemo(loadPreferences, [])
+  const [framework, setFramework] = useState<FrameworkKind>(initialPreferences.framework)
+  const [delivery, setDelivery] = useState<DeliveryKind>(initialPreferences.delivery)
+  const [duplicatePolicy, setDuplicatePolicy] = useState<JetStreamDuplicateDeliveryPolicy>(
+    initialPreferences.duplicatePolicy
+  )
   const [receipts, setReceipts] = useState<Receipt[]>([])
   const conversation = useConversationStream()
 
   useEffect(() => {
     void runtime.connection().catch(() => undefined)
   }, [])
+
+  useEffect(() => {
+    savePreferences({ framework, delivery, duplicatePolicy })
+  }, [delivery, duplicatePolicy, framework])
 
   const onReceipt = useCallback((receipt: TransportReceipt) => {
     setReceipts((current) =>

@@ -1,6 +1,6 @@
 # TanStack gateway rooms/chat example
 
-> PRIVATE EXAMPLE — repository application used to exercise the NATSail Durable Object gateway prototype. It is not published.
+> REPOSITORY EXAMPLE — included in the public repository. It is not published as an npm package.
 
 ## Question
 

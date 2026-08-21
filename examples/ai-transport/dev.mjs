@@ -1,4 +1,4 @@
-// PRIVATE EXAMPLE — one-command AI SDK and TanStack AI chat experience.
+// REPOSITORY EXAMPLE — one-command AI SDK and TanStack AI chat experience.
 
 import { execFileSync, spawn } from 'node:child_process'
 import { once } from 'node:events'

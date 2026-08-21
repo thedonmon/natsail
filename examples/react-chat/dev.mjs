@@ -1,4 +1,4 @@
-// PRIVATE EXAMPLE — one-command local runner for the direct React primitives app.
+// REPOSITORY EXAMPLE — one-command local runner for the direct React primitives app.
 
 import { execFileSync, spawn } from 'node:child_process'
 import { once } from 'node:events'
