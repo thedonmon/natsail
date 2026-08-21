@@ -1,12 +1,16 @@
 # NATSail
 
+[![CI](https://github.com/thedonmon/natsail/actions/workflows/ci.yml/badge.svg)](https://github.com/thedonmon/natsail/actions/workflows/ci.yml)
+
 NATSail provides reliable NATS sessions from the edge to the user interface.
 
 The runtime uses one NATS connection for many logical subscriptions. Core NATS works without JetStream. JetStream support is an optional package.
 
 Package names and interfaces can change before the first release.
 
-See the [project handoff](docs/HANDOFF.md) for architecture decisions, known limitations, and the remaining work.
+The source repository is public. All packages remain private workspace packages at version `0.0.0`.
+
+See the [resumable-stream research](docs/research/nats-resumable-streams.md) and [architecture proposal](docs/architecture/nats-resumable-streams-proposal.md) for the design evidence.
 
 ## Current status
 
@@ -19,7 +23,7 @@ See the [project handoff](docs/HANDOFF.md) for architecture decisions, known lim
 | Browser WebSocket transport in Node and Chromium        | Tested      |
 | Token, user/password, NKey, JWT, and TLS connections    | Tested      |
 | Cloudflare Workers WebSocket and TCP connections        | Local proof |
-| GitHub Actions workspace check                          | Configured  |
+| GitHub Actions workspace check                          | Passing     |
 | JetStream replay and live delivery through one consumer | Tested      |
 | Resume strictly after a stream sequence                 | Tested      |
 | Runtime cleanup of Core NATS and JetStream resources    | Tested      |
@@ -178,7 +182,7 @@ Install the dependencies:
 pnpm install
 ```
 
-Start a local NATS server without authentication:
+Start the local NATS server matrix:
 
 ```sh
 pnpm nats:up
@@ -187,7 +191,8 @@ pnpm nats:up
 The main server uses native port 4223, monitoring port 8223, and WebSocket port 9223.
 
 The authentication fixtures use ports 4224 through 4228.
-`pnpm nats:up` generates disposable NKey, JWT, and TLS credentials under the ignored `.generated/` directory before Docker starts. No private test credentials are stored in Git.
+
+`pnpm nats:up` creates disposable NKey, JWT, and TLS credentials in the ignored `.generated/` directory. Git does not store private test credentials.
 
 Run all tests:
 
@@ -384,13 +389,19 @@ The React and RxJS Core helpers share one underlying subscription when they use 
 
 The session key identifies the source configuration. If the source configuration changes, change the session key.
 
-## Roadmap
+## Current limits and roadmap
 
-1. Extend the private examples to exercise RxJS alongside the now-proven direct React and AI JetStream paths.
-2. Choose and prove the Durable Object per-client catch-up strategy, then promote the validated gateway seam into `@natsail/cloudflare-gateway`.
-3. Turn the `SharedWorker` proof into a production broker design when a real application needs cross-tab sharing.
-4. Run the Cloudflare transports against a remotely deployed Worker and non-local NATS endpoints.
-5. Add package publishing and release automation after the owner chooses the remote and package scope.
+The public repository now exists, and package names use the `@natsail` scope. The packages remain private while their pre-release interfaces change.
+
+| Priority                    | Current boundary                                                                                                                           | Next proof                                                                                                                                                            |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Named durable consumers     | `consumeJetStream()` uses ordered consumers with `AckPolicy.None`. It does not expose server acknowledgements or durable ownership.        | Add a separate named-consumer API with explicit acknowledgements, redelivery controls, and durable ownership. Keep the ordered API small.                             |
+| AI reload recovery          | The AI example recovers an active stream while the page stays open. `reconnectToStream()` returns `null`.                                  | Store the chat and run identity. Reconstruct framework state and resume from IndexedDB or a server checkpoint after a full reload.                                    |
+| Durable Object gateway      | The local proof supports shared fan-out, restart replay, and bounded client catch-up. Production gateway policy remains incomplete.        | Before package promotion, prove an atomic catch-up-to-live handoff. Then add byte limits, backpressure, authentication, forced-eviction tests, and cost measurements. |
+| Remote Cloudflare transport | Local workerd passes with WebSocket and TCP transports. Remote routing and authentication remain unproven.                                 | Deploy a Worker against a non-local NATS endpoint. Exercise authentication, reconnects, and remote JetStream resume. Test Workers VPC separately.                     |
+| Cross-tab sharing           | The `SharedWorker` test harness reduces two tab connections to one. It is not a production broker.                                         | If an application requires cross-tab sharing, define its protocol, authentication, lifecycle, and failure behavior.                                                   |
+| RxJS application example    | The RxJS package and React sharing behavior have integration tests. No full application example uses RxJS.                                 | If an RxJS example can expose missing composition APIs, add it. Do not add `@natsail/react-rxjs` without repeated application code.                                   |
+| Package releases            | The remote exists, and package manifests use `@natsail`. The packages lack stable metadata, provenance, versioning, and a release process. | Before the first package publication, review the public interfaces. Then add package metadata, changesets, provenance, and release automation.                        |
 
 ## License
 

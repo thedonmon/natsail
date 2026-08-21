@@ -1,6 +1,6 @@
 # NATSail architecture proposal
 
-Status: historical proposal. See the [handoff](../HANDOFF.md) for the implemented interface.
+Status: historical proposal. See the [README](../../README.md) for the implemented interface and current limits.
 
 ## Decision in one paragraph
 

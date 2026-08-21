@@ -2,8 +2,6 @@
 
 Date: 2026-08-21
 
-Branch: `codex/cloudflare-gateway-prototype`
-
 Question: Does a tenant-scoped Durable Object gateway provide enough behavior behind a small enough seam to justify a separate NATSail package?
 
 Verdict: Yes. Keep it separate from transport and runtime Core. The retained-log catch-up is valuable enough to continue, but not yet production-ready.
@@ -50,6 +48,6 @@ The likely production shape is still temporary per-client catch-up plus the shar
 - Retained-log storage cost, byte caps, and expiry under sustained traffic
 - Atomic catch-up-to-live handoff while the room feed never becomes quiet
 
-## Capture note
+## Repository status
 
-The prototype remains clearly marked under `prototypes/`. The repository has no initial commit and all project files are still untracked, so creating a prototype-only commit would also capture unrelated repository construction. The branch name records the experiment without making that unsafe commit.
+The prototype remains under `prototypes/`. It is evidence for a future package, not a production gateway implementation.

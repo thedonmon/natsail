@@ -2,8 +2,6 @@
 
 Date: 2026-08-21
 
-Branch: `codex/cloudflare-gateway-prototype`
-
 Question: Is a tenant-scoped NATSail Durable Object gateway valuable when exercised by a real multi-room TanStack application?
 
 Verdict: Yes. The application makes the gateway seam more convincing, and it also sharpens the limits enough to prevent premature package promotion.
