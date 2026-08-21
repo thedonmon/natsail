@@ -37,6 +37,7 @@ jobs:
       - run: pnpm exec playwright install --with-deps chromium
       - run: pnpm nats:up
       - run: pnpm check
+      - run: pnpm examples:verify
 
       - if: always()
         run: pnpm nats:down

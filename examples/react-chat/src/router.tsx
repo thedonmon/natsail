@@ -146,7 +146,11 @@ const seedMessages = async (publish: (message: ChatMessage) => Promise<void>): P
       'Sol / runtime',
       'Core NATS is live-only: reloads do not replay prior room messages.',
     ],
-    ['release', 'Tess / release', 'This example is private workspace code and is never published.'],
+    [
+      'release',
+      'Tess / release',
+      'This public repository example is workspace-only and is not an npm package.',
+    ],
   ]
 
   for (const [roomId, author, body] of values) {

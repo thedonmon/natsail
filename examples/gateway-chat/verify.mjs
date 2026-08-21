@@ -79,8 +79,8 @@ try {
 
   const missedBody = `Catch-up proof ${crypto.randomUUID().slice(0, 8)}`
   await secondTab.locator('#probe-body').fill(missedBody)
-  await secondTab.getByRole('button', { name: 'Send test message' }).click()
-  await expect(secondTab.getByText(missedBody)).toBeVisible()
+  await secondTab.getByRole('button', { name: 'Send message' }).click()
+  await expect(secondTab.getByLabel('Messages').getByText(missedBody)).toBeVisible()
 
   await firstTab.getByRole('button', { name: 'Reconnect' }).click()
   await expect(firstTab.getByText(missedBody)).toBeVisible()

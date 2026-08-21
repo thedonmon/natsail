@@ -1,0 +1,33 @@
+{
+  "name": "@natsail/example-rxjs-chat",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit && vite build",
+    "dev": "vite",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@nats-io/jetstream": "3.4.0",
+    "@nats-io/nats-core": "3.4.0",
+    "@nats-io/transport-node": "3.4.0",
+    "@natsail/checkpoints": "workspace:*",
+    "@natsail/core": "workspace:*",
+    "@natsail/example-chat-ui": "workspace:*",
+    "@natsail/jetstream": "workspace:*",
+    "@natsail/rxjs": "workspace:*",
+    "@natsail/session": "workspace:*",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "rxjs": "^7.8.2"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "4.3.3",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "5.2.0",
+    "typescript": "6.0.3",
+    "vite": "7.3.6"
+  }
+}

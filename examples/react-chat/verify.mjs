@@ -67,7 +67,7 @@ try {
 
   const body = `Direct React primitive ${crypto.randomUUID().slice(0, 8)}`
   await page.locator('#probe-body').fill(body)
-  await page.getByRole('button', { name: 'Send test message' }).click()
+  await page.getByRole('button', { name: 'Send message' }).click()
   await expect(page.getByText(body)).toBeVisible()
   await expect(
     page.locator('[data-proof-status="pass"]', { hasText: 'Observe a publish round trip' })

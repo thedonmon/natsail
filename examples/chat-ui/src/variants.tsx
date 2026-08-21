@@ -40,7 +40,7 @@ import {
 import { ToggleGroup, ToggleGroupItem } from '#components/ui/toggle-group'
 import { phaseLabel, type Room, type TimelineEntry, type TimelineState } from './model'
 
-export type ExampleMode = 'core' | 'gateway'
+export type ExampleMode = 'core' | 'gateway' | 'rxjs'
 
 export interface WorkspaceProps {
   mode: ExampleMode
@@ -53,9 +53,11 @@ export interface WorkspaceProps {
   architectureDescription: string
   topologyLabel: string
   upstreamLabel: string
+  sourceStarts?: number
   connectionAction?: {
     label: string
     onClick: () => void
+    disabled?: boolean
   }
   onRoomChange: (roomId: string) => void
   onSend: (body: string) => Promise<void>
@@ -250,13 +252,13 @@ function ProbeComposer({
   phase: TimelineState['phase']
   onSend: (body: string) => Promise<void>
 }) {
-  const [body, setBody] = useState(() => `Transport probe for ${room.signal}`)
+  const [body, setBody] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string>()
   const live = phase === 'live'
 
   useEffect(() => {
-    setBody(`Transport probe for ${room.signal}`)
+    setBody('')
     setError(undefined)
   }, [room.signal])
 
@@ -268,7 +270,7 @@ function ProbeComposer({
     setError(undefined)
     try {
       await onSend(value)
-      setBody(`Transport probe for ${room.signal}`)
+      setBody('')
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause))
     } finally {
@@ -279,7 +281,9 @@ function ProbeComposer({
   return (
     <form className="probe-composer" onSubmit={(event) => void submit(event)}>
       <Field data-disabled={!live || undefined} data-invalid={error ? true : undefined}>
-        <FieldLabel htmlFor="probe-body">Prepared publish probe</FieldLabel>
+        <FieldLabel htmlFor="probe-body" className="sr-only">
+          Message {room.label}
+        </FieldLabel>
         <InputGroup>
           <InputGroupTextarea
             id="probe-body"
@@ -289,6 +293,7 @@ function ProbeComposer({
             disabled={!live}
             aria-invalid={error ? true : undefined}
             maxLength={700}
+            placeholder={`Message ${room.label}`}
             onChange={(event) => setBody(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === 'Enter' && !event.shiftKey) {
@@ -306,7 +311,7 @@ function ProbeComposer({
               disabled={!live || !body.trim() || submitting}
             >
               <SendIcon data-icon="inline-start" />
-              {submitting ? 'Sending…' : 'Send test message'}
+              {submitting ? 'Sending…' : 'Send message'}
             </InputGroupButton>
           </InputGroupAddon>
         </InputGroup>
@@ -323,6 +328,7 @@ function EvidencePanel({ props }: { props: WorkspaceProps }) {
     [`${props.upstreamLabel} cursor`, timeline.gatewayCursor ?? '—'],
     ['Catch-up runs', timeline.catchUpCount],
     ['Deliveries seen', timeline.messages.length],
+    ...(props.sourceStarts === undefined ? [] : [['Observable source starts', props.sourceStarts]]),
   ] as const
 
   return (
@@ -339,6 +345,7 @@ function EvidencePanel({ props }: { props: WorkspaceProps }) {
               className="tabular-nums"
               data-catchups={label === 'Catch-up runs' ? value : undefined}
               data-deliveries={label === 'Deliveries seen' ? value : undefined}
+              data-source-starts={label === 'Observable source starts' ? value : undefined}
             >
               {value}
             </dd>
@@ -416,6 +423,7 @@ export function Workspace(props: WorkspaceProps) {
                   type="button"
                   variant="outline"
                   size="sm"
+                  disabled={props.connectionAction.disabled}
                   onClick={props.connectionAction.onClick}
                 >
                   <RotateCcwIcon data-icon="inline-start" />
@@ -425,16 +433,39 @@ export function Workspace(props: WorkspaceProps) {
             </div>
           ),
         }
-      : {
-          title: 'Verify one shared room feed',
-          instruction:
-            'Switch rooms above the transcript. Seeded deliveries all came through one reducer hook.',
-          result:
-            observedRooms >= 2
-              ? `${observedRooms} rooms folded into one subscription snapshot.`
-              : 'Waiting for the seeded multi-room deliveries.',
-          status: observedRooms >= 2 ? 'pass' : 'pending',
-        }
+      : props.mode === 'rxjs'
+        ? {
+            title: 'Recover retained deliveries',
+            instruction:
+              'Pause the ordered consumer. The app publishes three messages before it resumes from its checkpoint.',
+            result:
+              props.timeline.catchUpCount > 0
+                ? `${props.timeline.catchUpCount} retained recovery run observed.`
+                : 'Waiting for one pause, publish, and resume cycle.',
+            status: props.timeline.catchUpCount > 0 ? 'pass' : 'pending',
+            action: props.connectionAction ? (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={props.connectionAction.disabled}
+                onClick={props.connectionAction.onClick}
+              >
+                <RotateCcwIcon data-icon="inline-start" />
+                {props.connectionAction.label}
+              </Button>
+            ) : null,
+          }
+        : {
+            title: 'Verify one shared room feed',
+            instruction:
+              'Switch rooms above the transcript. Seeded deliveries all came through one reducer hook.',
+            result:
+              observedRooms >= 2
+                ? `${observedRooms} rooms folded into one subscription snapshot.`
+                : 'Waiting for the seeded multi-room deliveries.',
+            status: observedRooms >= 2 ? 'pass' : 'pending',
+          }
 
   const steps: ProofStep[] = [
     {
@@ -448,7 +479,7 @@ export function Workspace(props: WorkspaceProps) {
     {
       title: 'Observe a publish round trip',
       instruction:
-        'Click “Send test message” below. Wait for the same message to return with a cursor receipt.',
+        'Send a message below. Wait for the same message to return with a cursor receipt.',
       result: ownDelivery
         ? `Message returned as cursor ${ownDelivery.cursor ?? 'live'}.`
         : 'No message from this browser has completed the round trip yet.',
@@ -474,7 +505,9 @@ export function Workspace(props: WorkspaceProps) {
           <p className="text-pretty">
             {props.mode === 'gateway'
               ? 'One browser transport can publish live, miss data, and catch up from retained history.'
-              : 'The React primitive can share one live NATS subscription and reduce every delivery safely.'}
+              : props.mode === 'rxjs'
+                ? 'RxJS projections share one resumable JetStream feed and preserve every room delivery.'
+                : 'The React primitive can share one live NATS subscription and reduce every delivery safely.'}
           </p>
         </div>
         <ConnectionBadge timeline={props.timeline} />

@@ -279,6 +279,64 @@ importers:
         specifier: 7.3.6
         version: 7.3.6(@types/node@24.13.3)(jiti@2.7.0)(lightningcss@1.32.0)(yaml@2.9.0)
 
+  examples/rxjs-chat:
+    dependencies:
+      '@nats-io/jetstream':
+        specifier: 3.4.0
+        version: 3.4.0
+      '@nats-io/nats-core':
+        specifier: 3.4.0
+        version: 3.4.0
+      '@nats-io/transport-node':
+        specifier: 3.4.0
+        version: 3.4.0
+      '@natsail/checkpoints':
+        specifier: workspace:*
+        version: link:../../packages/checkpoints
+      '@natsail/core':
+        specifier: workspace:*
+        version: link:../../packages/core
+      '@natsail/example-chat-ui':
+        specifier: workspace:*
+        version: link:../chat-ui
+      '@natsail/jetstream':
+        specifier: workspace:*
+        version: link:../../packages/jetstream
+      '@natsail/rxjs':
+        specifier: workspace:*
+        version: link:../../packages/rxjs
+      '@natsail/session':
+        specifier: workspace:*
+        version: link:../../packages/session
+      react:
+        specifier: ^19.0.0
+        version: 19.2.8
+      react-dom:
+        specifier: ^19.0.0
+        version: 19.2.8(react@19.2.8)
+      rxjs:
+        specifier: ^7.8.2
+        version: 7.8.2
+    devDependencies:
+      '@tailwindcss/vite':
+        specifier: 4.3.3
+        version: 4.3.3(vite@7.3.6(@types/node@24.13.3)(jiti@2.7.0)(lightningcss@1.32.0)(yaml@2.9.0))
+      '@types/react':
+        specifier: ^19.0.0
+        version: 19.2.18
+      '@types/react-dom':
+        specifier: ^19.0.0
+        version: 19.2.4(@types/react@19.2.18)
+      '@vitejs/plugin-react':
+        specifier: 5.2.0
+        version: 5.2.0(vite@7.3.6(@types/node@24.13.3)(jiti@2.7.0)(lightningcss@1.32.0)(yaml@2.9.0))
+      typescript:
+        specifier: 6.0.3
+        version: 6.0.3
+      vite:
+        specifier: 7.3.6
+        version: 7.3.6(@types/node@24.13.3)(jiti@2.7.0)(lightningcss@1.32.0)(yaml@2.9.0)
+
   packages/checkpoints: {}
 
   packages/core:
