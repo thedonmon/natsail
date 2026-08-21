@@ -1,62 +1,32 @@
-# Releasing NATSail packages
+# Release NATSail packages
 
-NATSail uses Changesets for versions and changelogs. The release workflow publishes through npm trusted publishing after one manual bootstrap release.
+NATSail uses Changesets for versions and changelogs. The release workflow publishes through npm trusted publishing. Version `0.1.0` was the one manual bootstrap release.
 
 The workflow does not use an npm token. npm creates provenance automatically for trusted publication from this public repository.
 
 NATSail used the manual bootstrap path for version `0.1.0`. Trusted publishing is active for later releases.
 
-## One-time bootstrap
+## Completed bootstrap
+
+The following setup is complete. Keep this section as a record of the package ownership and trusted-publisher settings.
 
 1. Create the npm organization named `natsail` while signed in as `0xdon0`. This organization owns the `@natsail` scope.
 2. Keep `0xdon0` as an organization owner for the first publication.
-3. Refresh the npm login for the owner account.
+3. Version `0.1.0` was published manually. It does not include provenance.
+4. Each package has a GitHub Actions trusted publisher with these exact values:
+   - Organization or user: `thedonmon`
+   - Repository: `natsail`
+   - Workflow filename: `release.yml`
+   - Environment name: leave blank
+   - Allowed action: `npm publish`
+
+5. The GitHub repository variable `NPM_RELEASES_ENABLED` is `true`.
 
    ```sh
-   npm login --auth-type=web
-   npm whoami
-   npm org ls natsail 0xdon0
+   gh variable set NPM_RELEASES_ENABLED --body true --repo thedonmon/natsail
    ```
 
-4. Mark the Changesets version pull request as ready, and merge it after its checks pass.
-5. Use a clean checkout of the new `main` commit.
-6. Install the exact workspace dependencies.
-
-   ```sh
-   pnpm install --frozen-lockfile
-   ```
-
-7. Run the complete release test.
-
-   ```sh
-   pnpm release:check
-   ```
-
-8. Publish the first package versions with an npm account that uses two-factor authentication.
-
-   ```sh
-   npm whoami
-   pnpm release:publish
-   git push --follow-tags
-   ```
-
-   The manual bootstrap publication does not include provenance. Trusted publications add provenance automatically.
-
-9. Open the settings for each published package on npm.
-10. Add a GitHub Actions trusted publisher with these exact values:
-    - Organization or user: `thedonmon`
-    - Repository: `natsail`
-    - Workflow filename: `release.yml`
-    - Environment name: leave blank
-    - Allowed action: `npm publish`
-
-11. Enable automated publication in the GitHub repository.
-
-    ```sh
-    gh variable set NPM_RELEASES_ENABLED --body true --repo thedonmon/natsail
-    ```
-
-12. Set each npm package to require two-factor authentication and disallow tokens.
+6. Each npm package requires two-factor authentication and disallows tokens.
 
 Read the [npm trusted-publishing guide](https://docs.npmjs.com/trusted-publishers/) before you configure the package settings.
 
@@ -71,7 +41,13 @@ Read the [npm trusted-publishing guide](https://docs.npmjs.com/trusted-publisher
 
 The release workflow builds and packs all six packages. It installs every tarball together before publication.
 
-Then Changesets publishes each new version, creates package tags, and creates GitHub releases. npm attaches provenance to each package.
+The NATSail publisher compares each local version with npm. It packs missing versions with pnpm so no `workspace:` dependency reaches npm. It then publishes each tarball with the npm CLI and GitHub Actions OIDC. The Changesets action creates the package tags and GitHub releases. npm attaches provenance to each trusted publication.
+
+An ordinary push with no new package version is a successful no-op. You can inspect the same plan locally without publishing anything:
+
+```sh
+pnpm release:plan
+```
 
 Read the [Changesets guide](https://github.com/changesets/changesets/blob/main/docs/intro-to-using-changesets.md) for version and publication semantics.
 
@@ -86,7 +62,8 @@ The publish step requires all of these conditions:
 - The workflow has `id-token: write` permission.
 - Each package trusts `release.yml` on npm.
 - Each package repository URL is `git+https://github.com/thedonmon/natsail.git`.
+- The publisher rejects npm tokens and local publication attempts.
 
-If a publication stops after some packages succeed, do not change those versions. Correct the failure and run the workflow again.
+If a publication stops after some packages succeed, do not change those versions. Correct the failure and rerun the same workflow attempt. The publisher skips versions that reached npm and can restore a missing tag during the rerun.
 
-Changesets skips versions that already exist in the registry. npm never permits reuse of a published name and version pair.
+The publisher skips versions that already exist in the registry. npm never permits reuse of a published name and version pair.

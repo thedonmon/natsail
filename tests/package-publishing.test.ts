@@ -76,5 +76,10 @@ describe('package publishing', () => {
     expect(workflow).toContain('pr-draft: create')
     expect(workflow).toContain('publish-script: pnpm release:publish')
     expect(workflow).not.toContain('NPM_TOKEN')
+
+    const workspace = JSON.parse(
+      await readFile(new URL('../package.json', import.meta.url), 'utf8')
+    ) as { scripts?: Record<string, string> }
+    expect(workspace.scripts?.['release:publish']).toBe('node scripts/publish-packages.mjs')
   })
 })

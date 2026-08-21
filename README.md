@@ -219,7 +219,7 @@ Build, inspect, and install all six publication tarballs:
 pnpm release:check
 ```
 
-See the [release guide](docs/RELEASING.md) for Changesets, the first publication, trusted publishing, and provenance.
+See the [release guide](docs/RELEASING.md) for Changesets, trusted publishing, and provenance.
 
 Stop the server:
 
