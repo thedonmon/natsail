@@ -1,6 +1,6 @@
 {
   "name": "@natsail/jetstream",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Ordered JetStream replay and application checkpoints for NATSail runtimes.",
   "keywords": [
     "nats",
