@@ -1,6 +1,6 @@
 {
   "name": "@natsail/checkpoints",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Checkpoint stores and cursor validation for resumable NATSail JetStream consumers.",
   "keywords": [
     "nats",
