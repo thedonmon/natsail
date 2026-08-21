@@ -1,0 +1,35 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "natsail-cloudflare-gateway-prototype",
+  "main": "./worker.ts",
+  "compatibility_date": "2026-08-21",
+  "alias": {
+    "@natsail/checkpoints": "../../packages/checkpoints/src/index.ts",
+    "@natsail/core": "../../packages/core/src/index.ts",
+    "@natsail/jetstream": "../../packages/jetstream/src/index.ts",
+  },
+  "dev": {
+    "ip": "127.0.0.1",
+    "port": 8791,
+    "local_protocol": "http",
+  },
+  "vars": {
+    "NATS_WEBSOCKET_URL": "ws://127.0.0.1:9223",
+    "PROTOTYPE_STREAM": "NATSAIL_GATEWAY_PROTOTYPE",
+    "PROTOTYPE_TOKEN": "prototype-only",
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "NATS_GATEWAYS",
+        "class_name": "NatsGatewayPrototype",
+      },
+    ],
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["NatsGatewayPrototype"],
+    },
+  ],
+}

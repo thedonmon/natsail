@@ -1,0 +1,14 @@
+node_modules/
+.pnpm-store/
+.generated/
+dist/
+coverage/
+playwright-report/
+test-results/
+.wrangler/
+*.tsbuildinfo
+.DS_Store
+.env
+.env.*
+!.env.example
+docs/HANDOFF.md

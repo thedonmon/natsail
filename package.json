@@ -1,0 +1,57 @@
+{
+  "name": "natsail-workspace",
+  "version": "0.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "packageManager": "pnpm@10.11.0",
+  "scripts": {
+    "build": "pnpm --recursive --stream build",
+    "check": "pnpm format:check && pnpm build && pnpm test && pnpm test:browser",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "nats:down": "docker compose down --volumes",
+    "nats:fixtures": "node scripts/generate-test-fixtures.mjs",
+    "nats:logs": "docker compose logs --follow nats",
+    "nats:up": "pnpm nats:fixtures && docker compose up --detach",
+    "example:gateway-chat": "node examples/gateway-chat/dev.mjs",
+    "example:gateway-chat:verify": "node examples/gateway-chat/verify.mjs",
+    "example:ai-transport": "node examples/ai-transport/dev.mjs",
+    "example:ai-transport:verify": "node examples/ai-transport/verify.mjs",
+    "example:react-chat": "node examples/react-chat/dev.mjs",
+    "example:react-chat:verify": "node examples/react-chat/verify.mjs",
+    "prototype:chat": "pnpm example:gateway-chat",
+    "prototype:chat:verify": "pnpm example:gateway-chat:verify",
+    "prototype:cloudflare-gateway": "node prototypes/cloudflare-durable-object-gateway/run.mjs",
+    "test": "vitest run",
+    "test:browser": "playwright test",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@nats-io/jetstream": "3.4.0",
+    "@nats-io/nats-core": "3.4.0",
+    "@nats-io/nkeys": "2.0.3",
+    "@nats-io/transport-node": "3.4.0",
+    "@playwright/test": "1.62.1",
+    "@types/node": "^24.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "fake-indexeddb": "6.2.5",
+    "jsdom": "^26.0.0",
+    "nats-jwt": "0.0.9",
+    "prettier": "3.6.2",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "rxjs": "^7.8.2",
+    "typescript": "6.0.3",
+    "vite": "7.3.6",
+    "vitest": "4.0.18",
+    "wrangler": "4.125.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "workerd"
+    ]
+  }
+}

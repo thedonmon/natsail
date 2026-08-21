@@ -1,0 +1,340 @@
+import {
+  createContext,
+  createElement,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type ReactNode,
+} from 'react'
+
+import type { CoreSubscriptionOptions, NatsRuntime, NatsRuntimeStatusEvent } from '@natsail/core'
+import { createCoreSessionSource, createReducingSessionSource } from '@natsail/session'
+import type {
+  SessionReducer,
+  SessionHandle,
+  SessionRegistry,
+  SessionSnapshot,
+  SessionSource,
+} from '@natsail/session'
+
+const CONNECTING_SNAPSHOT: SessionSnapshot<never> = Object.freeze({
+  phase: 'connecting',
+  revision: 0,
+  valueRevision: 0,
+})
+
+const IDLE_RUNTIME_STATUS: NatsRuntimeStatusEvent = Object.freeze({
+  type: 'status',
+  state: 'idle',
+  at: 0,
+})
+
+interface NatsContextValue {
+  runtime: NatsRuntime
+  sessions: SessionRegistry
+}
+
+export interface NatsProviderProps {
+  children?: ReactNode
+  runtime: NatsRuntime
+  sessions: SessionRegistry
+}
+
+type ActiveSession<T> = {
+  registry: SessionRegistry
+  key: string
+  handle: SessionHandle<T>
+}
+
+interface ResolvedSession<T> {
+  registry: SessionRegistry
+  key: string
+  source: SessionSource<T>
+}
+
+interface SelectionCache<T, Selected> {
+  snapshot: SessionSnapshot<T>
+  selector: (snapshot: SessionSnapshot<T>) => Selected
+  value: Selected
+}
+
+const NatsContext = createContext<NatsContextValue | null>(null)
+
+/**
+ * Supplies one runtime and session registry to a React tree.
+ *
+ * The provider owns neither object. The application remains responsible for
+ * closing them after the tree no longer needs NATS.
+ */
+export function NatsProvider({ children, runtime, sessions }: NatsProviderProps) {
+  const value = useMemo(() => ({ runtime, sessions }), [runtime, sessions])
+  return createElement(NatsContext.Provider, { value }, children)
+}
+
+/** Returns the runtime supplied by the nearest NatsProvider. */
+export function useNatsRuntime(): NatsRuntime {
+  return useRequiredContext().runtime
+}
+
+/** Returns the session registry supplied by the nearest NatsProvider. */
+export function useNatsSessionRegistry(): SessionRegistry {
+  return useRequiredContext().sessions
+}
+
+/**
+ * Reports the latest runtime connection state.
+ *
+ * Pass a runtime directly or omit it inside a NatsProvider.
+ */
+export function useNatsRuntimeStatus(runtime?: NatsRuntime): NatsRuntimeStatusEvent {
+  const context = useContext(NatsContext)
+  const activeRuntime = runtime ?? context?.runtime
+  if (!activeRuntime) {
+    throw new Error('useNatsRuntimeStatus requires a runtime or a NatsProvider')
+  }
+
+  const [active, setActive] = useState<{
+    runtime: NatsRuntime
+    status: NatsRuntimeStatusEvent
+  } | null>(null)
+
+  useEffect(() => {
+    const iterator = activeRuntime.events[Symbol.asyncIterator]()
+    let cancelled = false
+
+    void (async () => {
+      try {
+        while (!cancelled) {
+          const next = await iterator.next()
+          if (next.done) return
+          if (next.value.type === 'status') {
+            setActive({ runtime: activeRuntime, status: next.value })
+          }
+        }
+      } finally {
+        await iterator.return?.()
+      }
+    })()
+
+    return () => {
+      cancelled = true
+      void iterator.return?.()
+    }
+  }, [activeRuntime])
+
+  return active && active.runtime === activeRuntime ? active.status : IDLE_RUNTIME_STATUS
+}
+
+export function useNatsSession<T>(key: string, source: SessionSource<T>): SessionSnapshot<T>
+export function useNatsSession<T>(
+  registry: SessionRegistry,
+  key: string,
+  source: SessionSource<T>
+): SessionSnapshot<T>
+/**
+ * Acquires a keyed session after commit and exposes its immutable snapshot.
+ *
+ * The key identifies the source configuration. Change the key when the source
+ * subject, decoder, credentials, or delivery policy changes.
+ */
+export function useNatsSession<T>(
+  registryOrKey: SessionRegistry | string,
+  keyOrSource: string | SessionSource<T>,
+  source?: SessionSource<T>
+): SessionSnapshot<T> {
+  const resolved = useResolvedSession(registryOrKey, keyOrSource, source)
+  return useSessionSelection(resolved, selectSnapshot)
+}
+
+/** Opens a shared Core NATS subscription through the nearest NatsProvider. */
+export function useNatsCoreSubscription<T>(
+  key: string,
+  options: CoreSubscriptionOptions<T>
+): SessionSnapshot<T> {
+  const { runtime } = useRequiredContext()
+  return useNatsSession(key, createCoreSessionSource(runtime, options))
+}
+
+/**
+ * Folds every Core NATS delivery into one shared session snapshot.
+ *
+ * Use this when React must render a collection or other accumulated state.
+ * The reducer runs serially at the session boundary, so render coalescing does
+ * not skip intermediate deliveries.
+ */
+export function useNatsCoreSubscriptionReducer<Value, State>(
+  key: string,
+  options: CoreSubscriptionOptions<Value>,
+  initialState: () => State,
+  reducer: SessionReducer<Value, State>
+): SessionSnapshot<State> {
+  const { runtime } = useRequiredContext()
+  return useNatsSession(
+    key,
+    createReducingSessionSource(createCoreSessionSource(runtime, options), initialState, reducer)
+  )
+}
+
+/** Selects state from a shared provider-backed Core NATS subscription. */
+export function useNatsCoreSubscriptionSelector<T, Selected>(
+  key: string,
+  options: CoreSubscriptionOptions<T>,
+  selector: (snapshot: SessionSnapshot<T>) => Selected,
+  isEqual?: (previous: Selected, next: Selected) => boolean
+): Selected {
+  const { runtime } = useRequiredContext()
+  return useNatsSessionSelector(key, createCoreSessionSource(runtime, options), selector, isEqual)
+}
+
+export function useNatsSessionSelector<T, Selected>(
+  key: string,
+  source: SessionSource<T>,
+  selector: (snapshot: SessionSnapshot<T>) => Selected,
+  isEqual?: (previous: Selected, next: Selected) => boolean
+): Selected
+export function useNatsSessionSelector<T, Selected>(
+  registry: SessionRegistry,
+  key: string,
+  source: SessionSource<T>,
+  selector: (snapshot: SessionSnapshot<T>) => Selected,
+  isEqual?: (previous: Selected, next: Selected) => boolean
+): Selected
+/** Selects session state and re-renders only when the selected value changes. */
+export function useNatsSessionSelector<T, Selected>(
+  registryOrKey: SessionRegistry | string,
+  keyOrSource: string | SessionSource<T>,
+  sourceOrSelector: SessionSource<T> | ((snapshot: SessionSnapshot<T>) => Selected),
+  selectorOrIsEqual?:
+    | ((snapshot: SessionSnapshot<T>) => Selected)
+    | ((previous: Selected, next: Selected) => boolean),
+  maybeIsEqual?: (previous: Selected, next: Selected) => boolean
+): Selected {
+  const providerCall = typeof registryOrKey === 'string'
+  const resolved = useResolvedSession(
+    registryOrKey,
+    keyOrSource,
+    providerCall ? undefined : (sourceOrSelector as SessionSource<T>)
+  )
+  const selector = (providerCall ? sourceOrSelector : selectorOrIsEqual) as (
+    snapshot: SessionSnapshot<T>
+  ) => Selected
+  const isEqual = (providerCall ? selectorOrIsEqual : maybeIsEqual) as
+    | ((previous: Selected, next: Selected) => boolean)
+    | undefined
+
+  return useSessionSelection(resolved, selector, isEqual)
+}
+
+function useRequiredContext(): NatsContextValue {
+  const context = useContext(NatsContext)
+  if (!context) {
+    throw new Error('This hook requires a NatsProvider')
+  }
+  return context
+}
+
+function useResolvedSession<T>(
+  registryOrKey: SessionRegistry | string,
+  keyOrSource: string | SessionSource<T>,
+  source?: SessionSource<T>
+): ResolvedSession<T> {
+  const context = useContext(NatsContext)
+
+  if (typeof registryOrKey === 'string') {
+    if (!context) {
+      throw new Error('useNatsSession requires a SessionRegistry or a NatsProvider')
+    }
+    return {
+      registry: context.sessions,
+      key: registryOrKey,
+      source: keyOrSource as SessionSource<T>,
+    }
+  }
+
+  return {
+    registry: registryOrKey,
+    key: keyOrSource as string,
+    source: source!,
+  }
+}
+
+function useSessionSelection<T, Selected>(
+  { registry, key, source }: ResolvedSession<T>,
+  selector: (snapshot: SessionSnapshot<T>) => Selected,
+  isEqual: (previous: Selected, next: Selected) => boolean = Object.is
+): Selected {
+  const handle = useSessionHandle(registry, key, source)
+  const selectorRef = useRef(selector)
+  const isEqualRef = useRef(isEqual)
+  const cacheRef = useRef<SelectionCache<T, Selected> | undefined>(undefined)
+  selectorRef.current = selector
+  isEqualRef.current = isEqual
+
+  const getSnapshot = useCallback(
+    () => handle?.getSnapshot() ?? (CONNECTING_SNAPSHOT as SessionSnapshot<T>),
+    [handle]
+  )
+  const getSelection = useCallback(() => {
+    const snapshot = getSnapshot()
+    const activeSelector = selectorRef.current
+    const cached = cacheRef.current
+    if (cached?.snapshot === snapshot && cached.selector === activeSelector) {
+      return cached.value
+    }
+
+    const selected = activeSelector(snapshot)
+    if (cached && isEqualRef.current(cached.value, selected)) {
+      cacheRef.current = { snapshot, selector: activeSelector, value: cached.value }
+      return cached.value
+    }
+
+    cacheRef.current = { snapshot, selector: activeSelector, value: selected }
+    return selected
+  }, [getSnapshot])
+  const subscribe = useCallback(
+    (listener: () => void) => {
+      if (!handle) return () => undefined
+
+      let selected = getSelection()
+      return handle.subscribe(() => {
+        const next = getSelection()
+        if (!isEqualRef.current(selected, next)) {
+          selected = next
+          listener()
+        }
+      })
+    },
+    [getSelection, handle]
+  )
+
+  return useSyncExternalStore(subscribe, getSelection, getSelection)
+}
+
+function useSessionHandle<T>(
+  registry: SessionRegistry,
+  key: string,
+  source: SessionSource<T>
+): SessionHandle<T> | null {
+  const sourceRef = useRef(source)
+  sourceRef.current = source
+  const [active, setActive] = useState<ActiveSession<T> | null>(null)
+
+  useEffect(() => {
+    const handle = registry.acquire(key, sourceRef.current)
+    setActive({ registry, key, handle })
+
+    return () => {
+      void handle.release().catch(() => undefined)
+    }
+  }, [key, registry])
+
+  return active?.registry === registry && active.key === key ? active.handle : null
+}
+
+function selectSnapshot<T>(snapshot: SessionSnapshot<T>): SessionSnapshot<T> {
+  return snapshot
+}

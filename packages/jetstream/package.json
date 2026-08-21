@@ -1,0 +1,25 @@
+{
+  "name": "@natsail/jetstream",
+  "version": "0.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@natsail/checkpoints": "workspace:*",
+    "@natsail/core": "workspace:*",
+    "@nats-io/jetstream": "3.4.0"
+  }
+}

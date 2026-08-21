@@ -1,0 +1,49 @@
+services:
+  nats:
+    image: nats:2.14.4-alpine
+    command: ['-c', '/etc/nats/nats-server.conf']
+    ports:
+      - '${NATS_CLIENT_PORT:-4223}:4222'
+      - '${NATS_MONITOR_PORT:-8223}:8222'
+      - '${NATS_WS_PORT:-9223}:8080'
+    volumes:
+      - './tests/fixtures/nats-server.conf:/etc/nats/nats-server.conf:ro'
+    tmpfs:
+      - /data
+
+  nats-token:
+    image: nats:2.14.4-alpine
+    command: ['--auth', 'natsail-test-token']
+    ports:
+      - '${NATS_TOKEN_PORT:-4224}:4222'
+
+  nats-user-password:
+    image: nats:2.14.4-alpine
+    command: ['--user', 'natsail', '--pass', 'test-password']
+    ports:
+      - '${NATS_USER_PASSWORD_PORT:-4225}:4222'
+
+  nats-nkey:
+    image: nats:2.14.4-alpine
+    command: ['-c', '/etc/nats/nats-nkey.conf']
+    ports:
+      - '${NATS_NKEY_PORT:-4226}:4222'
+    volumes:
+      - './.generated/nats-fixtures/nkey/nats-nkey.conf:/etc/nats/nats-nkey.conf:ro'
+
+  nats-tls:
+    image: nats:2.14.4-alpine
+    command: ['-c', '/etc/nats/nats-tls.conf']
+    ports:
+      - '${NATS_TLS_PORT:-4227}:4222'
+    volumes:
+      - './tests/fixtures/nats-tls.conf:/etc/nats/nats-tls.conf:ro'
+      - './.generated/nats-fixtures/tls:/etc/nats/certs:ro'
+
+  nats-jwt:
+    image: nats:2.14.4-alpine
+    command: ['-c', '/etc/nats/nats-jwt.conf']
+    ports:
+      - '${NATS_JWT_PORT:-4228}:4222'
+    volumes:
+      - './.generated/nats-fixtures/jwt/nats-jwt.conf:/etc/nats/nats-jwt.conf:ro'

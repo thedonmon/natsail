@@ -1,0 +1,11 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "natsail-cloudflare-websocket-test",
+  "main": "./worker.ts",
+  "compatibility_date": "2026-08-20",
+  "dev": {
+    "ip": "127.0.0.1",
+    "port": 8787,
+    "local_protocol": "http",
+  },
+}

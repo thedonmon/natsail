@@ -1,0 +1,41 @@
+{
+  "name": "@natsail/example-ai-transport",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit && vite build",
+    "dev": "vite",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@ai-sdk/react": "4.0.77",
+    "@mcp-ui/client": "7.1.1",
+    "@nats-io/jetstream": "3.4.0",
+    "@nats-io/nats-core": "3.4.0",
+    "@nats-io/transport-node": "3.4.0",
+    "@natsail/checkpoints": "workspace:*",
+    "@natsail/core": "workspace:*",
+    "@natsail/example-chat-ui": "workspace:*",
+    "@natsail/jetstream": "workspace:*",
+    "@natsail/react": "workspace:*",
+    "@natsail/session": "workspace:*",
+    "@shadcn/helpers": "0.2.0",
+    "@tanstack/ai": "0.40.0",
+    "@tanstack/ai-client": "0.20.0",
+    "@tanstack/ai-react": "0.16.4",
+    "ai": "7.0.74",
+    "lucide-react": "1.33.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "4.3.3",
+    "@types/node": "^24.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "5.2.0",
+    "typescript": "6.0.3",
+    "vite": "7.3.6"
+  }
+}
