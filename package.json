@@ -4,9 +4,13 @@
   "private": true,
   "license": "Apache-2.0",
   "type": "module",
-  "packageManager": "pnpm@10.11.0",
+  "packageManager": "pnpm@10.34.5",
+  "engines": {
+    "node": ">=22.14.0"
+  },
   "scripts": {
     "build": "pnpm --recursive --stream build",
+    "changeset": "changeset",
     "check": "pnpm format:check && pnpm build && pnpm test && pnpm test:browser",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
@@ -23,11 +27,16 @@
     "prototype:chat": "pnpm example:gateway-chat",
     "prototype:chat:verify": "pnpm example:gateway-chat:verify",
     "prototype:cloudflare-gateway": "node prototypes/cloudflare-durable-object-gateway/run.mjs",
+    "release": "pnpm release:check && pnpm release:publish",
+    "release:check": "pnpm build && node scripts/verify-package-tarballs.mjs",
+    "release:publish": "changeset publish",
+    "release:version": "changeset version",
     "test": "vitest run",
     "test:browser": "playwright test",
     "test:watch": "vitest"
   },
   "devDependencies": {
+    "@changesets/cli": "3.0.1",
     "@nats-io/jetstream": "3.4.0",
     "@nats-io/nats-core": "3.4.0",
     "@nats-io/nkeys": "2.0.3",

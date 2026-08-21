@@ -1,10 +1,20 @@
 {
   "name": "@natsail/checkpoints",
   "version": "0.0.0",
-  "private": true,
+  "description": "Checkpoint stores and cursor validation for resumable NATSail JetStream consumers.",
+  "keywords": [
+    "nats",
+    "jetstream",
+    "checkpoint",
+    "indexeddb",
+    "streaming"
+  ],
   "license": "Apache-2.0",
   "type": "module",
   "sideEffects": false,
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -14,7 +24,22 @@
   "files": [
     "dist"
   ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/thedonmon/natsail.git",
+    "directory": "packages/checkpoints"
+  },
+  "homepage": "https://github.com/thedonmon/natsail/tree/main/packages/checkpoints#readme",
+  "bugs": {
+    "url": "https://github.com/thedonmon/natsail/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true,
+    "registry": "https://registry.npmjs.org/"
+  },
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "prepack": "pnpm build"
   }
 }

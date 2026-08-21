@@ -1,10 +1,20 @@
 {
   "name": "@natsail/core",
   "version": "0.0.0",
-  "private": true,
+  "description": "Shared NATS runtime with bounded subscriptions, retries, cleanup, status, and diagnostics.",
+  "keywords": [
+    "nats",
+    "messaging",
+    "streaming",
+    "websocket",
+    "runtime"
+  ],
   "license": "Apache-2.0",
   "type": "module",
   "sideEffects": false,
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -14,10 +24,25 @@
   "files": [
     "dist"
   ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/thedonmon/natsail.git",
+    "directory": "packages/core"
+  },
+  "homepage": "https://github.com/thedonmon/natsail/tree/main/packages/core#readme",
+  "bugs": {
+    "url": "https://github.com/thedonmon/natsail/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true,
+    "registry": "https://registry.npmjs.org/"
+  },
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "prepack": "pnpm build"
   },
   "dependencies": {
-    "@nats-io/nats-core": "3.4.0"
+    "@nats-io/nats-core": "^3.4.0"
   }
 }

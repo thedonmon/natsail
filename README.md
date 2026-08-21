@@ -8,7 +8,7 @@ The runtime uses one NATS connection for many logical subscriptions. Core NATS w
 
 Package names and interfaces can change before the first release.
 
-The source repository is public. All packages remain private workspace packages at version `0.0.0`.
+The source repository is public. The six packages are public-release candidates at version `0.0.0`, but they are not published yet.
 
 See the [resumable-stream research](docs/research/nats-resumable-streams.md) and [architecture proposal](docs/architecture/nats-resumable-streams-proposal.md) for the design evidence.
 
@@ -47,6 +47,7 @@ See the [resumable-stream research](docs/research/nats-resumable-streams.md) and
 | Guided shadcn workbenches with visible proof receipts   | Example     |
 | Native AI SDK `ChatTransport` over Core and JetStream   | Example     |
 | Native TanStack AI adapter over Core and JetStream      | Example     |
+| Public npm metadata and tarball installation            | Tested      |
 
 The integration tests use NATS 2.14.4. Separate fixtures cover anonymous, token, user/password, NKey, operator JWT, and TLS connections.
 
@@ -211,6 +212,14 @@ Run formatting, builds, and tests:
 ```sh
 pnpm check
 ```
+
+Build, inspect, and install all six publication tarballs:
+
+```sh
+pnpm release:check
+```
+
+See the [release guide](docs/RELEASING.md) for Changesets, the first publication, trusted publishing, and provenance.
 
 Stop the server:
 
@@ -389,19 +398,32 @@ The React and RxJS Core helpers share one underlying subscription when they use 
 
 The session key identifies the source configuration. If the source configuration changes, change the session key.
 
-## Current limits and roadmap
+## Current limits
 
-The public repository now exists, and package names use the `@natsail` scope. The packages remain private while their pre-release interfaces change.
+The current packages solve client runtime, replay, checkpoint, session, React, and RxJS concerns. They do not yet solve every delivery or deployment model.
 
-| Priority                    | Current boundary                                                                                                                           | Next proof                                                                                                                                                            |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Named durable consumers     | `consumeJetStream()` uses ordered consumers with `AckPolicy.None`. It does not expose server acknowledgements or durable ownership.        | Add a separate named-consumer API with explicit acknowledgements, redelivery controls, and durable ownership. Keep the ordered API small.                             |
-| AI reload recovery          | The AI example recovers an active stream while the page stays open. `reconnectToStream()` returns `null`.                                  | Store the chat and run identity. Reconstruct framework state and resume from IndexedDB or a server checkpoint after a full reload.                                    |
-| Durable Object gateway      | The local proof supports shared fan-out, restart replay, and bounded client catch-up. Production gateway policy remains incomplete.        | Before package promotion, prove an atomic catch-up-to-live handoff. Then add byte limits, backpressure, authentication, forced-eviction tests, and cost measurements. |
-| Remote Cloudflare transport | Local workerd passes with WebSocket and TCP transports. Remote routing and authentication remain unproven.                                 | Deploy a Worker against a non-local NATS endpoint. Exercise authentication, reconnects, and remote JetStream resume. Test Workers VPC separately.                     |
-| Cross-tab sharing           | The `SharedWorker` test harness reduces two tab connections to one. It is not a production broker.                                         | If an application requires cross-tab sharing, define its protocol, authentication, lifecycle, and failure behavior.                                                   |
-| RxJS application example    | The RxJS package and React sharing behavior have integration tests. No full application example uses RxJS.                                 | If an RxJS example can expose missing composition APIs, add it. Do not add `@natsail/react-rxjs` without repeated application code.                                   |
-| Package releases            | The remote exists, and package manifests use `@natsail`. The packages lack stable metadata, provenance, versioning, and a release process. | Before the first package publication, review the public interfaces. Then add package metadata, changesets, provenance, and release automation.                        |
+| Boundary                     | Supported now                                                                                                   | Not supported yet                                                                                         |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| JetStream consumer model     | Ordered consumers, `AckPolicy.None`, application checkpoints, duplicate policies, and retention-gap detection.  | Named durable consumers, explicit server acknowledgements, redelivery controls, and work-queue ownership. |
+| Checkpoint coordination      | Monotonic memory and IndexedDB checkpoints for one client-side backing store.                                   | Distributed coordination between multiple writers or a server-owned acknowledgement record.               |
+| Framework stream restoration | The AI example recreates a consumer from its processed checkpoint while the page stays open.                    | Complete AI SDK or TanStack AI message and run restoration after a page reload.                           |
+| Cloudflare gateway           | Local Durable Object fan-out, storage-backed upstream checkpoints, restart replay, and bounded client catch-up. | A published gateway package with production authentication, backpressure, eviction, and cost policy.      |
+| Cloudflare transport         | Official NATS WebSocket and Node TCP transports in local workerd.                                               | Remote endpoint, production authentication, and Workers VPC validation.                                   |
+| Cross-tab connection sharing | A `SharedWorker` harness proves that two tabs can share one connection.                                         | A supported browser-broker protocol with defined authentication, lifecycle, and failure behavior.         |
+| Adapter ergonomics           | Direct Core NATS helpers for React and RxJS; framework-neutral sessions can wrap JetStream or other sources.    | Direct JetStream convenience helpers and a full RxJS application example.                                 |
+| Package availability         | Public package metadata, Changesets, installable tarballs, and gated trusted-publishing automation.             | Published `@natsail/*` versions until the npm organization and first release are complete.                |
+
+These boundaries define the next proofs. They do not block continued experimentation in the examples and prototypes.
+
+## Roadmap
+
+1. Create the `natsail` npm organization, publish the six packages at version `0.1.0`, register `release.yml` as their trusted publisher, and enable release automation.
+2. Prove a separate named durable-consumer API with explicit acknowledgement, redelivery, ownership, and shutdown semantics. Keep `consumeJetStream()` focused on ordered replay.
+3. Add a full-page AI recovery scenario that restores framework state and resumes after the last processed checkpoint.
+4. Prove an atomic client catch-up-to-live handoff in the Durable Object gateway. Add authentication, byte limits, backpressure, forced-eviction tests, and cost measurements before package promotion.
+5. Deploy the Cloudflare examples against a remote NATS endpoint. Test authentication, reconnect, JetStream resume, and Workers VPC independently.
+6. Build a full RxJS rooms or chat example. Use it to find missing composition APIs and add direct JetStream helpers where they remove repeated application code.
+7. Turn the `SharedWorker` harness into a supported browser broker after its protocol, authentication, lifecycle, and failure tests are explicit.
 
 ## License
 

@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+  pull-requests: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.34.5
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.15.0
+          package-manager-cache: false
+
+      - run: npm install --global npm@12.0.2
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm release:check
+
+      - name: Create or update the version pull request
+        if: vars.NPM_RELEASES_ENABLED != 'true'
+        uses: changesets/action@v2
+        with:
+          pr-draft: create
+
+      - name: Create the version pull request or publish packages
+        if: vars.NPM_RELEASES_ENABLED == 'true'
+        uses: changesets/action@v2
+        with:
+          pr-draft: create
+          publish-script: pnpm release:publish
