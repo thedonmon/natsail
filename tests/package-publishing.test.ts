@@ -58,6 +58,10 @@ describe('package publishing', () => {
   })
 
   it('uses gated trusted-publishing automation', async () => {
+    const ciWorkflow = await readFile(
+      new URL('../.github/workflows/ci.yml', import.meta.url),
+      'utf8'
+    )
     const workflow = await readFile(
       new URL('../.github/workflows/release.yml', import.meta.url),
       'utf8'
@@ -67,6 +71,7 @@ describe('package publishing', () => {
     ) as { access?: string; baseBranch?: string }
 
     expect(changesets).toMatchObject({ access: 'public', baseBranch: 'main' })
+    expect(ciWorkflow).toContain('ready_for_review')
     expect(workflow).toContain('id-token: write')
     expect(workflow).toContain("vars.NPM_RELEASES_ENABLED == 'true'")
     expect(workflow).toContain('pr-draft: create')
