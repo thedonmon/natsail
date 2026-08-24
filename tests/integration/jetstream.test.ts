@@ -1,8 +1,8 @@
-import { AckPolicy, jetstream, jetstreamManager, StorageType, type JsMsg } from '@nats-io/jetstream'
+import { AckPolicy, jetstream, jetstreamManager, StorageType } from '@nats-io/jetstream'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { createMemoryCheckpointStore } from '@natsail/checkpoints'
-import { createNatsRuntime } from '@natsail/core'
+import { createNatsRuntime, natsCodecs } from '@natsail/core'
 import { consumeJetStream, JetStreamResumeError } from '@natsail/jetstream'
 
 import { connectToTestNats, uniqueSubject } from './helpers.js'
@@ -41,9 +41,7 @@ describe('JetStream runtime adapter', () => {
       await adminConnection.drain()
     })
 
-    const encoder = new TextEncoder()
-    const decoder = new TextDecoder()
-    await client.publish(subject, encoder.encode('stored'))
+    await client.publish(subject, 'stored')
 
     const received: Array<{ sequence: number; value: string }> = []
     const lease = consumeJetStream(
@@ -52,9 +50,11 @@ describe('JetStream runtime adapter', () => {
         stream,
         filter: subject,
         start: 'all',
-        decode: (message) => decoder.decode(message.data),
+        maxBufferedBytes: 1024 * 1024,
+        codec: natsCodecs.text,
       },
       async (delivery) => {
+        expect(delivery.subject).toBe(subject)
         received.push({
           sequence: delivery.cursor.sequence,
           value: delivery.value,
@@ -66,7 +66,7 @@ describe('JetStream runtime adapter', () => {
     const orderedConsumers = await manager.consumers.list(stream).next()
     expect(orderedConsumers).toHaveLength(1)
     expect(orderedConsumers[0]!.config.ack_policy).toBe(AckPolicy.None)
-    await client.publish(subject, encoder.encode('live'))
+    await client.publish(subject, 'live')
 
     await expect
       .poll(() => received)
@@ -78,14 +78,14 @@ describe('JetStream runtime adapter', () => {
 
     await lease.close()
 
-    await client.publish(subject, encoder.encode('while-closed'))
+    await client.publish(subject, 'while-closed')
     const resumed = consumeJetStream(
       runtime,
       {
         stream,
         filter: subject,
         start: { after: 2 },
-        decode: (message) => decoder.decode(message.data),
+        codec: natsCodecs.text,
       },
       async (delivery) => {
         received.push({
@@ -133,11 +133,9 @@ describe('JetStream runtime adapter', () => {
       await adminConnection.drain()
     })
 
-    const encoder = new TextEncoder()
-    const decoder = new TextDecoder()
-    const first = await client.publish(selectedSubject, encoder.encode('selected-one'))
-    await client.publish(otherSubject, encoder.encode('other-two'))
-    const third = await client.publish(selectedSubject, encoder.encode('selected-three'))
+    const first = await client.publish(selectedSubject, 'selected-one')
+    await client.publish(otherSubject, 'other-two')
+    const third = await client.publish(selectedSubject, 'selected-three')
     const received: Array<{ sequence: number; value: string }> = []
     const options = {
       stream,
@@ -147,7 +145,7 @@ describe('JetStream runtime adapter', () => {
         key: 'conversation:filtered-sequence',
         store: checkpoints,
       },
-      decode: (message: JsMsg) => decoder.decode(message.data),
+      codec: natsCodecs.text,
     }
     const consume = () =>
       consumeJetStream(runtime, options, ({ cursor, value }) => {
@@ -164,8 +162,8 @@ describe('JetStream runtime adapter', () => {
       ])
     await initial.close()
 
-    await client.publish(otherSubject, encoder.encode('other-four'))
-    const fifth = await client.publish(selectedSubject, encoder.encode('selected-five'))
+    await client.publish(otherSubject, 'other-four')
+    const fifth = await client.publish(selectedSubject, 'selected-five')
     const resumed = consume()
     await resumed.ready
     await expect
@@ -208,10 +206,8 @@ describe('JetStream runtime adapter', () => {
       await adminConnection.drain()
     })
 
-    const encoder = new TextEncoder()
-    const decoder = new TextDecoder()
-    await client.publish(subject, encoder.encode('already-processed'))
-    await client.publish(subject, encoder.encode('next'))
+    await client.publish(subject, 'already-processed')
+    await client.publish(subject, 'next')
 
     let finishProcessing!: () => void
     const processing = new Promise<void>((resolve) => {
@@ -229,7 +225,7 @@ describe('JetStream runtime adapter', () => {
           key: 'conversation:one',
           store: checkpoints,
         },
-        decode: (message) => decoder.decode(message.data),
+        codec: natsCodecs.text,
       },
       async (delivery) => {
         received.push(delivery.value)
@@ -263,10 +259,9 @@ describe('JetStream runtime adapter', () => {
       subjects: [subject],
       storage: StorageType.Memory,
     })
-    const encoder = new TextEncoder()
-    await client.publish(subject, encoder.encode('one'))
-    await client.publish(subject, encoder.encode('two'))
-    await client.publish(subject, encoder.encode('three'))
+    await client.publish(subject, 'one')
+    await client.publish(subject, 'two')
+    await client.publish(subject, 'three')
     await manager.streams.purge(stream, { keep: 1 })
     const streamInfo = await manager.streams.info(stream)
     expect(streamInfo.state.first_seq).toBe(3)
@@ -294,7 +289,7 @@ describe('JetStream runtime adapter', () => {
           key: 'conversation:gap',
           store: checkpoints,
         },
-        decode: (message) => message.data,
+        codec: natsCodecs.bytes,
       },
       async () => undefined
     )
@@ -319,7 +314,7 @@ describe('JetStream runtime adapter', () => {
           store: checkpoints,
           retentionGapPolicy: 'continue',
         },
-        decode: (message) => new TextDecoder().decode(message.data),
+        codec: natsCodecs.text,
       },
       async (delivery) => {
         received.push(delivery.value)

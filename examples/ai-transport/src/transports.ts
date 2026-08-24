@@ -4,12 +4,15 @@ import type { UIMessage as TanStackUIMessage } from '@tanstack/ai-client'
 import type { RunAgentInputContext, SubscribeConnectionAdapter } from '@tanstack/ai-react'
 
 import { createIndexedDbCheckpointStore } from '@natsail/checkpoints'
-import type { NatsRuntime, SubscriptionLease } from '@natsail/core'
+import {
+  natsCodecs,
+  type NatsPayloadCodec,
+  type NatsRuntime,
+  type SubscriptionLease,
+} from '@natsail/core'
 import { consumeJetStream, type JetStreamDuplicateDeliveryPolicy } from '@natsail/jetstream'
 import { clearActiveRun, loadActiveRun, saveActiveRun } from './chat-persistence'
 
-const encoder = new TextEncoder()
-const decoder = new TextDecoder()
 const requestSubject = 'natsail.examples.ai.requests'
 const checkpoints = createIndexedDbCheckpointStore({ databaseName: 'natsail-ai-example' })
 
@@ -59,15 +62,20 @@ interface WireErrorFrame {
 }
 
 type WireFrame = WireChunkFrame | WireEndFrame | WireErrorFrame
+const jsonCodec = natsCodecs.json<unknown>()
 
-const decodeWireFrame = (data: Uint8Array): WireFrame => {
-  const value: unknown = JSON.parse(decoder.decode(data))
+const decodeWireFrame = (value: unknown): WireFrame => {
   if (!value || typeof value !== 'object') throw new Error('Invalid AI transport frame')
   const frame = value as Partial<WireFrame>
   if (frame.type === 'chunk' && 'chunk' in frame) return frame as WireChunkFrame
   if (frame.type === 'end') return frame as WireEndFrame
   if (frame.type === 'error' && typeof frame.message === 'string') return frame as WireErrorFrame
   throw new Error('Unknown AI transport frame')
+}
+
+const wireFrameCodec: NatsPayloadCodec<WireFrame> = {
+  encode: (frame) => jsonCodec.encode(frame),
+  decode: (data) => decodeWireFrame(jsonCodec.decode(data)),
 }
 
 const eventType = (chunk: unknown): string => {
@@ -108,7 +116,7 @@ const subscribeToFrames = (
     return runtime.subscribe<WireFrame>(
       {
         subject: replySubject,
-        decode: (message) => decodeWireFrame(message.data),
+        codec: wireFrameCodec,
       },
       (frame) => handler(frame, {})
     )
@@ -130,7 +138,7 @@ const subscribeToFrames = (
             },
           }
         : {}),
-      decode: (message) => decodeWireFrame(message.data),
+      codec: wireFrameCodec,
     },
     (frame) =>
       handler(frame.value, {
@@ -256,19 +264,17 @@ export class NatsAiSdkChatTransport<UI_MESSAGE extends UIMessage = UIMessage>
           }
           await this.runtime.publish(
             requestSubject,
-            encoder.encode(
-              JSON.stringify({
-                framework: 'ai-sdk',
-                delivery: this.delivery,
-                replySubject,
-                payload: {
-                  trigger: options.trigger,
-                  chatId: options.chatId,
-                  messageId: options.messageId,
-                  messages: options.messages,
-                },
-              })
-            )
+            jsonCodec.encode({
+              framework: 'ai-sdk',
+              delivery: this.delivery,
+              replySubject,
+              payload: {
+                trigger: options.trigger,
+                chatId: options.chatId,
+                messageId: options.messageId,
+                messages: options.messages,
+              },
+            })
           )
         } catch (error) {
           clearActiveRun('ai-sdk', this.delivery)
@@ -591,18 +597,16 @@ export class NatsTanStackConnection implements SubscribeConnectionAdapter {
     try {
       await this.runtime.publish(
         requestSubject,
-        encoder.encode(
-          JSON.stringify({
-            framework: 'tanstack-ai',
-            delivery: this.delivery,
-            replySubject: this.replySubject,
-            payload: {
-              messages,
-              data,
-              runContext,
-            },
-          })
-        )
+        jsonCodec.encode({
+          framework: 'tanstack-ai',
+          delivery: this.delivery,
+          replySubject: this.replySubject,
+          payload: {
+            messages,
+            data,
+            runContext,
+          },
+        })
       )
     } catch (error) {
       clearActiveRun('tanstack-ai', this.delivery)

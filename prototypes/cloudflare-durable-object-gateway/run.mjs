@@ -18,8 +18,6 @@ const websocketUrl = 'ws://127.0.0.1:8791'
 const token = 'prototype-only'
 const stream = 'NATSAIL_GATEWAY_PROTOTYPE'
 const subjectPrefix = 'prototype.gateway.>'
-const encoder = new TextEncoder()
-
 let admin
 let manager
 let wrangler
@@ -279,10 +277,7 @@ try {
     persistedGatewayCursor: beforeRestart.checkpoint,
   })
 
-  const missed = await js.publish(
-    beforeRestart.subject,
-    encoder.encode('stored-while-object-was-down')
-  )
+  const missed = await js.publish(beforeRestart.subject, 'stored-while-object-was-down')
   print('ACTION: JETSTREAM STORED A MESSAGE WHILE THE OBJECT WAS DOWN', {
     streamSequence: missed.seq,
   })

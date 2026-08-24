@@ -76,13 +76,13 @@ import {
   type PageRecoveryState,
   type TransportReceipt,
 } from './transports'
+import { natsCodecs, type NatsPayloadCodec } from '@natsail/core'
 
 const gatewayPrompt = 'Help me plan the gateway release.'
 const reconnectPrompt = "What happens if the connection drops while you're answering?"
 const conversationStream = 'NATSAIL_AI_CONVERSATIONS'
 const conversationSubject = 'natsail.examples.ai.conversations.release-room'
 const clientId = getOrCreateClientId()
-const encoder = new TextEncoder()
 
 interface Receipt extends TransportReceipt {
   id: number
@@ -113,6 +113,7 @@ interface ConversationReadyFrame {
 }
 
 type ConversationFrame = ConversationMessageFrame | ConversationReadyFrame
+const conversationJsonCodec = natsCodecs.json<unknown>()
 
 interface ConversationStreamState {
   history: DisplayMessage[]
@@ -125,8 +126,7 @@ interface ConversationStreamState {
 
 type ReconnectPhase = 'idle' | 'reconnecting' | 'recovering' | 'reconnected'
 
-const decodeConversationFrame = (data: Uint8Array): ConversationFrame => {
-  const value: unknown = JSON.parse(new TextDecoder().decode(data))
+const decodeConversationFrame = (value: unknown): ConversationFrame => {
   if (!value || typeof value !== 'object') throw new Error('Invalid conversation event')
   const frame = value as Partial<ConversationFrame>
   if (frame.type === 'history-ready' && typeof frame.id === 'string') {
@@ -143,6 +143,11 @@ const decodeConversationFrame = (data: Uint8Array): ConversationFrame => {
     return frame as ConversationMessageFrame
   }
   throw new Error('Unknown conversation event')
+}
+
+const conversationCodec: NatsPayloadCodec<ConversationFrame> = {
+  encode: (frame) => conversationJsonCodec.encode(frame),
+  decode: (data) => decodeConversationFrame(conversationJsonCodec.decode(data)),
 }
 
 const randomStreamMessages = [
@@ -167,7 +172,7 @@ function useConversationStream(): ConversationStreamState {
         start: 'all',
         maxBufferedMessages: 32,
         duplicateDeliveryPolicy: 'drop',
-        decode: (message) => decodeConversationFrame(message.data),
+        codec: conversationCodec,
       },
       ({ value, cursor: nextCursor }) => {
         setCursor(nextCursor.sequence)
@@ -207,16 +212,14 @@ function useConversationStream(): ConversationStreamState {
         randomStreamMessages[Math.floor(Math.random() * randomStreamMessages.length)]!
       await runtime.publish(
         conversationSubject,
-        encoder.encode(
-          JSON.stringify({
-            type: 'message',
-            id: `injected-${crypto.randomUUID()}`,
-            phase: 'live',
-            role: 'assistant',
-            author,
-            text,
-          } satisfies ConversationMessageFrame)
-        )
+        conversationCodec.encode({
+          type: 'message',
+          id: `injected-${crypto.randomUUID()}`,
+          phase: 'live',
+          role: 'assistant',
+          author,
+          text,
+        } satisfies ConversationMessageFrame)
       )
     } catch (cause) {
       setError(cause instanceof Error ? cause : new Error(String(cause)))

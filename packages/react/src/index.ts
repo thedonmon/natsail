@@ -11,12 +11,27 @@ import {
   type ReactNode,
 } from 'react'
 
-import type { CoreSubscriptionOptions, NatsRuntime, NatsRuntimeStatusEvent } from '@natsail/core'
+import type {
+  CoreSubscriptionOptions,
+  NatsConnection,
+  NatsRuntime,
+  NatsRuntimeStatusEvent,
+  SubscriptionLease,
+} from '@natsail/core'
+import {
+  createJetStreamSessionSource,
+  processJetStream,
+  type JetStreamDelivery,
+  type JetStreamProcessorHandler,
+  type JetStreamProcessorOptions,
+  type JetStreamSubscriptionOptions,
+} from '@natsail/jetstream'
 import { createCoreSessionSource, createReducingSessionSource } from '@natsail/session'
 import type {
   SessionReducer,
   SessionHandle,
   SessionRegistry,
+  SessionPhase,
   SessionSnapshot,
   SessionSource,
 } from '@natsail/session'
@@ -78,6 +93,58 @@ export function NatsProvider({ children, runtime, sessions }: NatsProviderProps)
 /** Returns the runtime supplied by the nearest NatsProvider. */
 export function useNatsRuntime(): NatsRuntime {
   return useRequiredContext().runtime
+}
+
+export interface NatsConnectionSnapshot {
+  connection: NatsConnection | null
+  status: NatsRuntimeStatusEvent
+  error?: unknown
+}
+
+/** Resolves and follows the runtime-owned connection for advanced nats.js operations. */
+export function useNatsConnection(runtime?: NatsRuntime): NatsConnectionSnapshot {
+  const context = useContext(NatsContext)
+  const activeRuntime = runtime ?? context?.runtime
+  if (!activeRuntime) {
+    throw new Error('useNatsConnection requires a runtime or a NatsProvider')
+  }
+  const status = useNatsRuntimeStatus(activeRuntime)
+  const [active, setActive] = useState<{
+    runtime: NatsRuntime
+    connection: NatsConnection | null
+    error?: unknown
+  } | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    if (status.state === 'closed') {
+      setActive({ runtime: activeRuntime, connection: null })
+      return () => {
+        cancelled = true
+      }
+    }
+
+    void activeRuntime.connection().then(
+      (connection) => {
+        if (!cancelled) setActive({ runtime: activeRuntime, connection })
+      },
+      (error) => {
+        if (!cancelled) setActive({ runtime: activeRuntime, connection: null, error })
+      }
+    )
+
+    return () => {
+      cancelled = true
+    }
+  }, [activeRuntime, status.at, status.state])
+
+  return {
+    connection: active?.runtime === activeRuntime ? active.connection : null,
+    status,
+    ...(active?.runtime === activeRuntime && active.error !== undefined
+      ? { error: active.error }
+      : {}),
+  }
 }
 
 /** Returns the session registry supplied by the nearest NatsProvider. */
@@ -157,6 +224,103 @@ export function useNatsCoreSubscription<T>(
 ): SessionSnapshot<T> {
   const { runtime } = useRequiredContext()
   return useNatsSession(key, createCoreSessionSource(runtime, options))
+}
+
+/** Opens one registry-shared checkpointed JetStream session through the nearest provider. */
+export function useNatsJetStreamSubscription<T>(
+  key: string,
+  options: JetStreamSubscriptionOptions<T>
+): SessionSnapshot<JetStreamDelivery<T>> {
+  const { runtime } = useRequiredContext()
+  return useNatsSession(key, createJetStreamSessionSource(runtime, options))
+}
+
+export interface NatsJetStreamProcessorSnapshot {
+  phase: SessionPhase
+  error?: unknown
+}
+
+/**
+ * Owns one explicit-ack processor lease for the lifetime of `key`.
+ * Change the key whenever the consumer configuration changes.
+ */
+export function useNatsJetStreamProcessor<T>(
+  key: string,
+  options: JetStreamProcessorOptions<T> | null,
+  handler: JetStreamProcessorHandler<T>
+): NatsJetStreamProcessorSnapshot {
+  const { runtime } = useRequiredContext()
+  const optionsRef = useRef(options)
+  const handlerRef = useRef(handler)
+  optionsRef.current = options
+  handlerRef.current = handler
+  const [active, setActive] = useState<{
+    key: string
+    snapshot: NatsJetStreamProcessorSnapshot
+  } | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    if (optionsRef.current === null) {
+      setActive({ key, snapshot: { phase: 'closed' } })
+      return () => {
+        cancelled = true
+      }
+    }
+    setActive({ key, snapshot: { phase: 'connecting' } })
+    let lease: SubscriptionLease
+    try {
+      lease = processJetStream(runtime, optionsRef.current, (delivery) =>
+        handlerRef.current(delivery)
+      )
+    } catch (error) {
+      setActive({ key, snapshot: { phase: 'error', error } })
+      return () => {
+        cancelled = true
+      }
+    }
+
+    void lease.ready.then(
+      () => {
+        if (!cancelled) setActive({ key, snapshot: { phase: 'live' } })
+      },
+      (error) => {
+        if (!cancelled) setActive({ key, snapshot: { phase: 'error', error } })
+      }
+    )
+    void lease.closed.then(
+      () => {
+        if (!cancelled) setActive({ key, snapshot: { phase: 'closed' } })
+      },
+      (error) => {
+        if (!cancelled) setActive({ key, snapshot: { phase: 'error', error } })
+      }
+    )
+
+    return () => {
+      cancelled = true
+      void lease.close().catch(() => undefined)
+    }
+  }, [key, options !== null, runtime])
+
+  if (options === null) return { phase: 'closed' }
+  return active?.key === key ? active.snapshot : { phase: 'connecting' }
+}
+
+/** Selects state from one registry-shared checkpointed JetStream session. */
+export function useNatsJetStreamSubscriptionSelector<T, Selected>(
+  key: string,
+  options: JetStreamSubscriptionOptions<T>,
+  selector: (snapshot: SessionSnapshot<JetStreamDelivery<T>>) => Selected,
+  isEqual?: (previous: Selected, next: Selected) => boolean
+): Selected {
+  const { runtime } = useRequiredContext()
+  return useNatsSessionSelector(
+    key,
+    createJetStreamSessionSource(runtime, options),
+    selector,
+    isEqual
+  )
 }
 
 /**

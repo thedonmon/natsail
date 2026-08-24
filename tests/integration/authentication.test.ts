@@ -1,6 +1,6 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { createNatsRuntime } from '@natsail/core'
+import { createNatsRuntime, natsCodecs } from '@natsail/core'
 
 import {
   connectToJwtTestNats,
@@ -27,7 +27,7 @@ describe('authenticated connection factories', () => {
     const lease = runtime.subscribe(
       {
         subject,
-        decode: (message) => new TextDecoder().decode(message.data),
+        codec: natsCodecs.text,
       },
       async (value) => {
         received.push(value)
@@ -35,7 +35,7 @@ describe('authenticated connection factories', () => {
     )
 
     await lease.ready
-    await runtime.publish(subject, new TextEncoder().encode('authenticated'))
+    await runtime.publish(subject, 'authenticated')
     const connection = await runtime.connection()
     await connection.flush()
     await expect.poll(() => received).toEqual(['authenticated'])
@@ -50,7 +50,7 @@ describe('authenticated connection factories', () => {
     const lease = runtime.subscribe(
       {
         subject,
-        decode: (message) => new TextDecoder().decode(message.data),
+        codec: natsCodecs.text,
       },
       async (value) => {
         received.push(value)
@@ -58,7 +58,7 @@ describe('authenticated connection factories', () => {
     )
 
     await lease.ready
-    await runtime.publish(subject, new TextEncoder().encode('authenticated'))
+    await runtime.publish(subject, 'authenticated')
     const connection = await runtime.connection()
     await connection.flush()
     await expect.poll(() => received).toEqual(['authenticated'])
@@ -73,7 +73,7 @@ describe('authenticated connection factories', () => {
     const lease = runtime.subscribe(
       {
         subject,
-        decode: (message) => new TextDecoder().decode(message.data),
+        codec: natsCodecs.text,
       },
       async (value) => {
         received.push(value)
@@ -81,7 +81,7 @@ describe('authenticated connection factories', () => {
     )
 
     await lease.ready
-    await runtime.publish(subject, new TextEncoder().encode('authenticated'))
+    await runtime.publish(subject, 'authenticated')
     const connection = await runtime.connection()
     await connection.flush()
     await expect.poll(() => received).toEqual(['authenticated'])
@@ -96,7 +96,7 @@ describe('authenticated connection factories', () => {
     const lease = runtime.subscribe(
       {
         subject,
-        decode: (message) => new TextDecoder().decode(message.data),
+        codec: natsCodecs.text,
       },
       async (value) => {
         received.push(value)
@@ -104,7 +104,7 @@ describe('authenticated connection factories', () => {
     )
 
     await lease.ready
-    await runtime.publish(subject, new TextEncoder().encode('encrypted'))
+    await runtime.publish(subject, 'encrypted')
     const connection = await runtime.connection()
     await connection.flush()
     await expect.poll(() => received).toEqual(['encrypted'])
@@ -119,7 +119,7 @@ describe('authenticated connection factories', () => {
     const lease = runtime.subscribe(
       {
         subject,
-        decode: (message) => new TextDecoder().decode(message.data),
+        codec: natsCodecs.text,
       },
       async (value) => {
         received.push(value)
@@ -127,9 +127,24 @@ describe('authenticated connection factories', () => {
     )
 
     await lease.ready
-    await runtime.publish(subject, new TextEncoder().encode('authenticated'))
+    await runtime.publish(subject, 'authenticated')
     const connection = await runtime.connection()
     await connection.flush()
     await expect.poll(() => received).toEqual(['authenticated'])
+  })
+
+  it('runs the JWT authenticator again after a forced runtime reconnect', async () => {
+    const onAuthenticate = vi.fn()
+    const runtime = createNatsRuntime({
+      connect: () => connectToJwtTestNats(onAuthenticate),
+    })
+    closeAfterTest.push(() => runtime.close())
+
+    const connection = await runtime.connection()
+    expect(onAuthenticate).toHaveBeenCalledOnce()
+
+    await runtime.reconnect({ reason: 'credentials-changed' })
+    await expect.poll(() => onAuthenticate, { timeout: 5_000 }).toHaveBeenCalledTimes(2)
+    await connection.flush()
   })
 })

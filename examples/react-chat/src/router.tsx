@@ -8,7 +8,12 @@ import {
 } from '@tanstack/react-router'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-import type { CoreSubscriptionOptions, NatsRuntimeConnectionState } from '@natsail/core'
+import {
+  natsCodecs,
+  type CoreSubscriptionOptions,
+  type NatsPayloadCodec,
+  type NatsRuntimeConnectionState,
+} from '@natsail/core'
 import {
   isChatMessage,
   rooms,
@@ -26,18 +31,21 @@ import {
 import type { SessionPhase } from '@natsail/session'
 
 const subjectPrefix = 'example.chat'
-const encoder = new TextEncoder()
-const decoder = new TextDecoder()
 const emptyTimeline: TimelineEntry[] = []
 const names = ['Avery', 'Mika', 'Noor', 'Sol', 'Tess', 'Zed']
-
-const chatFeedOptions: CoreSubscriptionOptions<ChatMessage> = {
-  subject: `${subjectPrefix}.>`,
-  decode: (message) => {
-    const value: unknown = JSON.parse(decoder.decode(message.data))
+const jsonCodec = natsCodecs.json<unknown>()
+const chatCodec: NatsPayloadCodec<ChatMessage> = {
+  encode: (message) => jsonCodec.encode(message),
+  decode: (data) => {
+    const value = jsonCodec.decode(data)
     if (!isChatMessage(value)) throw new Error('Received an invalid chat message')
     return value
   },
+}
+
+const chatFeedOptions: CoreSubscriptionOptions<ChatMessage> = {
+  subject: `${subjectPrefix}.>`,
+  codec: chatCodec,
 }
 
 const roomQuery = queryOptions({
@@ -187,10 +195,7 @@ function ReactChatRoom() {
 
   const publish = useCallback(
     async (message: ChatMessage): Promise<void> => {
-      await runtime.publish(
-        `${subjectPrefix}.${message.roomId}`,
-        encoder.encode(JSON.stringify(message))
-      )
+      await runtime.publish(`${subjectPrefix}.${message.roomId}`, chatCodec.encode(message))
     },
     [runtime]
   )

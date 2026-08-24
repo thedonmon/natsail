@@ -1,7 +1,7 @@
 import { jetstream, jetstreamManager, StorageType } from '@nats-io/jetstream'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { createNatsRuntime, NatsRuntimeLimitError } from '@natsail/core'
+import { createNatsRuntime, natsCodecs, NatsRuntimeLimitError } from '@natsail/core'
 import { consumeJetStream } from '@natsail/jetstream'
 
 import { connectToTestNats, uniqueSubject } from './helpers.js'
@@ -47,7 +47,6 @@ describe('multiple conversations in one runtime', () => {
     })
 
     const received = new Set<string>()
-    const decoder = new TextDecoder()
     const leases = Array.from({ length: conversationCount }, (_, index) => {
       const subject = `${subjectPrefix}.${index}`
       return consumeJetStream(
@@ -57,7 +56,7 @@ describe('multiple conversations in one runtime', () => {
           filter: subject,
           start: 'new',
           maxBufferedMessages: perConversationBuffer,
-          decode: (message) => decoder.decode(message.data),
+          codec: natsCodecs.text,
         },
         async (value) => {
           received.add(value.value)
@@ -71,10 +70,9 @@ describe('multiple conversations in one runtime', () => {
       .poll(async () => (await manager.streams.info(stream)).state.consumer_count)
       .toBe(conversationCount)
 
-    const encoder = new TextEncoder()
     await Promise.all(
       Array.from({ length: conversationCount }, (_, index) =>
-        client.publish(`${subjectPrefix}.${index}`, encoder.encode(`conversation-${index}`))
+        client.publish(`${subjectPrefix}.${index}`, `conversation-${index}`)
       )
     )
 
@@ -114,7 +112,7 @@ describe('multiple conversations in one runtime', () => {
           filter: `${subjectPrefix}.${index}`,
           start: 'new',
           maxBufferedMessages: 1,
-          decode: (message) => message.data,
+          codec: natsCodecs.bytes,
         },
         async () => undefined
       )
@@ -174,7 +172,7 @@ describe('multiple conversations in one runtime', () => {
           filter: `${subjectPrefix}.${index}`,
           start: 'new',
           maxBufferedMessages,
-          decode: (message) => message.data,
+          codec: natsCodecs.bytes,
         },
         async () => undefined
       )

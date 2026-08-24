@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { createNatsRuntime } from '@natsail/core'
+import { createNatsRuntime, natsCodecs } from '@natsail/core'
 
 import { connectToTestNats, uniqueSubject } from './helpers.js'
 
@@ -22,28 +22,26 @@ describe('Core NATS runtime', () => {
     })
     closeAfterTest.push(() => runtime.close())
 
-    const encoder = new TextEncoder()
-    const decoder = new TextDecoder()
     const firstSubject = uniqueSubject('core.first')
     const secondSubject = uniqueSubject('core.second')
     const received: string[] = []
 
     const first = runtime.subscribe(
-      { subject: firstSubject, decode: (message) => decoder.decode(message.data) },
+      { subject: firstSubject, codec: natsCodecs.text },
       async (value) => {
         received.push(`first:${value}`)
       }
     )
     const second = runtime.subscribe(
-      { subject: secondSubject, decode: (message) => decoder.decode(message.data) },
+      { subject: secondSubject, codec: natsCodecs.text },
       async (value) => {
         received.push(`second:${value}`)
       }
     )
 
     await Promise.all([first.ready, second.ready])
-    await runtime.publish(firstSubject, encoder.encode('one'))
-    await runtime.publish(secondSubject, encoder.encode('two'))
+    await runtime.publish(firstSubject, 'one')
+    await runtime.publish(secondSubject, 'two')
     await connection.flush()
 
     await expect.poll(() => received).toEqual(['first:one', 'second:two'])

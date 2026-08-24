@@ -1,7 +1,7 @@
 import { jetstream, jetstreamManager, StorageType } from '@nats-io/jetstream'
 import { wsconnect } from '@nats-io/nats-core'
 
-import { createNatsRuntime, type NatsRuntime } from '@natsail/core'
+import { createNatsRuntime, natsCodecs, type NatsRuntime } from '@natsail/core'
 import { consumeJetStream, type JetStreamLease } from '@natsail/jetstream'
 
 interface BrowserLoadResult {
@@ -63,7 +63,6 @@ window.runNatsailBrowserLoad = async () => {
     })
     streamCreated = true
 
-    const decoder = new TextDecoder()
     const received = new Set<string>()
 
     for (let index = 0; index < conversationCount; index += 1) {
@@ -75,7 +74,7 @@ window.runNatsailBrowserLoad = async () => {
             filter: `${subjectPrefix}.${index}`,
             start: 'new',
             maxBufferedMessages: perConversationBuffer,
-            decode: (message) => decoder.decode(message.data),
+            codec: natsCodecs.text,
           },
           async (delivery) => {
             received.add(delivery.value)

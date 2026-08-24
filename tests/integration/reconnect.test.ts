@@ -3,7 +3,7 @@ import type { NatsConnection } from '@nats-io/nats-core'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { createMemoryCheckpointStore } from '@natsail/checkpoints'
-import { createNatsRuntime, type NatsRuntimeEvent } from '@natsail/core'
+import { createNatsRuntime, natsCodecs, type NatsRuntimeEvent } from '@natsail/core'
 import { consumeJetStream } from '@natsail/jetstream'
 
 import { connectToTestNats, uniqueSubject } from './helpers.js'
@@ -38,14 +38,12 @@ describe('forced reconnect recovery', () => {
     const runtime = createNatsRuntime({ connect: async () => connection })
     closeAfterTest.push(() => runtime.close())
 
-    const encoder = new TextEncoder()
-    const decoder = new TextDecoder()
     const subject = uniqueSubject('core-reconnect')
     const received: string[] = []
     const lease = runtime.subscribe(
       {
         subject,
-        decode: (message) => decoder.decode(message.data),
+        codec: natsCodecs.text,
       },
       async (value) => {
         received.push(value)
@@ -53,14 +51,14 @@ describe('forced reconnect recovery', () => {
     )
 
     await lease.ready
-    await runtime.publish(subject, encoder.encode('before'))
+    await runtime.publish(subject, 'before')
     await connection.flush()
     await expect.poll(() => received).toEqual(['before'])
 
     const statuses = await forceReconnect(connection)
     expect(statuses).toEqual(expect.arrayContaining(['forceReconnect', 'disconnect', 'reconnect']))
 
-    await runtime.publish(subject, encoder.encode('after'))
+    await runtime.publish(subject, 'after')
     await connection.flush()
     await expect.poll(() => received).toEqual(['before', 'after'])
   })
@@ -87,9 +85,7 @@ describe('forced reconnect recovery', () => {
     })
 
     const checkpoints = createMemoryCheckpointStore()
-    const encoder = new TextEncoder()
-    const decoder = new TextDecoder()
-    await client.publish(subject, encoder.encode('before'))
+    await client.publish(subject, 'before')
 
     const received: Array<{ duplicate: boolean; sequence: number; value: string }> = []
     const lease = consumeJetStream(
@@ -99,7 +95,7 @@ describe('forced reconnect recovery', () => {
         filter: subject,
         start: 'all',
         resume: { key: 'reconnect', store: checkpoints },
-        decode: (message) => decoder.decode(message.data),
+        codec: natsCodecs.text,
       },
       async (delivery) => {
         received.push({
@@ -114,10 +110,10 @@ describe('forced reconnect recovery', () => {
     await expect.poll(() => received).toEqual([{ duplicate: false, sequence: 1, value: 'before' }])
 
     const statuses = await forceReconnect(runtimeConnection, async () => {
-      await client.publish(subject, encoder.encode('during'))
+      await client.publish(subject, 'during')
     })
     expect(statuses).toEqual(expect.arrayContaining(['forceReconnect', 'disconnect', 'reconnect']))
-    await client.publish(subject, encoder.encode('after'))
+    await client.publish(subject, 'after')
 
     await expect
       .poll(() => received)
@@ -194,7 +190,7 @@ describe('forced reconnect recovery', () => {
         stream,
         filter: subject,
         start: 'new',
-        decode: (message) => new TextDecoder().decode(message.data),
+        codec: natsCodecs.text,
       },
       async (delivery) => {
         received.push(delivery.value)
@@ -206,7 +202,7 @@ describe('forced reconnect recovery', () => {
     expect(consumers).toHaveLength(1)
     await manager.consumers.delete(stream, consumers[0]!.name)
     await forceReconnect(runtimeConnection)
-    await client.publish(subject, new TextEncoder().encode('after-recreation'))
+    await client.publish(subject, 'after-recreation')
 
     await expect.poll(() => received, { timeout: 5_000 }).toEqual(['after-recreation'])
     await expect

@@ -2,7 +2,7 @@
 
 Research date: 2026-08-21. The repository pins `@nats-io/jetstream`, `@nats-io/nats-core`, and `@nats-io/transport-node` 3.4.0.
 
-This document records the initial research. See the [handoff](../HANDOFF.md) for the implemented interface and current limitations.
+This document records the initial research. See the [main README](../../README.md#current-limits) for the implemented interface and current limitations.
 
 ## Conclusion
 

@@ -8,6 +8,7 @@ import { connect } from '@nats-io/transport-node'
 import { jetstream, jetstreamManager, StorageType } from '@nats-io/jetstream'
 import { createChat as createAiSdkChat } from '@shadcn/helpers/ai-sdk'
 import { createChat as createTanStackChat } from '@shadcn/helpers/tanstack-ai'
+import { natsCodecs } from '@natsail/core'
 
 const root = fileURLToPath(new URL('../..', import.meta.url))
 const appDirectory = fileURLToPath(new URL('.', import.meta.url))
@@ -19,8 +20,7 @@ const responseStream = 'NATSAIL_AI_RESPONSES'
 const responseStreamSubjects = 'natsail.examples.ai.responses.jetstream.>'
 const conversationStream = 'NATSAIL_AI_CONVERSATIONS'
 const conversationSubject = 'natsail.examples.ai.conversations.release-room'
-const encoder = new TextEncoder()
-const decoder = new TextDecoder()
+const jsonCodec = natsCodecs.json()
 const gatewayPrompt = 'Help me plan the gateway release.'
 const reconnectPrompt = "What happens if the connection drops while you're answering?"
 
@@ -123,7 +123,7 @@ const runningServices = () => {
 
 const publishFrame = async (subject, frame, delivery) => {
   if (stopping) return
-  const data = encoder.encode(JSON.stringify({ ...frame, publishedAt: Date.now() }))
+  const data = jsonCodec.encode({ ...frame, publishedAt: Date.now() })
   if (delivery === 'jetstream') {
     await responderJetStream.publish(subject, data)
   } else {
@@ -134,7 +134,7 @@ const publishFrame = async (subject, frame, delivery) => {
 const handleRequest = async (message) => {
   let request
   try {
-    request = JSON.parse(decoder.decode(message.data))
+    request = jsonCodec.decode(message.data)
     if (!request || typeof request.replySubject !== 'string') {
       throw new Error('Request is missing a reply subject')
     }
@@ -283,7 +283,7 @@ try {
       },
     ]
     for (const event of history) {
-      await responderJetStream.publish(conversationSubject, encoder.encode(JSON.stringify(event)))
+      await responderJetStream.publish(conversationSubject, jsonCodec.encode(event))
     }
   }
   responderSubscription = responder.subscribe(requestSubject, {

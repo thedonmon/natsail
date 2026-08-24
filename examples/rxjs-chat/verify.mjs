@@ -99,7 +99,7 @@ try {
           'the React view observes RxJS state without opening another NATS subscription',
         ],
         currentBoundary:
-          'JetStream composition uses the generic SessionSource seam; a direct RxJS JetStream helper is not yet published',
+          'Controlled gap injection wraps the direct JetStream source with a custom SessionSource lifecycle',
         screenshot,
       },
       null,

@@ -132,14 +132,18 @@ export async function connectToTlsTestNats(): Promise<NatsConnection> {
   throw new Error(`Cannot connect to the TLS NATS server at ${tlsServer}`, { cause })
 }
 
-export async function connectToJwtTestNats(): Promise<NatsConnection> {
+export async function connectToJwtTestNats(onAuthenticate?: () => void): Promise<NatsConnection> {
   let cause: unknown
 
   for (let attempt = 0; attempt < 20; attempt += 1) {
     try {
+      const authenticate = credsAuthenticator(await readFile(jwtCredsFile))
       return await connect({
         servers: jwtServer,
-        authenticator: credsAuthenticator(await readFile(jwtCredsFile)),
+        authenticator: (nonce) => {
+          onAuthenticate?.()
+          return authenticate(nonce)
+        },
         timeout: 500,
       })
     } catch (error) {
