@@ -2,7 +2,12 @@
 
 import { wsconnect } from '@nats-io/nats-core'
 
-import { createNatsRuntime, type NatsRuntime, type SubscriptionLease } from '@natsail/core'
+import {
+  createNatsRuntime,
+  natsCodecs,
+  type NatsRuntime,
+  type SubscriptionLease,
+} from '@natsail/core'
 
 interface WorkerRequest {
   action: 'close' | 'publish' | 'stats' | 'subscribe'
@@ -17,8 +22,6 @@ interface ClientState {
 }
 
 const clients = new Set<ClientState>()
-const decoder = new TextDecoder()
-const encoder = new TextEncoder()
 let connectionRequests = 0
 let runtime: NatsRuntime | undefined
 
@@ -60,7 +63,7 @@ const handleRequest = async (client: ClientState, request: WorkerRequest): Promi
       const lease = activeRuntime.subscribe(
         {
           subject,
-          decode: (message) => decoder.decode(message.data),
+          codec: natsCodecs.text,
         },
         async (value) => {
           client.port.postMessage({ subject, type: 'delivery', value })
@@ -77,7 +80,7 @@ const handleRequest = async (client: ClientState, request: WorkerRequest): Promi
         throw new Error('A subject and value are required')
       }
 
-      await activeRuntime.publish(request.subject, encoder.encode(request.value))
+      await activeRuntime.publish(request.subject, request.value)
       postResult(client.port, request.id)
       return
 

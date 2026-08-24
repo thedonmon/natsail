@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { SubscriptionLease } from '@natsail/core'
 import {
   NatsProvider,
+  useNatsConnection,
   useNatsCoreSubscriptionReducer,
   useNatsCoreSubscriptionSelector,
   useNatsRuntime,
@@ -201,6 +202,40 @@ describe('React session adapter', () => {
       await Promise.resolve()
     })
     expect(container.textContent).toBe('reconnecting')
+
+    await act(async () => root.unmount())
+    await registry.close()
+  })
+
+  it('resolves the runtime-owned connection without application effects', async () => {
+    Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
+    const events = controllableEvents()
+    const connection = { getServer: () => 'nats://test' }
+    const connect = vi.fn().mockResolvedValue(connection)
+    const runtime = { events: events.iterable, connection: connect } as unknown as NatsRuntime
+    const registry = createSessionRegistry()
+    const container = document.createElement('div')
+    let root!: Root
+
+    function ConnectionProbe() {
+      const snapshot = useNatsConnection()
+      return createElement(
+        'output',
+        null,
+        `${snapshot.status.state}:${snapshot.connection?.getServer() ?? 'none'}`
+      )
+    }
+
+    await act(async () => {
+      root = createRoot(container)
+      root.render(
+        createElement(NatsProvider, { runtime, sessions: registry }, createElement(ConnectionProbe))
+      )
+      await Promise.resolve()
+    })
+
+    expect(container.textContent).toBe('idle:nats://test')
+    expect(connect).toHaveBeenCalledOnce()
 
     await act(async () => root.unmount())
     await registry.close()

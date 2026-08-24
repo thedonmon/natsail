@@ -18,7 +18,9 @@ The same Observable resumes after its processed checkpoint. The transcript displ
 
 ## What it proves
 
-- `observeNatsSessionValues()` adapts a JetStream `SessionSource` without a React-specific NATS hook.
+- `createJetStreamSessionSource()` opens the checkpointed source used by the recovery controller.
+- `observeNatsSessionValues()` adapts that custom-controlled source without a React-specific hook.
+- The source reserves byte capacity and uses a versioned checkpoint scope.
 - `scan()` preserves the complete multi-room timeline and each global stream cursor.
 - A second RxJS projection counts observed rooms from the same delivery stream.
 - `share()` keeps both projections on one keyed NATSail session source.

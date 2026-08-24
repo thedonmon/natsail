@@ -22,11 +22,15 @@ export interface SessionHandle<T> {
   readonly ready: Promise<void>
   getSnapshot(): SessionSnapshot<T>
   subscribe(listener: SessionListener): () => void
+  /** Reopens this logical source while preserving its shared handle and latest value. */
+  restart(): Promise<void>
   release(): Promise<void>
 }
 
 export interface SessionRegistry {
   acquire<T>(key: string, source: SessionSource<T>): SessionHandle<T>
+  /** Restarts an active logical session by key. */
+  restart(key: string): Promise<void>
   close(): Promise<void>
 }
 
@@ -65,26 +69,27 @@ export function createReducingSessionSource<Value, State>(
 }
 
 class SharedSession<T> {
-  readonly ready: Promise<void>
-
   private snapshot: SessionSnapshot<T> = {
     phase: 'connecting',
     revision: 0,
     valueRevision: 0,
   }
   private readonly listeners = new Set<SessionListener>()
-  private readonly lease: SubscriptionLease
+  private lease?: SubscriptionLease
+  private currentReady: Promise<void>
   private closePromise?: Promise<void>
+  private restartPromise: Promise<void> | undefined
   private references = 0
+  private generation = 0
+  private closeRequested = false
 
-  constructor(source: SessionSource<T>) {
-    this.lease = source(async (value) => this.accept(value))
-    this.ready = this.activate()
-    void this.ready.catch(() => undefined)
-    void this.lease.closed.then(
-      () => this.finish('closed'),
-      (error: unknown) => this.finish('error', error)
-    )
+  constructor(private readonly source: SessionSource<T>) {
+    this.currentReady = this.start()
+    void this.currentReady.catch(() => undefined)
+  }
+
+  get ready(): Promise<void> {
+    return this.currentReady
   }
 
   retain(): void {
@@ -106,25 +111,84 @@ class SharedSession<T> {
   }
 
   close(): Promise<void> {
-    this.closePromise ??= this.lease.close()
+    this.closeRequested = true
+    this.generation += 1
+    this.closePromise ??= (async () => {
+      try {
+        await (this.lease?.close() ?? Promise.resolve())
+      } finally {
+        if (this.snapshot.phase !== 'closed') {
+          this.update({
+            ...this.snapshot,
+            phase: 'closed',
+            revision: this.snapshot.revision + 1,
+          })
+        }
+      }
+    })()
     return this.closePromise
   }
 
-  private async activate(): Promise<void> {
+  restart(): Promise<void> {
+    if (this.closeRequested) {
+      return Promise.reject(new Error('The NATS session is closed'))
+    }
+
+    if (!this.restartPromise) {
+      this.restartPromise = this.restartSession().finally(() => {
+        this.restartPromise = undefined
+      })
+      this.currentReady = this.restartPromise
+    }
+    return this.restartPromise
+  }
+
+  private async start(): Promise<void> {
+    const generation = ++this.generation
     try {
-      await this.lease.ready
+      const lease = this.source(async (value) => this.accept(generation, value))
+      this.lease = lease
+      void lease.closed.then(
+        () => this.finish(generation, 'closed'),
+        (error: unknown) => this.finish(generation, 'error', error)
+      )
+
+      await lease.ready
+      if (generation !== this.generation || this.closeRequested) return
       this.update({
         ...this.snapshot,
         phase: 'live',
         revision: this.snapshot.revision + 1,
       })
     } catch (error) {
-      this.finish('error', error)
+      this.finish(generation, 'error', error)
       throw error
     }
   }
 
-  private async accept(value: T): Promise<void> {
+  private async restartSession(): Promise<void> {
+    const previous = this.lease
+    this.generation += 1
+    const { error: _error, ...current } = this.snapshot
+    this.update({
+      ...current,
+      phase: 'connecting',
+      revision: this.snapshot.revision + 1,
+    })
+    if (previous) {
+      await previous.close().catch(() => undefined)
+    }
+    if (this.closeRequested) {
+      throw new Error('The NATS session is closed')
+    }
+
+    this.currentReady = this.start()
+    void this.currentReady.catch(() => undefined)
+    return this.currentReady
+  }
+
+  private async accept(generation: number, value: T): Promise<void> {
+    if (generation !== this.generation) return
     if (this.snapshot.phase === 'closed' || this.snapshot.phase === 'error') {
       return
     }
@@ -137,7 +201,8 @@ class SharedSession<T> {
     })
   }
 
-  private finish(phase: 'closed' | 'error', error?: unknown): void {
+  private finish(generation: number, phase: 'closed' | 'error', error?: unknown): void {
+    if (generation !== this.generation || this.closeRequested) return
     if (this.snapshot.phase === 'closed' || this.snapshot.phase === 'error') {
       return
     }
@@ -186,9 +251,12 @@ class DefaultSessionRegistry implements SessionRegistry {
     let released = false
     return {
       key,
-      ready: session.ready,
+      get ready() {
+        return session.ready
+      },
       getSnapshot: () => session.getSnapshot(),
       subscribe: (listener) => session.subscribe(listener),
+      restart: () => session.restart(),
       release: async () => {
         if (released) {
           return
@@ -200,6 +268,17 @@ class DefaultSessionRegistry implements SessionRegistry {
         }
       },
     }
+  }
+
+  restart(key: string): Promise<void> {
+    if (this.closeRequested) {
+      return Promise.reject(new Error('The session registry is closed'))
+    }
+    const session = this.sessions.get(key)
+    if (!session) {
+      return Promise.reject(new Error(`No active NATS session exists for key ${key}`))
+    }
+    return session.restart()
   }
 
   close(): Promise<void> {

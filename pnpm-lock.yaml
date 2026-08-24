@@ -356,12 +356,18 @@ importers:
       '@natsail/core':
         specifier: workspace:^
         version: link:../core
+      '@natsail/session':
+        specifier: workspace:^
+        version: link:../session
 
   packages/react:
     dependencies:
       '@natsail/core':
         specifier: workspace:^
         version: link:../core
+      '@natsail/jetstream':
+        specifier: workspace:^
+        version: link:../jetstream
       '@natsail/session':
         specifier: workspace:^
         version: link:../session
@@ -374,6 +380,9 @@ importers:
       '@natsail/core':
         specifier: workspace:^
         version: link:../core
+      '@natsail/jetstream':
+        specifier: workspace:^
+        version: link:../jetstream
       '@natsail/session':
         specifier: workspace:^
         version: link:../session

@@ -6,6 +6,11 @@ import type {
   NatsRuntimeEvent,
   NatsRuntimeStatusEvent,
 } from '@natsail/core'
+import {
+  createJetStreamSessionSource,
+  type JetStreamDelivery,
+  type JetStreamSubscriptionOptions,
+} from '@natsail/jetstream'
 import { createCoreSessionSource } from '@natsail/session'
 import type { SessionRegistry, SessionSnapshot, SessionSource } from '@natsail/session'
 
@@ -57,6 +62,16 @@ export function observeNatsCoreSubscription<T>(
   options: CoreSubscriptionOptions<T>
 ): Observable<T> {
   return observeNatsSessionValues(registry, key, createCoreSessionSource(runtime, options))
+}
+
+/** Emits deliveries from one registry-shared checkpointed JetStream session. */
+export function observeNatsJetStreamSubscription<T>(
+  registry: SessionRegistry,
+  runtime: NatsRuntime,
+  key: string,
+  options: JetStreamSubscriptionOptions<T>
+): Observable<JetStreamDelivery<T>> {
+  return observeNatsSessionValues(registry, key, createJetStreamSessionSource(runtime, options))
 }
 
 /**

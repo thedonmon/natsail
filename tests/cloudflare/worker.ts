@@ -1,10 +1,7 @@
 import { type NatsConnection, wsconnect } from '@nats-io/nats-core'
 import { connect as tcpConnect } from '@nats-io/transport-node'
 
-import { createNatsRuntime } from '../../packages/core/src/index.js'
-
-const encoder = new TextEncoder()
-const decoder = new TextDecoder()
+import { createNatsRuntime, natsCodecs } from '../../packages/core/src/index.js'
 
 const waitFor = async (predicate: () => boolean, description: string): Promise<void> => {
   const deadline = Date.now() + 5_000
@@ -34,7 +31,7 @@ const probeConnection = async (
   const lease = runtime.subscribe(
     {
       subject,
-      decode: (message) => decoder.decode(message.data),
+      codec: natsCodecs.text,
     },
     async (value) => {
       received = value
@@ -46,7 +43,7 @@ const probeConnection = async (
     const connection = await runtime.connection()
     await connection.flush()
     const expected = `cloudflare-${transport}`
-    await runtime.publish(subject, encoder.encode(expected))
+    await runtime.publish(subject, expected)
     await connection.flush()
     await waitFor(() => received !== undefined, 'the Cloudflare Worker delivery')
 

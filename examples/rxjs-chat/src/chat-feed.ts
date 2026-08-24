@@ -1,17 +1,20 @@
 import { BehaviorSubject } from 'rxjs'
 
 import { createMemoryCheckpointStore } from '@natsail/checkpoints'
-import type { NatsRuntime, SubscriptionLease } from '@natsail/core'
+import {
+  natsCodecs,
+  type NatsPayloadCodec,
+  type NatsRuntime,
+  type SubscriptionLease,
+} from '@natsail/core'
 import { isChatMessage, type ChatMessage } from '@natsail/example-chat-ui'
-import { consumeJetStream, type JetStreamDelivery } from '@natsail/jetstream'
+import { createJetStreamSessionSource, type JetStreamDelivery } from '@natsail/jetstream'
 import type { SessionSource } from '@natsail/session'
 
 export const chatStream = 'NATSAIL_RXJS_CHAT'
 export const chatSubjectPrefix = 'natsail.examples.rxjs.chat'
 export const chatStreamSubjects = `${chatSubjectPrefix}.>`
 
-const encoder = new TextEncoder()
-const decoder = new TextDecoder()
 const checkpoints = createMemoryCheckpointStore()
 const delay = (milliseconds: number): Promise<void> =>
   new Promise((resolve) => window.setTimeout(resolve, milliseconds))
@@ -47,10 +50,14 @@ const deferred = <T>(): Deferred<T> => {
   return { promise, resolve, reject }
 }
 
-const decodeMessage = (data: Uint8Array): ChatMessage => {
-  const value: unknown = JSON.parse(decoder.decode(data))
-  if (!isChatMessage(value)) throw new Error('Received an invalid RxJS chat message')
-  return value
+const jsonCodec = natsCodecs.json<unknown>()
+const chatCodec: NatsPayloadCodec<ChatMessage> = {
+  encode: (message) => jsonCodec.encode(message),
+  decode: (data) => {
+    const value = jsonCodec.decode(data)
+    if (!isChatMessage(value)) throw new Error('Received an invalid RxJS chat message')
+    return value
+  },
 }
 
 export class RecoverableChatFeed {
@@ -98,10 +105,7 @@ export class RecoverableChatFeed {
   constructor(private readonly runtime: NatsRuntime) {}
 
   async publish(message: ChatMessage): Promise<void> {
-    await this.runtime.publish(
-      `${chatSubjectPrefix}.${message.roomId}`,
-      encoder.encode(JSON.stringify(message))
-    )
+    await this.runtime.publish(`${chatSubjectPrefix}.${message.roomId}`, chatCodec.encode(message))
   }
 
   async recover(roomId: string): Promise<void> {
@@ -137,43 +141,41 @@ export class RecoverableChatFeed {
 
   private async open(): Promise<void> {
     if (!this.accept || this.stopped) return
-    const lease = consumeJetStream(
-      this.runtime,
-      {
-        stream: chatStream,
-        filter: chatStreamSubjects,
-        start: 'all',
-        maxBufferedMessages: 32,
-        duplicateDeliveryPolicy: 'drop',
-        resume: {
-          key: 'rxjs-chat:all-rooms',
-          store: checkpoints,
-        },
-        decode: (message) => decodeMessage(message.data),
+    const source = createJetStreamSessionSource(this.runtime, {
+      stream: chatStream,
+      filter: chatStreamSubjects,
+      start: 'all',
+      maxBufferedBytes: 1024 * 1024,
+      duplicateDeliveryPolicy: 'drop',
+      resume: {
+        key: 'rxjs-chat:all-rooms',
+        store: checkpoints,
+        scope: 'chat-message:v1',
       },
-      async (delivery) => {
-        await this.accept?.(delivery)
-        if (!this.pendingRecoveryIds.delete(delivery.value.id)) return
+      codec: chatCodec,
+    })
+    const lease = source(async (delivery) => {
+      await this.accept?.(delivery)
+      if (!this.pendingRecoveryIds.delete(delivery.value.id)) return
 
-        const retainedFrom = Math.min(
-          this.state$.value.retainedFrom ?? delivery.cursor.sequence,
-          delivery.cursor.sequence
-        )
-        const retainedThrough = Math.max(
-          this.state$.value.retainedThrough ?? delivery.cursor.sequence,
-          delivery.cursor.sequence
-        )
-        this.patch({ retainedFrom, retainedThrough })
-        if (this.pendingRecoveryIds.size === 0) {
-          this.patch({
-            phase: 'live',
-            catchUpCount: this.state$.value.catchUpCount + 1,
-          })
-          this.recoveryComplete?.resolve()
-          this.recoveryComplete = undefined
-        }
+      const retainedFrom = Math.min(
+        this.state$.value.retainedFrom ?? delivery.cursor.sequence,
+        delivery.cursor.sequence
+      )
+      const retainedThrough = Math.max(
+        this.state$.value.retainedThrough ?? delivery.cursor.sequence,
+        delivery.cursor.sequence
+      )
+      this.patch({ retainedFrom, retainedThrough })
+      if (this.pendingRecoveryIds.size === 0) {
+        this.patch({
+          phase: 'live',
+          catchUpCount: this.state$.value.catchUpCount + 1,
+        })
+        this.recoveryComplete?.resolve()
+        this.recoveryComplete = undefined
       }
-    )
+    })
     this.activeLease = lease
     void lease.closed.then(
       () => {

@@ -43,6 +43,7 @@
   },
   "dependencies": {
     "@natsail/core": "workspace:^",
+    "@natsail/jetstream": "workspace:^",
     "@natsail/session": "workspace:^"
   },
   "peerDependencies": {

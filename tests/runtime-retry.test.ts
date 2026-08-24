@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import type { NatsConnection } from '@nats-io/nats-core'
+import type { NatsConnection, Status } from '@nats-io/nats-core'
 import { createNatsRuntime } from '@natsail/core'
 
 describe('runtime initial connection retry', () => {
@@ -89,10 +89,132 @@ describe('runtime initial connection retry', () => {
       })
     ).toThrow('delayMs')
   })
+
+  it('supports error-aware retry decisions and computed delays', async () => {
+    vi.useFakeTimers()
+    try {
+      const connection = fakeConnection()
+      const connect = vi
+        .fn<() => Promise<NatsConnection>>()
+        .mockRejectedValueOnce(new Error('offline'))
+        .mockResolvedValue(connection)
+      const delayMs = vi.fn(() => 25)
+      const shouldRetry = vi.fn(() => true)
+      const runtime = createNatsRuntime({
+        connect,
+        initialConnectRetry: { maxAttempts: 2, delayMs, shouldRetry },
+      })
+
+      const pending = runtime.connection()
+      await vi.runAllTimersAsync()
+
+      await expect(pending).resolves.toBe(connection)
+      expect(shouldRetry).toHaveBeenCalledWith(
+        expect.objectContaining({ attempt: 1, maxAttempts: 2, error: expect.any(Error) })
+      )
+      expect(delayMs).toHaveBeenCalledWith(
+        expect.objectContaining({ attempt: 1, maxAttempts: 2, error: expect.any(Error) })
+      )
+      await runtime.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('replaces a permanently closed connection without closing the runtime event stream', async () => {
+    const first = controllableConnection('nats://first')
+    const second = controllableConnection('nats://second')
+    const connect = vi
+      .fn<() => Promise<NatsConnection>>()
+      .mockResolvedValueOnce(first.connection)
+      .mockResolvedValueOnce(second.connection)
+    const runtime = createNatsRuntime({ connect })
+    const iterator = runtime.events[Symbol.asyncIterator]()
+
+    await expect(runtime.connection()).resolves.toBe(first.connection)
+    expect(runtime.inspect()).toEqual(
+      expect.objectContaining({ connectionGeneration: 1, activeResources: 0 })
+    )
+
+    first.closePermanently()
+    await expect.poll(() => connect).toHaveBeenCalledTimes(2)
+    await expect(runtime.connection()).resolves.toBe(second.connection)
+    expect(runtime.inspect()).toEqual(
+      expect.objectContaining({
+        connection: expect.objectContaining({ state: 'connected', server: 'nats://second' }),
+        connectionGeneration: 2,
+      })
+    )
+
+    await runtime.close()
+    await expect(iterator.next()).resolves.toEqual(
+      expect.objectContaining({ done: false, value: expect.objectContaining({ state: 'idle' }) })
+    )
+  })
+
+  it('can wait for a caller before replacing a permanently closed connection', async () => {
+    const first = controllableConnection('nats://first')
+    const second = controllableConnection('nats://second')
+    const connect = vi
+      .fn<() => Promise<NatsConnection>>()
+      .mockResolvedValueOnce(first.connection)
+      .mockResolvedValueOnce(second.connection)
+    const runtime = createNatsRuntime({
+      connect,
+      connectionRecovery: { onPermanentClose: 'wait' },
+    })
+
+    await runtime.connection()
+    first.closePermanently()
+    await expect.poll(() => runtime.inspect().connection.state).toBe('disconnected')
+    expect(connect).toHaveBeenCalledOnce()
+
+    await expect(runtime.connection()).resolves.toBe(second.connection)
+    expect(connect).toHaveBeenCalledTimes(2)
+    await runtime.close()
+  })
+
+  it('forces a live reconnect so rotating authenticators can run again', async () => {
+    const controlled = controllableConnection('nats://test')
+    const runtime = createNatsRuntime({ connect: async () => controlled.connection })
+
+    await runtime.connection()
+    await expect(runtime.reconnect({ reason: 'credentials-changed' })).resolves.toBe(
+      controlled.connection
+    )
+
+    expect(controlled.reconnect).toHaveBeenCalledTimes(1)
+    expect(runtime.inspect().connectionGeneration).toBe(1)
+    await runtime.close()
+  })
+
+  it('replaces a connection that closes during a forced reconnect', async () => {
+    const first = controllableConnection('nats://first')
+    const second = controllableConnection('nats://second')
+    first.reconnect.mockImplementationOnce(async () => {
+      first.closePermanently(new Error('authentication expired'))
+      throw new Error('connection closed')
+    })
+    const connect = vi
+      .fn<() => Promise<NatsConnection>>()
+      .mockResolvedValueOnce(first.connection)
+      .mockResolvedValueOnce(second.connection)
+    const runtime = createNatsRuntime({ connect })
+
+    await runtime.connection()
+    await expect(runtime.reconnect({ reason: 'token-rotated' })).resolves.toBe(second.connection)
+    expect(runtime.inspect().connectionGeneration).toBe(2)
+
+    await runtime.close()
+  })
 })
 
 function fakeConnection(): NatsConnection {
   let closed = false
+  let resolveClosed!: () => void
+  const closedPromise = new Promise<void>((resolve) => {
+    resolveClosed = resolve
+  })
 
   return {
     getServer: () => 'nats://test',
@@ -100,8 +222,72 @@ function fakeConnection(): NatsConnection {
       async *[Symbol.asyncIterator]() {},
     }),
     isClosed: () => closed,
+    closed: () => closedPromise,
     drain: async () => {
       closed = true
+      resolveClosed()
     },
   } as NatsConnection
+}
+
+function controllableConnection(server: string): {
+  connection: NatsConnection
+  reconnect: ReturnType<typeof vi.fn<() => Promise<void>>>
+  closePermanently(error?: Error): void
+} {
+  let closed = false
+  let waiting: ((result: IteratorResult<Status>) => void) | undefined
+  const queued: Status[] = []
+  const reconnect = vi.fn<() => Promise<void>>().mockResolvedValue(undefined)
+  let resolveClosed!: (error?: void | Error) => void
+  const closedPromise = new Promise<void | Error>((resolve) => {
+    resolveClosed = resolve
+  })
+
+  const emit = (status: Status) => {
+    if (waiting) {
+      const resolve = waiting
+      waiting = undefined
+      resolve({ done: false, value: status })
+    } else {
+      queued.push(status)
+    }
+  }
+
+  const connection = {
+    getServer: () => server,
+    status: () => ({
+      [Symbol.asyncIterator]() {
+        return {
+          next: () => {
+            const status = queued.shift()
+            if (status) return Promise.resolve({ done: false as const, value: status })
+            if (closed) return Promise.resolve({ done: true as const, value: undefined })
+            return new Promise<IteratorResult<Status>>((resolve) => {
+              waiting = resolve
+            })
+          },
+        }
+      },
+    }),
+    isClosed: () => closed,
+    closed: () => closedPromise,
+    reconnect,
+    drain: async () => {
+      closed = true
+      resolveClosed()
+      waiting?.({ done: true, value: undefined })
+      waiting = undefined
+    },
+  } as NatsConnection
+
+  return {
+    connection,
+    reconnect,
+    closePermanently: (error?: Error) => {
+      closed = true
+      resolveClosed(error)
+      emit({ type: 'close' })
+    },
+  }
 }

@@ -4,11 +4,9 @@ import { DurableObject } from 'cloudflare:workers'
 import { wsconnect } from '@nats-io/nats-core'
 
 import type { StreamCheckpoint } from '@natsail/checkpoints'
-import { createNatsRuntime, type NatsRuntime } from '@natsail/core'
+import { createNatsRuntime, natsCodecs, type NatsRuntime } from '@natsail/core'
 import { consumeJetStream, type JetStreamDelivery } from '@natsail/jetstream'
 
-const encoder = new TextEncoder()
-const decoder = new TextDecoder()
 const CHECKPOINT_KEY = 'shared-upstream'
 const RETAINED_PREFIX = 'retained-delivery:'
 const RETAINED_LIMIT = 128
@@ -103,7 +101,7 @@ export class NatsGatewayPrototype extends DurableObject<Env> {
   async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
     try {
       const frame = JSON.parse(
-        typeof message === 'string' ? message : decoder.decode(message)
+        typeof message === 'string' ? message : natsCodecs.text.decode(new Uint8Array(message))
       ) as ClientFrame
 
       switch (frame.type) {
@@ -112,7 +110,7 @@ export class NatsGatewayPrototype extends DurableObject<Env> {
             throw new Error('Prototype publish values must be strings of at most 1,024 characters')
           }
           await this.ensureUpstream()
-          await this.runtime!.publish(this.subject(), encoder.encode(frame.value))
+          await this.runtime!.publish(this.subject(), frame.value)
           this.send(socket, { type: 'published', value: frame.value })
           break
         }
@@ -254,7 +252,7 @@ export class NatsGatewayPrototype extends DurableObject<Env> {
           key: CHECKPOINT_KEY,
           store: this.checkpoints,
         },
-        decode: (message) => decoder.decode(message.data),
+        codec: natsCodecs.text,
       },
       async (delivery) => this.deliver(delivery)
     )

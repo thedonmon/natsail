@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   CheckpointConflictError,
+  CheckpointScopeConflictError,
   CheckpointValidationError,
   createIndexedDbCheckpointStore,
   createMemoryCheckpointStore,
@@ -89,6 +90,40 @@ describe('checkpoint stores', () => {
         })
       ).rejects.toBeInstanceOf(CheckpointConflictError)
       expect((await store.load('conversation:shared'))?.sequence).toBe(42)
+    }
+  })
+
+  it('prevents one logical source from overwriting another source checkpoint', async () => {
+    vi.stubGlobal('indexedDB', new IDBFactory())
+    const stores = [
+      createMemoryCheckpointStore(),
+      createIndexedDbCheckpointStore({ databaseName: `natsail-${crypto.randomUUID()}` }),
+    ]
+
+    for (const store of stores) {
+      await store.save('conversation:shared', {
+        stream: 'CONVERSATIONS',
+        epoch: '2026-08-21T00:00:00.000Z',
+        sequence: 42,
+        scope: 'filter:conversation.one:v1',
+      })
+
+      await expect(
+        store.save('conversation:shared', {
+          stream: 'CONVERSATIONS',
+          epoch: '2026-08-21T00:00:00.000Z',
+          sequence: 43,
+          scope: 'filter:conversation.two:v1',
+        })
+      ).rejects.toBeInstanceOf(CheckpointScopeConflictError)
+      await expect(
+        store.save('conversation:shared', {
+          stream: 'CONVERSATIONS',
+          epoch: '2026-08-21T00:00:00.000Z',
+          sequence: 43,
+        })
+      ).rejects.toBeInstanceOf(CheckpointScopeConflictError)
+      expect((await store.load('conversation:shared'))?.scope).toBe('filter:conversation.one:v1')
     }
   })
 })

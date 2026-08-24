@@ -15,8 +15,6 @@ const appUrl = 'http://127.0.0.1:4177'
 const stream = 'NATSAIL_RXJS_CHAT'
 const subjectPrefix = 'natsail.examples.rxjs.chat'
 const streamSubjects = `${subjectPrefix}.>`
-const encoder = new TextEncoder()
-
 let vite
 let connection
 let manager
@@ -100,16 +98,14 @@ const seedMessages = async (client) => {
   for (const [roomId, author, body] of values) {
     await client.publish(
       `${subjectPrefix}.${roomId}`,
-      encoder.encode(
-        JSON.stringify({
-          id: `rxjs-seed-${roomId}-${author}`,
-          roomId,
-          author,
-          body,
-          sentAt: new Date().toISOString(),
-          clientId: 'rxjs-example-seed',
-        })
-      )
+      JSON.stringify({
+        id: `rxjs-seed-${roomId}-${author}`,
+        roomId,
+        author,
+        body,
+        sentAt: new Date().toISOString(),
+        clientId: 'rxjs-example-seed',
+      })
     )
   }
 }

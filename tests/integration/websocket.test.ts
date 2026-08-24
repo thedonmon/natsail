@@ -1,7 +1,7 @@
 import { jetstream, jetstreamManager, StorageType } from '@nats-io/jetstream'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { createNatsRuntime } from '@natsail/core'
+import { createNatsRuntime, natsCodecs } from '@natsail/core'
 import { consumeJetStream } from '@natsail/jetstream'
 
 import { connectToTestNats, connectToTestNatsWebSocket, uniqueSubject } from './helpers.js'
@@ -21,13 +21,12 @@ describe('WebSocket transport', () => {
       await publisher.drain()
     })
 
-    const decoder = new TextDecoder()
     const subject = uniqueSubject('websocket')
     const received: string[] = []
     const lease = runtime.subscribe(
       {
         subject,
-        decode: (message) => decoder.decode(message.data),
+        codec: natsCodecs.text,
       },
       async (value) => {
         received.push(value)
@@ -37,7 +36,7 @@ describe('WebSocket transport', () => {
     await lease.ready
     const connection = await runtime.connection()
     await connection.flush()
-    publisher.publish(subject, new TextEncoder().encode('over-websocket'))
+    publisher.publish(subject, 'over-websocket')
     await publisher.flush()
     await expect.poll(() => received).toEqual(['over-websocket'])
   })
@@ -75,7 +74,6 @@ describe('WebSocket transport', () => {
     })
 
     const received = new Set<string>()
-    const decoder = new TextDecoder()
     const leases = Array.from({ length: conversationCount }, (_, index) =>
       consumeJetStream(
         runtime,
@@ -84,7 +82,7 @@ describe('WebSocket transport', () => {
           filter: `${subjectPrefix}.${index}`,
           start: 'new',
           maxBufferedMessages: perConversationBuffer,
-          decode: (message) => decoder.decode(message.data),
+          codec: natsCodecs.text,
         },
         async (delivery) => {
           received.add(delivery.value)
@@ -98,10 +96,9 @@ describe('WebSocket transport', () => {
       .poll(async () => (await manager.streams.info(stream)).state.consumer_count)
       .toBe(conversationCount)
 
-    const encoder = new TextEncoder()
     await Promise.all(
       Array.from({ length: conversationCount }, (_, index) =>
-        client.publish(`${subjectPrefix}.${index}`, encoder.encode(`conversation-${index}`))
+        client.publish(`${subjectPrefix}.${index}`, `conversation-${index}`)
       )
     )
     await expect.poll(() => received.size).toBe(conversationCount)

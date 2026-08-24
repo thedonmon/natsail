@@ -2,6 +2,8 @@ export interface StreamCheckpoint {
   readonly stream: string
   readonly epoch: string
   readonly sequence: number
+  /** Logical source identity, such as a normalized filter plus decoder version. */
+  readonly scope?: string
 }
 
 export interface CheckpointStore {
@@ -15,7 +17,11 @@ export interface IndexedDbCheckpointStoreOptions {
   databaseName?: string
 }
 
-export type CheckpointValidationErrorCode = 'invalid-stream' | 'invalid-epoch' | 'invalid-sequence'
+export type CheckpointValidationErrorCode =
+  | 'invalid-stream'
+  | 'invalid-epoch'
+  | 'invalid-sequence'
+  | 'invalid-scope'
 
 export class CheckpointValidationError extends Error {
   readonly name = 'CheckpointValidationError'
@@ -37,6 +43,18 @@ export class CheckpointConflictError extends Error {
   }
 }
 
+export class CheckpointScopeConflictError extends Error {
+  readonly name = 'CheckpointScopeConflictError'
+  readonly code = 'scope-conflict'
+
+  constructor(
+    readonly storedScope: string,
+    readonly incomingScope: string
+  ) {
+    super(`Checkpoint scope ${incomingScope} does not match stored scope ${storedScope}`)
+  }
+}
+
 function validateCheckpoint(checkpoint: StreamCheckpoint): void {
   if (typeof checkpoint.stream !== 'string' || checkpoint.stream.length === 0) {
     throw new CheckpointValidationError('invalid-stream')
@@ -46,6 +64,12 @@ function validateCheckpoint(checkpoint: StreamCheckpoint): void {
   }
   if (!Number.isSafeInteger(checkpoint.sequence) || checkpoint.sequence < 0) {
     throw new CheckpointValidationError('invalid-sequence')
+  }
+  if (
+    checkpoint.scope !== undefined &&
+    (typeof checkpoint.scope !== 'string' || checkpoint.scope.length === 0)
+  ) {
+    throw new CheckpointValidationError('invalid-scope')
   }
 }
 
@@ -58,6 +82,10 @@ function rejectSequenceRegression(
   stored: StreamCheckpoint | undefined,
   incoming: StreamCheckpoint
 ): void {
+  if (stored?.scope !== undefined && stored.scope !== incoming.scope) {
+    throw new CheckpointScopeConflictError(stored.scope, incoming.scope ?? '<unspecified>')
+  }
+
   if (
     stored &&
     stored.stream === incoming.stream &&

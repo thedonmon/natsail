@@ -3,12 +3,15 @@ import type { NatsConnection } from '@nats-io/nats-core'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { CheckpointStore } from '@natsail/checkpoints'
-import { createNatsRuntime } from '@natsail/core'
+import { createNatsRuntime, natsCodecs } from '@natsail/core'
 import {
+  createJetStreamSessionSource,
   consumeJetStream,
   JetStreamDuplicateError,
+  JetStreamResumeError,
   type JetStreamDelivery,
   type JetStreamDuplicateDeliveryPolicy,
+  type JetStreamSubscriptionOptions,
 } from '@natsail/jetstream'
 
 const jetStreamMocks = vi.hoisted(() => ({
@@ -28,12 +31,9 @@ vi.mock('@nats-io/jetstream', async (importOriginal) => {
 
 const stream = 'EVENTS'
 const epoch = '2026-08-21T00:00:00.000Z'
-const encoder = new TextEncoder()
-const decoder = new TextDecoder()
-
 function message(sequence: number, value: string, redelivered = false): JsMsg {
   return {
-    data: encoder.encode(value),
+    data: natsCodecs.text.encode(value),
     info: { stream, streamSequence: sequence },
     redelivered,
   } as JsMsg
@@ -67,8 +67,13 @@ function arrangeConsumer(deliveries: readonly JsMsg[]) {
 }
 
 function arrangeRuntime() {
+  let resolveClosed!: () => void
+  const closed = new Promise<void>((resolve) => {
+    resolveClosed = resolve
+  })
   const connection = {
-    drain: vi.fn(async () => undefined),
+    closed: () => closed,
+    drain: vi.fn(async () => resolveClosed()),
     getServer: vi.fn(() => 'mock:4222'),
     isClosed: vi.fn(() => false),
     status: async function* () {},
@@ -100,7 +105,7 @@ function consumeWithPolicy(
       start: 'all',
       ...(policy === undefined ? {} : { duplicateDeliveryPolicy: policy }),
       resume: { key: 'conversation:one', store },
-      decode: (delivery) => decoder.decode(delivery.data),
+      codec: natsCodecs.text,
     },
     handler
   )
@@ -139,6 +144,7 @@ describe('JetStream duplicate-delivery policy', () => {
       stream,
       epoch,
       sequence: 3,
+      scope: '["events.>"]',
     })
     await runtime.close()
   })
@@ -171,6 +177,7 @@ describe('JetStream duplicate-delivery policy', () => {
       stream,
       epoch,
       sequence: 3,
+      scope: '["events.>"]',
     })
     await runtime.close()
   })
@@ -192,6 +199,114 @@ describe('JetStream duplicate-delivery policy', () => {
     expect(handler).not.toHaveBeenCalled()
     expect(save).not.toHaveBeenCalled()
     expect(consumer.delete).toHaveBeenCalledOnce()
+    await runtime.close()
+  })
+
+  it('rejects a checkpoint created for another logical source', async () => {
+    arrangeConsumer([])
+    const runtime = arrangeRuntime()
+    const store: CheckpointStore = {
+      load: async () => ({
+        stream,
+        epoch,
+        sequence: 2,
+        scope: '["events.other"]:decoder-v1',
+      }),
+      save: async () => undefined,
+      clear: async () => undefined,
+    }
+    const lease = consumeJetStream(
+      runtime,
+      {
+        stream,
+        filter: 'events.>',
+        start: 'all',
+        resume: { key: 'conversation:one', store, scope: 'decoder-v1' },
+        codec: natsCodecs.text,
+      },
+      () => undefined
+    )
+
+    const expectedError = expect.objectContaining<Partial<JetStreamResumeError>>({
+      code: 'checkpoint-scope-mismatch',
+      checkpointSequence: 2,
+    })
+    await Promise.all([
+      expect(lease.ready).rejects.toEqual(expectedError),
+      expect(lease.closed).rejects.toEqual(expectedError),
+    ])
+    await runtime.close()
+  })
+
+  it('bounds pull buffers by bytes and reports the reserved capacity', async () => {
+    const { consumer } = arrangeConsumer([])
+    const runtime = arrangeRuntime()
+    const lease = consumeJetStream(
+      runtime,
+      {
+        stream,
+        filter: 'events.>',
+        start: 'new',
+        maxBufferedBytes: 4_096,
+        codec: natsCodecs.text,
+      },
+      () => undefined
+    )
+
+    await lease.ready
+    expect(consumer.consume).toHaveBeenCalledWith({ max_bytes: 4_096 })
+    expect(runtime.inspect()).toEqual(
+      expect.objectContaining({
+        activeResources: 1,
+        usedJetStreamConsumers: 1,
+        usedBufferedMessages: 0,
+        usedBufferedBytes: 4_096,
+      })
+    )
+    await lease.closed
+    expect(runtime.inspect()).toEqual(
+      expect.objectContaining({ activeResources: 0, usedBufferedBytes: 0 })
+    )
+    await runtime.close()
+  })
+
+  it('rejects simultaneous message and byte buffer modes', () => {
+    const runtime = arrangeRuntime()
+
+    expect(() =>
+      consumeJetStream(
+        runtime,
+        {
+          stream,
+          filter: 'events.>',
+          start: 'new',
+          maxBufferedMessages: 32,
+          maxBufferedBytes: 4_096,
+          codec: natsCodecs.text,
+        } as unknown as JetStreamSubscriptionOptions<string>,
+        () => undefined
+      )
+    ).toThrow('mutually exclusive')
+  })
+
+  it('adapts one JetStream consumer into a shareable session source', async () => {
+    arrangeConsumer([message(1, 'one')])
+    const runtime = arrangeRuntime()
+    const source = createJetStreamSessionSource(runtime, {
+      stream,
+      filter: 'events.>',
+      start: 'all',
+      codec: natsCodecs.text,
+    })
+    const accepted: Array<JetStreamDelivery<string>> = []
+    const lease = source(async (delivery) => {
+      accepted.push(delivery)
+    })
+
+    await lease.closed
+    expect(accepted).toMatchObject([
+      { value: 'one', cursor: { stream, sequence: 1 }, duplicate: false },
+    ])
     await runtime.close()
   })
 })

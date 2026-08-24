@@ -165,4 +165,50 @@ describe('session registry', () => {
       vi.useRealTimers()
     }
   })
+
+  it('restarts one shared logical session while preserving its handle and latest value', async () => {
+    const leases = [controllableLease(), controllableLease(), controllableLease()]
+    const accepts: Array<(value: string) => Promise<void>> = []
+    const source = vi.fn((accept: (value: string) => Promise<void>) => {
+      accepts.push(accept)
+      return leases[accepts.length - 1]!.lease
+    })
+    const registry = createSessionRegistry()
+    const first = registry.acquire('conversation:restart', source)
+    const second = registry.acquire('conversation:restart', source)
+
+    await first.ready
+    await accepts[0]!('before')
+    expect(second.getSnapshot()).toEqual({
+      phase: 'live',
+      revision: 2,
+      valueRevision: 1,
+      value: 'before',
+    })
+
+    await first.restart()
+    expect(source).toHaveBeenCalledTimes(2)
+    expect(leases[0]!.close).toHaveBeenCalledOnce()
+    expect(second.getSnapshot()).toEqual({
+      phase: 'live',
+      revision: 4,
+      valueRevision: 1,
+      value: 'before',
+    })
+
+    await accepts[0]!('stale')
+    await accepts[1]!('after')
+    expect(first.getSnapshot()).toEqual({
+      phase: 'live',
+      revision: 5,
+      valueRevision: 2,
+      value: 'after',
+    })
+
+    await registry.restart('conversation:restart')
+    expect(source).toHaveBeenCalledTimes(3)
+
+    await first.release()
+    await second.release()
+  })
 })
