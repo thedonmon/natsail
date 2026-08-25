@@ -1,6 +1,6 @@
 {
   "name": "@natsail/react",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "React provider and hooks for NATSail runtimes and shared sessions.",
   "keywords": [
     "nats",
