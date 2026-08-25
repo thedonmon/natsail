@@ -11,6 +11,7 @@ const packages = [
   { directory: 'core', name: '@natsail/core' },
   { directory: 'jetstream', name: '@natsail/jetstream' },
   { directory: 'session', name: '@natsail/session' },
+  { directory: 'effect', name: '@natsail/effect' },
   { directory: 'react', name: '@natsail/react' },
   { directory: 'rxjs', name: '@natsail/rxjs' },
 ]
@@ -96,6 +97,7 @@ try {
         type: 'module',
         dependencies: {
           ...localPackages,
+          effect: '^3.22.0',
           react: '^19.0.0',
           rxjs: '^7.8.0',
         },
