@@ -1,6 +1,6 @@
 {
   "name": "@natsail/effect",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Scoped Effect services and Streams for NATSail runtimes and shared sessions.",
   "keywords": [
     "nats",
