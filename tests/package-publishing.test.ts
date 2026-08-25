@@ -2,7 +2,15 @@ import { readFile } from 'node:fs/promises'
 
 import { describe, expect, it } from 'vitest'
 
-const packageDirectories = ['checkpoints', 'core', 'jetstream', 'session', 'react', 'rxjs']
+const packageDirectories = [
+  'checkpoints',
+  'core',
+  'jetstream',
+  'session',
+  'effect',
+  'react',
+  'rxjs',
+]
 
 describe('package publishing', () => {
   it.each(packageDirectories)('gives %s complete public npm metadata', async (directory) => {

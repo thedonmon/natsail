@@ -14,6 +14,7 @@ export const releasePackages = [
   { directory: 'core', name: '@natsail/core' },
   { directory: 'jetstream', name: '@natsail/jetstream' },
   { directory: 'session', name: '@natsail/session' },
+  { directory: 'effect', name: '@natsail/effect' },
   { directory: 'react', name: '@natsail/react' },
   { directory: 'rxjs', name: '@natsail/rxjs' },
 ]

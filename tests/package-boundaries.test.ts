@@ -16,10 +16,16 @@ describe('package boundaries', () => {
 
     expect(Object.keys(manifest.dependencies)).toEqual(['@nats-io/nats-core'])
     expect(manifest.sideEffects).toBe(false)
-    expect(source).not.toMatch(/@nats-io\/jetstream|react|rxjs/i)
+    expect(source).not.toMatch(/@nats-io\/jetstream|from ['"]effect['"]|react|rxjs/i)
   })
 
-  it('keeps React and RxJS in separate adapter packages', async () => {
+  it('keeps Effect, React, and RxJS in separate adapter packages', async () => {
+    const effectManifest = JSON.parse(
+      await readFile(new URL('../packages/effect/package.json', import.meta.url), 'utf8')
+    ) as {
+      dependencies: Record<string, string>
+      peerDependencies: Record<string, string>
+    }
     const reactManifest = JSON.parse(
       await readFile(new URL('../packages/react/package.json', import.meta.url), 'utf8')
     ) as {
@@ -33,6 +39,8 @@ describe('package boundaries', () => {
       peerDependencies: Record<string, string>
     }
 
+    expect(Object.keys(effectManifest.dependencies)).toEqual(['@natsail/core', '@natsail/session'])
+    expect(Object.keys(effectManifest.peerDependencies)).toEqual(['effect'])
     expect(Object.keys(reactManifest.dependencies)).toEqual([
       '@natsail/core',
       '@natsail/jetstream',
@@ -63,6 +71,6 @@ describe('package boundaries', () => {
 
     expect(manifest.dependencies).toBeUndefined()
     expect(manifest.sideEffects).toBe(false)
-    expect(source).not.toMatch(/@nats-io|react|rxjs/i)
+    expect(source).not.toMatch(/@nats-io|from ['"]effect['"]|react|rxjs/i)
   })
 })
