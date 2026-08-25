@@ -24,11 +24,13 @@ import {
   type JetStreamDelivery,
   type JetStreamProcessorHandler,
   type JetStreamProcessorOptions,
-  type JetStreamSubscriptionOptions,
+  type JetStreamSessionSourceOptions,
+  type JetStreamStateSnapshot,
 } from '@natsail/jetstream'
 import { createCoreSessionSource, createReducingSessionSource } from '@natsail/session'
 import type {
   SessionReducer,
+  SessionDefinition,
   SessionHandle,
   SessionRegistry,
   SessionPhase,
@@ -59,6 +61,29 @@ export interface NatsProviderProps {
   sessions: SessionRegistry
 }
 
+export interface NatsManagedResource {
+  readonly runtime: NatsRuntime
+  readonly sessions: SessionRegistry
+  /** Defaults to closing the registry and then the runtime. */
+  close?(): Promise<void>
+}
+
+export interface NatsManagedProviderProps {
+  children?: ReactNode
+  /** Remounts and replaces the managed resource when its connection identity changes. */
+  identity: string
+  create(): NatsManagedResource
+  fallback?: ReactNode
+  onCloseError?(error: unknown): void
+}
+
+export type SessionNotificationMode = 'immediate' | 'microtask' | 'animation-frame'
+
+export interface NatsJetStreamReducerOptions {
+  /** React notification scheduling. Every delivery is still reduced serially. */
+  notifications?: SessionNotificationMode
+}
+
 type ActiveSession<T> = {
   registry: SessionRegistry
   key: string
@@ -68,6 +93,7 @@ type ActiveSession<T> = {
 interface ResolvedSession<T> {
   registry: SessionRegistry
   key: string
+  contract?: string
   source: SessionSource<T>
 }
 
@@ -88,6 +114,53 @@ const NatsContext = createContext<NatsContextValue | null>(null)
 export function NatsProvider({ children, runtime, sessions }: NatsProviderProps) {
   const value = useMemo(() => ({ runtime, sessions }), [runtime, sessions])
   return createElement(NatsContext.Provider, { value }, children)
+}
+
+/**
+ * Creates and disposes one provider resource after commit. Development Strict
+ * Mode effect replay reuses the same resource instead of closing it mid-remount.
+ */
+export function NatsManagedProvider(props: NatsManagedProviderProps) {
+  return createElement(ManagedProviderInstance, { ...props, key: props.identity })
+}
+
+function ManagedProviderInstance({
+  children,
+  create,
+  fallback = null,
+  onCloseError,
+}: NatsManagedProviderProps) {
+  const createRef = useRef(create)
+  const closeErrorRef = useRef(onCloseError)
+  const resourceRef = useRef<NatsManagedResource | null>(null)
+  const effectRun = useRef(0)
+  const [resource, setResource] = useState<NatsManagedResource | null>(null)
+  createRef.current = create
+  closeErrorRef.current = onCloseError
+
+  useEffect(() => {
+    const run = ++effectRun.current
+    const active = resourceRef.current ?? createRef.current()
+    resourceRef.current = active
+    setResource(active)
+
+    return () => {
+      queueMicrotask(() => {
+        if (effectRun.current !== run || resourceRef.current !== active) return
+        const close = active.close
+          ? () => active.close!()
+          : () => active.sessions.close().then(() => active.runtime.close())
+        void close().catch((error) => closeErrorRef.current?.(error))
+      })
+    }
+  }, [])
+
+  if (!resource) return fallback
+  return createElement(NatsProvider, {
+    runtime: resource.runtime,
+    sessions: resource.sessions,
+    children,
+  })
 }
 
 /** Returns the runtime supplied by the nearest NatsProvider. */
@@ -196,6 +269,11 @@ export function useNatsRuntimeStatus(runtime?: NatsRuntime): NatsRuntimeStatusEv
   return active && active.runtime === activeRuntime ? active.status : IDLE_RUNTIME_STATUS
 }
 
+export function useNatsSession<T>(definition: SessionDefinition<T>): SessionSnapshot<T>
+export function useNatsSession<T>(
+  registry: SessionRegistry,
+  definition: SessionDefinition<T>
+): SessionSnapshot<T>
 export function useNatsSession<T>(key: string, source: SessionSource<T>): SessionSnapshot<T>
 export function useNatsSession<T>(
   registry: SessionRegistry,
@@ -209,11 +287,11 @@ export function useNatsSession<T>(
  * subject, decoder, credentials, or delivery policy changes.
  */
 export function useNatsSession<T>(
-  registryOrKey: SessionRegistry | string,
-  keyOrSource: string | SessionSource<T>,
+  registryDefinitionOrKey: SessionRegistry | SessionDefinition<T> | string,
+  definitionKeyOrSource?: SessionDefinition<T> | string | SessionSource<T>,
   source?: SessionSource<T>
 ): SessionSnapshot<T> {
-  const resolved = useResolvedSession(registryOrKey, keyOrSource, source)
+  const resolved = useResolvedSession(registryDefinitionOrKey, definitionKeyOrSource, source)
   return useSessionSelection(resolved, selectSnapshot)
 }
 
@@ -229,10 +307,40 @@ export function useNatsCoreSubscription<T>(
 /** Opens one registry-shared checkpointed JetStream session through the nearest provider. */
 export function useNatsJetStreamSubscription<T>(
   key: string,
-  options: JetStreamSubscriptionOptions<T>
+  options: JetStreamSessionSourceOptions<T>
 ): SessionSnapshot<JetStreamDelivery<T>> {
   const { runtime } = useRequiredContext()
   return useNatsSession(key, createJetStreamSessionSource(runtime, options))
+}
+
+/** Renders one validated atomic replay/live reduced JetStream session. */
+export function useNatsJetStreamReducer<State>(
+  definition: SessionDefinition<JetStreamStateSnapshot<State>>,
+  options: NatsJetStreamReducerOptions = {}
+): SessionSnapshot<JetStreamStateSnapshot<State>> {
+  const resolved = useResolvedSession(definition)
+  return useSessionSelection(
+    resolved,
+    selectSnapshot,
+    Object.is,
+    options.notifications ?? 'animation-frame'
+  )
+}
+
+/** Selects one projection while preserving atomic replay and coalesced live renders. */
+export function useNatsJetStreamReducerSelector<State, Selected>(
+  definition: SessionDefinition<JetStreamStateSnapshot<State>>,
+  selector: (snapshot: SessionSnapshot<JetStreamStateSnapshot<State>>) => Selected,
+  isEqual: (previous: Selected, next: Selected) => boolean = Object.is,
+  options: NatsJetStreamReducerOptions = {}
+): Selected {
+  const resolved = useResolvedSession(definition)
+  return useSessionSelection(
+    resolved,
+    selector,
+    isEqual,
+    options.notifications ?? 'animation-frame'
+  )
 }
 
 export interface NatsJetStreamProcessorSnapshot {
@@ -310,7 +418,7 @@ export function useNatsJetStreamProcessor<T>(
 /** Selects state from one registry-shared checkpointed JetStream session. */
 export function useNatsJetStreamSubscriptionSelector<T, Selected>(
   key: string,
-  options: JetStreamSubscriptionOptions<T>,
+  options: JetStreamSessionSourceOptions<T>,
   selector: (snapshot: SessionSnapshot<JetStreamDelivery<T>>) => Selected,
   isEqual?: (previous: Selected, next: Selected) => boolean
 ): Selected {
@@ -402,36 +510,68 @@ function useRequiredContext(): NatsContextValue {
 }
 
 function useResolvedSession<T>(
-  registryOrKey: SessionRegistry | string,
-  keyOrSource: string | SessionSource<T>,
+  registryDefinitionOrKey: SessionRegistry | SessionDefinition<T> | string,
+  definitionKeyOrSource?: SessionDefinition<T> | string | SessionSource<T>,
   source?: SessionSource<T>
 ): ResolvedSession<T> {
   const context = useContext(NatsContext)
 
-  if (typeof registryOrKey === 'string') {
+  if (isSessionDefinition(registryDefinitionOrKey)) {
     if (!context) {
       throw new Error('useNatsSession requires a SessionRegistry or a NatsProvider')
     }
     return {
       registry: context.sessions,
-      key: registryOrKey,
-      source: keyOrSource as SessionSource<T>,
+      key: registryDefinitionOrKey.key,
+      contract: registryDefinitionOrKey.contract,
+      source: registryDefinitionOrKey.source,
+    }
+  }
+
+  if (typeof registryDefinitionOrKey === 'string') {
+    if (!context) {
+      throw new Error('useNatsSession requires a SessionRegistry or a NatsProvider')
+    }
+    return {
+      registry: context.sessions,
+      key: registryDefinitionOrKey,
+      source: definitionKeyOrSource as SessionSource<T>,
+    }
+  }
+
+  if (isSessionDefinition(definitionKeyOrSource)) {
+    return {
+      registry: registryDefinitionOrKey,
+      key: definitionKeyOrSource.key,
+      contract: definitionKeyOrSource.contract,
+      source: definitionKeyOrSource.source,
     }
   }
 
   return {
-    registry: registryOrKey,
-    key: keyOrSource as string,
+    registry: registryDefinitionOrKey,
+    key: definitionKeyOrSource as string,
     source: source!,
   }
 }
 
+function isSessionDefinition<T>(value: unknown): value is SessionDefinition<T> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'key' in value &&
+    'contract' in value &&
+    'source' in value
+  )
+}
+
 function useSessionSelection<T, Selected>(
-  { registry, key, source }: ResolvedSession<T>,
+  { registry, key, contract, source }: ResolvedSession<T>,
   selector: (snapshot: SessionSnapshot<T>) => Selected,
-  isEqual: (previous: Selected, next: Selected) => boolean = Object.is
+  isEqual: (previous: Selected, next: Selected) => boolean = Object.is,
+  notifications: SessionNotificationMode = 'immediate'
 ): Selected {
-  const handle = useSessionHandle(registry, key, source)
+  const handle = useSessionHandle(registry, key, contract, source)
   const selectorRef = useRef(selector)
   const isEqualRef = useRef(isEqual)
   const cacheRef = useRef<SelectionCache<T, Selected> | undefined>(undefined)
@@ -464,15 +604,53 @@ function useSessionSelection<T, Selected>(
       if (!handle) return () => undefined
 
       let selected = getSelection()
-      return handle.subscribe(() => {
+      let cancelled = false
+      let scheduled = false
+      let cancelScheduled: (() => void) | undefined
+      const notify = () => {
+        if (notifications === 'immediate') {
+          listener()
+          return
+        }
+        if (scheduled) return
+        scheduled = true
+        if (notifications === 'microtask') {
+          queueMicrotask(() => {
+            scheduled = false
+            if (!cancelled) listener()
+          })
+          return
+        }
+
+        if (typeof requestAnimationFrame === 'function') {
+          const frame = requestAnimationFrame(() => {
+            scheduled = false
+            if (!cancelled) listener()
+          })
+          cancelScheduled = () => cancelAnimationFrame(frame)
+        } else {
+          const timer = setTimeout(() => {
+            scheduled = false
+            if (!cancelled) listener()
+          }, 16)
+          cancelScheduled = () => clearTimeout(timer)
+        }
+      }
+      const unsubscribe = handle.subscribe(() => {
         const next = getSelection()
         if (!isEqualRef.current(selected, next)) {
           selected = next
-          listener()
+          notify()
         }
       })
+
+      return () => {
+        cancelled = true
+        cancelScheduled?.()
+        unsubscribe()
+      }
     },
-    [getSelection, handle]
+    [getSelection, handle, notifications]
   )
 
   return useSyncExternalStore(subscribe, getSelection, getSelection)
@@ -481,6 +659,7 @@ function useSessionSelection<T, Selected>(
 function useSessionHandle<T>(
   registry: SessionRegistry,
   key: string,
+  contract: string | undefined,
   source: SessionSource<T>
 ): SessionHandle<T> | null {
   const sourceRef = useRef(source)
@@ -488,13 +667,15 @@ function useSessionHandle<T>(
   const [active, setActive] = useState<ActiveSession<T> | null>(null)
 
   useEffect(() => {
-    const handle = registry.acquire(key, sourceRef.current)
+    const handle = contract
+      ? registry.acquire({ key, contract, source: sourceRef.current })
+      : registry.acquire(key, sourceRef.current)
     setActive({ registry, key, handle })
 
     return () => {
       void handle.release().catch(() => undefined)
     }
-  }, [key, registry])
+  }, [contract, key, registry])
 
   return active?.registry === registry && active.key === key ? active.handle : null
 }

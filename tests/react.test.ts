@@ -1,22 +1,30 @@
 /** @vitest-environment jsdom */
 
-import { act, createElement, Fragment } from 'react'
+import { act, createElement, Fragment, StrictMode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { describe, expect, it, vi } from 'vitest'
 
 import type { SubscriptionLease } from '@natsail/core'
 import {
   NatsProvider,
+  NatsManagedProvider,
   useNatsConnection,
   useNatsCoreSubscriptionReducer,
   useNatsCoreSubscriptionSelector,
+  useNatsJetStreamReducer,
   useNatsRuntime,
   useNatsRuntimeStatus,
   useNatsSession,
   useNatsSessionSelector,
 } from '@natsail/react'
 import type { NatsRuntime, NatsRuntimeEvent } from '@natsail/core'
-import { createSessionRegistry, type SessionRegistry, type SessionSource } from '@natsail/session'
+import {
+  createSessionRegistry,
+  defineSession,
+  type SessionRegistry,
+  type SessionSource,
+} from '@natsail/session'
+import type { JetStreamStateSnapshot } from '@natsail/jetstream'
 
 function controllableSource<T>(): {
   source: SessionSource<T>
@@ -330,6 +338,117 @@ describe('React session adapter', () => {
     await act(async () => root.unmount())
     await registry.close()
     await sourceLease.close()
+  })
+
+  it('owns provider cleanup without closing the resource during Strict Mode effect replay', async () => {
+    Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
+    const sessions = createSessionRegistry()
+    const runtime = {
+      events: emptyEvents(),
+      close: vi.fn(async () => undefined),
+    } as unknown as NatsRuntime
+    const close = vi.fn(async () => {
+      await sessions.close()
+      await runtime.close()
+    })
+    const create = vi.fn(() => ({ runtime, sessions, close }))
+    const container = document.createElement('div')
+    let root!: Root
+
+    function ManagedProbe() {
+      return createElement('output', null, useNatsRuntime() === runtime ? 'managed' : 'wrong')
+    }
+
+    await act(async () => {
+      root = createRoot(container)
+      root.render(
+        createElement(
+          StrictMode,
+          null,
+          createElement(
+            NatsManagedProvider,
+            { identity: 'primary', create, fallback: createElement('output', null, 'loading') },
+            createElement(ManagedProbe)
+          )
+        )
+      )
+      await Promise.resolve()
+    })
+
+    expect(container.textContent).toBe('managed')
+    expect(create).toHaveBeenCalledOnce()
+    expect(close).not.toHaveBeenCalled()
+
+    await act(async () => root.unmount())
+    await Promise.resolve()
+    expect(close).toHaveBeenCalledOnce()
+  })
+
+  it('coalesces reduced JetStream renders while preserving every accepted state', async () => {
+    Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
+    vi.useFakeTimers()
+    try {
+      const registry = createSessionRegistry()
+      const controlled = controllableSource<JetStreamStateSnapshot<string[]>>()
+      const definition = defineSession({
+        key: 'conversation:coalesced',
+        contract: 'conversation:v1',
+        source: controlled.source,
+      })
+      const runtime = { events: emptyEvents() } as NatsRuntime
+      const container = document.createElement('div')
+      let renders = 0
+      let root!: Root
+
+      function ReducedJetStreamProbe() {
+        renders += 1
+        const snapshot = useNatsJetStreamReducer(definition)
+        return createElement('output', null, snapshot.value?.data.join(',') ?? '')
+      }
+
+      await act(async () => {
+        root = createRoot(container)
+        root.render(
+          createElement(
+            NatsProvider,
+            { runtime, sessions: registry },
+            createElement(ReducedJetStreamProbe)
+          )
+        )
+      })
+      const rendersBeforeBurst = renders
+
+      await act(async () => {
+        await controlled.deliver({
+          phase: 'live',
+          data: ['one'],
+          restarts: 0,
+          replay: { delivered: 1, remaining: 0 },
+        })
+        await controlled.deliver({
+          phase: 'live',
+          data: ['one', 'two'],
+          restarts: 0,
+          replay: { delivered: 1, remaining: 0 },
+        })
+        await controlled.deliver({
+          phase: 'live',
+          data: ['one', 'two', 'three'],
+          restarts: 0,
+          replay: { delivered: 1, remaining: 0 },
+        })
+      })
+
+      expect(renders).toBe(rendersBeforeBurst)
+      await act(async () => vi.advanceTimersByTimeAsync(16))
+      expect(container.textContent).toBe('one,two,three')
+      expect(renders).toBe(rendersBeforeBurst + 1)
+
+      await act(async () => root.unmount())
+      await registry.close()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 

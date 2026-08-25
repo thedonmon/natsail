@@ -3,12 +3,15 @@ import { describe, expect, it, vi } from 'vitest'
 import type { NatsRuntime, NatsRuntimeEvent, SubscriptionLease } from '@natsail/core'
 import {
   observeNatsCoreSubscription,
+  observeNatsJetStreamReducer,
   observeNatsRuntimeEvents,
   observeNatsRuntimeStatus,
   observeNatsSession,
+  observeNatsSessionEvents,
   observeNatsSessionValues,
 } from '@natsail/rxjs'
-import { createSessionRegistry, type SessionSource } from '@natsail/session'
+import { createSessionRegistry, defineSession, type SessionSource } from '@natsail/session'
+import type { JetStreamStateSnapshot } from '@natsail/jetstream'
 
 function controllableSource<T>(): {
   source: SessionSource<T>
@@ -128,6 +131,62 @@ describe('RxJS session adapter', () => {
 
     expect(values).toEqual(['same', 'same'])
     expect(completions).toBe(1)
+  })
+
+  it('converts registry lifecycle diagnostics to a cancellable Observable', async () => {
+    const registry = createSessionRegistry()
+    const controlled = controllableSource<string>()
+    const types: string[] = []
+    const subscription = observeNatsSessionEvents(registry).subscribe((event) => {
+      types.push(event.type)
+    })
+
+    const handle = registry.acquire('conversation:events', controlled.source)
+    await handle.ready
+    await handle.release()
+    await Promise.resolve()
+
+    expect(types).toEqual(expect.arrayContaining(['opened', 'retained', 'released', 'closed']))
+    subscription.unsubscribe()
+    await registry.close()
+  })
+
+  it('observes the same validated reduced JetStream state definition as React', async () => {
+    const registry = createSessionRegistry()
+    const controlled = controllableSource<JetStreamStateSnapshot<string[]>>()
+    const definition = defineSession({
+      key: 'conversation:rxjs-reducer',
+      contract: 'conversation:v1',
+      source: controlled.source,
+    })
+    const phases: string[] = []
+    const values: string[][] = []
+    const subscription = observeNatsJetStreamReducer(registry, definition).subscribe((snapshot) => {
+      if (!snapshot.value) return
+      phases.push(snapshot.value.phase)
+      values.push(snapshot.value.data)
+    })
+    await Promise.resolve()
+
+    await controlled.deliver({
+      phase: 'replaying',
+      data: [],
+      restarts: 0,
+      replay: { delivered: 0, remaining: 1 },
+    })
+    await controlled.deliver({
+      phase: 'live',
+      data: ['one', 'two'],
+      restarts: 0,
+      replay: { delivered: 2, remaining: 0 },
+    })
+
+    expect(phases).toEqual(['replaying', 'live'])
+    expect(values).toEqual([[], ['one', 'two']])
+    expect(registry.inspect().activeSessions).toBe(1)
+
+    subscription.unsubscribe()
+    await registry.close()
   })
 
   it('converts runtime events to a cancellable Observable and distinct status stream', async () => {

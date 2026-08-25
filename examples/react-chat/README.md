@@ -14,7 +14,8 @@ The command starts the repository's local NATS Docker fixtures when necessary an
 
 ## What it demonstrates
 
-- One module-level `NatsRuntime` and `SessionRegistry` supplied through `NatsProvider`.
+- `NatsManagedProvider` creates one `NatsRuntime` and `SessionRegistry` after commit and closes both on final unmount.
+- React Strict Mode effect replay reuses that managed resource instead of opening a second connection.
 - `useNatsRuntimeStatus()` for connection state.
 - `useNatsCoreSubscriptionReducer()` for one wildcard room subscription that serially folds every delivery into an immutable timeline.
 - Core NATS publish through the provider runtime.

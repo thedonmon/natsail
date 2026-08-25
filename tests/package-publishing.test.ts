@@ -48,7 +48,13 @@ describe('package publishing', () => {
   })
 
   it('keeps examples private', async () => {
-    for (const directory of ['ai-transport', 'chat-ui', 'gateway-chat', 'react-chat']) {
+    for (const directory of [
+      'ai-transport',
+      'chat-ui',
+      'gateway-chat',
+      'react-chat',
+      'rxjs-chat',
+    ]) {
       const manifest = JSON.parse(
         await readFile(new URL(`../examples/${directory}/package.json`, import.meta.url), 'utf8')
       ) as { private?: boolean }

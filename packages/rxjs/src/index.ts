@@ -9,10 +9,49 @@ import type {
 import {
   createJetStreamSessionSource,
   type JetStreamDelivery,
-  type JetStreamSubscriptionOptions,
+  type JetStreamSessionSourceOptions,
+  type JetStreamStateSnapshot,
 } from '@natsail/jetstream'
 import { createCoreSessionSource } from '@natsail/session'
-import type { SessionRegistry, SessionSnapshot, SessionSource } from '@natsail/session'
+import type {
+  SessionDefinition,
+  SessionRegistryEvent,
+  SessionRegistry,
+  SessionSnapshot,
+  SessionSource,
+} from '@natsail/session'
+
+/** Converts registry lifecycle and reference-count diagnostics into a cancellable Observable. */
+export function observeNatsSessionEvents(
+  registry: SessionRegistry
+): Observable<SessionRegistryEvent> {
+  return new Observable((subscriber) => {
+    const iterator = registry.events[Symbol.asyncIterator]()
+    let cancelled = false
+
+    void (async () => {
+      try {
+        while (!cancelled) {
+          const next = await iterator.next()
+          if (next.done) {
+            if (!cancelled) subscriber.complete()
+            return
+          }
+          subscriber.next(next.value)
+        }
+      } catch (error) {
+        if (!cancelled) subscriber.error(error)
+      } finally {
+        await iterator.return?.()
+      }
+    })()
+
+    return () => {
+      cancelled = true
+      void iterator.return?.()
+    }
+  })
+}
 
 /** Converts the runtime event iterable into a cancellable Observable. */
 export function observeNatsRuntimeEvents(runtime: NatsRuntime): Observable<NatsRuntimeEvent> {
@@ -69,9 +108,17 @@ export function observeNatsJetStreamSubscription<T>(
   registry: SessionRegistry,
   runtime: NatsRuntime,
   key: string,
-  options: JetStreamSubscriptionOptions<T>
+  options: JetStreamSessionSourceOptions<T>
 ): Observable<JetStreamDelivery<T>> {
   return observeNatsSessionValues(registry, key, createJetStreamSessionSource(runtime, options))
+}
+
+/** Emits one atomic replay/live reduced state from a validated shared definition. */
+export function observeNatsJetStreamReducer<State>(
+  registry: SessionRegistry,
+  definition: SessionDefinition<JetStreamStateSnapshot<State>>
+): Observable<SessionSnapshot<JetStreamStateSnapshot<State>>> {
+  return observeNatsSession(registry, definition)
 }
 
 /**
@@ -82,11 +129,23 @@ export function observeNatsJetStreamSubscription<T>(
  */
 export function observeNatsSession<T>(
   registry: SessionRegistry,
+  definition: SessionDefinition<T>
+): Observable<SessionSnapshot<T>>
+export function observeNatsSession<T>(
+  registry: SessionRegistry,
   key: string,
   source: SessionSource<T>
+): Observable<SessionSnapshot<T>>
+export function observeNatsSession<T>(
+  registry: SessionRegistry,
+  definitionOrKey: SessionDefinition<T> | string,
+  source?: SessionSource<T>
 ): Observable<SessionSnapshot<T>> {
   return new Observable((subscriber) => {
-    const handle = registry.acquire(key, source)
+    const handle =
+      typeof definitionOrKey === 'string'
+        ? registry.acquire(definitionOrKey, source!)
+        : registry.acquire(definitionOrKey)
     const emit = () => {
       const snapshot = handle.getSnapshot()
       subscriber.next(snapshot)
@@ -112,12 +171,25 @@ export function observeNatsSession<T>(
  */
 export function observeNatsSessionValues<T>(
   registry: SessionRegistry,
+  definition: SessionDefinition<T>
+): Observable<T>
+export function observeNatsSessionValues<T>(
+  registry: SessionRegistry,
   key: string,
   source: SessionSource<T>
+): Observable<T>
+export function observeNatsSessionValues<T>(
+  registry: SessionRegistry,
+  definitionOrKey: SessionDefinition<T> | string,
+  source?: SessionSource<T>
 ): Observable<T> {
   return new Observable((subscriber) => {
     let valueRevision = -1
-    const subscription = observeNatsSession(registry, key, source).subscribe({
+    const snapshots =
+      typeof definitionOrKey === 'string'
+        ? observeNatsSession(registry, definitionOrKey, source!)
+        : observeNatsSession(registry, definitionOrKey)
+    const subscription = snapshots.subscribe({
       next: (snapshot) => {
         if (
           snapshot.valueRevision !== valueRevision &&

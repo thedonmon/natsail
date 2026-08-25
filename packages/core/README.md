@@ -34,7 +34,7 @@ Use the lower-level `decode(message)` option only when decoding depends on NATS 
 
 The runtime replaces a permanently closed connection by default. Set `connectionRecovery.onPermanentClose` to `wait` to defer replacement until the next caller.
 
-Call `runtime.reconnect()` after an authenticator receives new credentials. A live connection starts a new handshake and calls the authenticator again.
+Call `runtime.reconnect()` after an authenticator receives new credentials. A live connection starts a new handshake and calls the authenticator again. The promise resolves after the runtime observes the disconnect-to-connected cycle, so a subsequent publish does not race the offline socket.
 
 The reconnect can interrupt in-flight messages and requests. Normal NATS reconnect settings still apply.
 

@@ -1,10 +1,10 @@
 # Release NATSail packages
 
-NATSail uses Changesets for versions and changelogs. The release workflow publishes through npm trusted publishing. Version `0.1.0` was the one manual bootstrap release.
+NATSail uses Changesets for versions and changelogs. The release workflow publishes through npm trusted publishing. Version `0.1.0` was the one manual bootstrap release; version `0.2.0` proved the trusted workflow end to end.
 
 The workflow does not use an npm token. npm creates provenance automatically for trusted publication from this public repository.
 
-NATSail used the manual bootstrap path for version `0.1.0`. Trusted publishing is active for later releases.
+NATSail used the manual bootstrap path for version `0.1.0`. Trusted publishing is active and produced the public `0.2.0` release with provenance.
 
 ## Completed bootstrap
 

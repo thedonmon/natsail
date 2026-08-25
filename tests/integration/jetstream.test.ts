@@ -109,6 +109,76 @@ describe('JetStream runtime adapter', () => {
     expect(streamInfo.state.consumer_count).toBe(0)
   })
 
+  it('cuts initial replay at the consumer high-water mark while new traffic continues', async () => {
+    const adminConnection = await connectToTestNats()
+    const runtimeConnection = await connectToTestNats()
+    const manager = await jetstreamManager(adminConnection)
+    const client = jetstream(adminConnection)
+    const stream = `TEST_${crypto.randomUUID().replaceAll('-', '_').toUpperCase()}`
+    const subject = uniqueSubject('caught-up')
+
+    await manager.streams.add({
+      name: stream,
+      subjects: [subject],
+      storage: StorageType.Memory,
+    })
+    const runtime = createNatsRuntime({ connect: async () => runtimeConnection })
+    closeAfterTest.push(async () => {
+      await runtime.close()
+      await manager.streams.delete(stream)
+      await adminConnection.drain()
+    })
+
+    await client.publish(subject, 'stored-one')
+    await client.publish(subject, 'stored-two')
+
+    let enterFirst!: () => void
+    const firstEntered = new Promise<void>((resolve) => {
+      enterFirst = resolve
+    })
+    let releaseFirst!: () => void
+    const firstReleased = new Promise<void>((resolve) => {
+      releaseFirst = resolve
+    })
+    const deliveries: Array<{ value: string; replay: string; pending: number }> = []
+    const lease = consumeJetStream(
+      runtime,
+      {
+        stream,
+        filter: subject,
+        start: 'all',
+        codec: natsCodecs.text,
+      },
+      async (delivery) => {
+        deliveries.push({
+          value: delivery.value,
+          replay: delivery.replay,
+          pending: delivery.consumerPending,
+        })
+        if (delivery.value === 'stored-one') {
+          enterFirst()
+          await firstReleased
+        }
+      }
+    )
+
+    await lease.ready
+    await firstEntered
+    await client.publish(subject, 'published-during-replay')
+    releaseFirst()
+
+    await expect(lease.caughtUp).resolves.toMatchObject({ delivered: 2 })
+    await expect
+      .poll(() => deliveries.map(({ value, replay }) => ({ value, replay })))
+      .toEqual([
+        { value: 'stored-one', replay: 'initial' },
+        { value: 'stored-two', replay: 'initial' },
+        { value: 'published-during-replay', replay: 'live' },
+      ])
+    expect(deliveries.every(({ pending }) => Number.isSafeInteger(pending))).toBe(true)
+    await lease.close()
+  })
+
   it('keeps filtered checkpoints in global stream-sequence units', async () => {
     const adminConnection = await connectToTestNats()
     const runtimeConnection = await connectToTestNats()

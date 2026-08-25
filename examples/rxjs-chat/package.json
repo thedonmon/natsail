@@ -12,7 +12,6 @@
     "@nats-io/jetstream": "3.4.0",
     "@nats-io/nats-core": "3.4.0",
     "@nats-io/transport-node": "3.4.0",
-    "@natsail/checkpoints": "workspace:*",
     "@natsail/core": "workspace:*",
     "@natsail/example-chat-ui": "workspace:*",
     "@natsail/jetstream": "workspace:*",

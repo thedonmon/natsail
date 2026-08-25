@@ -2,11 +2,13 @@ import type { Consumer, ConsumerMessages, JsMsg } from '@nats-io/jetstream'
 import type { NatsConnection } from '@nats-io/nats-core'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { CheckpointStore } from '@natsail/checkpoints'
+import { createMemoryCheckpointStore, type CheckpointStore } from '@natsail/checkpoints'
 import { createNatsRuntime, natsCodecs } from '@natsail/core'
 import {
+  createReducingJetStreamSessionSource,
   createJetStreamSessionSource,
   consumeJetStream,
+  defineJetStreamSession,
   JetStreamDuplicateError,
   JetStreamResumeError,
   type JetStreamDelivery,
@@ -31,16 +33,24 @@ vi.mock('@nats-io/jetstream', async (importOriginal) => {
 
 const stream = 'EVENTS'
 const epoch = '2026-08-21T00:00:00.000Z'
-function message(sequence: number, value: string, redelivered = false): JsMsg {
+function message(sequence: number, value: string, redelivered = false, pending = 0): JsMsg {
   return {
     data: natsCodecs.text.encode(value),
-    info: { stream, streamSequence: sequence },
+    info: { stream, streamSequence: sequence, pending },
     redelivered,
   } as JsMsg
 }
 
-function messageSource(deliveries: readonly JsMsg[]): ConsumerMessages {
+function messageSource(
+  deliveries: readonly JsMsg[],
+  closedError?: Error,
+  stayOpen = false
+): ConsumerMessages {
   let closeRequested = false
+  let finish!: () => void
+  const closeSignal = new Promise<void>((resolve) => {
+    finish = resolve
+  })
 
   return {
     async *[Symbol.asyncIterator]() {
@@ -48,20 +58,28 @@ function messageSource(deliveries: readonly JsMsg[]): ConsumerMessages {
         if (closeRequested) break
         yield delivery
       }
+      if (stayOpen && !closeRequested) await closeSignal
     },
     close: vi.fn(async () => {
       closeRequested = true
+      finish()
     }),
-    closed: vi.fn(async () => undefined),
+    closed: vi.fn(async () => closedError),
   } as unknown as ConsumerMessages
 }
 
-function arrangeConsumer(deliveries: readonly JsMsg[]) {
-  const messages = messageSource(deliveries)
+function createConsumer(deliveries: readonly JsMsg[], closedError?: Error, stayOpen = false) {
+  const messages = messageSource(deliveries, closedError, stayOpen)
   const consumer = {
     consume: vi.fn(async () => messages),
+    info: vi.fn(async () => ({ num_pending: deliveries.length })),
     delete: vi.fn(async () => true),
   } as unknown as Consumer
+  return { consumer, messages }
+}
+
+function arrangeConsumer(deliveries: readonly JsMsg[]) {
+  const { consumer, messages } = createConsumer(deliveries)
   jetStreamMocks.getConsumer.mockResolvedValue(consumer)
   return { consumer, messages }
 }
@@ -146,6 +164,126 @@ describe('JetStream duplicate-delivery policy', () => {
       sequence: 3,
       scope: '["events.>"]',
     })
+    await runtime.close()
+  })
+
+  it('marks the captured backlog and resolves caughtUp after its final accepted delivery', async () => {
+    arrangeConsumer([message(1, 'one', false, 1), message(2, 'two')])
+    const runtime = arrangeRuntime()
+    const deliveries: Array<JetStreamDelivery<string>> = []
+    const lease = consumeJetStream(
+      runtime,
+      {
+        stream,
+        filter: 'events.>',
+        start: 'all',
+        codec: natsCodecs.text,
+      },
+      (delivery) => {
+        deliveries.push(delivery)
+      }
+    )
+
+    await expect(lease.caughtUp).resolves.toEqual({
+      cursor: { stream, sequence: 2 },
+      delivered: 2,
+    })
+    expect(deliveries).toMatchObject([
+      { value: 'one', replay: 'initial', consumerPending: 1 },
+      { value: 'two', replay: 'initial', consumerPending: 0 },
+    ])
+    await runtime.close()
+  })
+
+  it('publishes one atomic reduced state after replay instead of every historical delivery', async () => {
+    arrangeConsumer([message(1, 'one', false, 1), message(2, 'two')])
+    const runtime = arrangeRuntime()
+    const snapshots: Array<{ phase: string; data: string[] }> = []
+    const source = createReducingJetStreamSessionSource(
+      runtime,
+      {
+        stream,
+        filter: 'events.>',
+        start: 'all',
+        codec: natsCodecs.text,
+        recovery: { maxAttempts: 2, delayMs: 0 },
+      },
+      {
+        scope: 'messages:v1',
+        initial: () => [] as string[],
+        reduce: (values, delivery) => [...values, delivery.value],
+      }
+    )
+    const lease = source(async (snapshot) => {
+      snapshots.push({ phase: snapshot.phase, data: [...snapshot.data] })
+    })
+
+    await lease.ready
+    expect(snapshots.slice(0, 2)).toEqual([
+      { phase: 'replaying', data: [] },
+      { phase: 'live', data: ['one', 'two'] },
+    ])
+    await lease.close()
+    await runtime.close()
+  })
+
+  it('rejects an event cursor without matching materialized reducer state', () => {
+    const runtime = arrangeRuntime()
+    expect(() =>
+      createReducingJetStreamSessionSource(
+        runtime,
+        {
+          stream,
+          filter: 'events.>',
+          start: 'all',
+          codec: natsCodecs.text,
+          resume: { key: 'unsafe-reducer', store: createMemoryCheckpointStore() },
+        },
+        {
+          scope: 'messages:v1',
+          initial: () => [] as string[],
+          reduce: (values, delivery) => [...values, delivery.value],
+        }
+      )
+    ).toThrow(/materialized state/)
+  })
+
+  it('requires a contract scope for custom recovery functions', () => {
+    const runtime = arrangeRuntime()
+    expect(() =>
+      defineJetStreamSession(runtime, 'events:custom-retry', {
+        stream,
+        filter: 'events.>',
+        start: 'all',
+        codec: natsCodecs.text,
+        recovery: { shouldRetry: () => true },
+      })
+    ).toThrow(/recovery scope/)
+  })
+
+  it('restarts a failed session and resumes from its package-owned in-memory cursor', async () => {
+    const first = createConsumer([message(1, 'one')], new Error('consumer failed'))
+    const second = createConsumer([message(2, 'two')], undefined, true)
+    jetStreamMocks.getConsumer
+      .mockResolvedValueOnce(first.consumer)
+      .mockResolvedValueOnce(second.consumer)
+    const runtime = arrangeRuntime()
+    const values: string[] = []
+    const source = createJetStreamSessionSource(runtime, {
+      stream,
+      filter: 'events.>',
+      start: 'all',
+      codec: natsCodecs.text,
+      recovery: { maxAttempts: 2, delayMs: 0 },
+    })
+    const lease = source(async (delivery) => {
+      values.push(delivery.value)
+    })
+
+    await vi.waitFor(() => expect(jetStreamMocks.getConsumer).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() => expect(values).toEqual(['one', 'two']))
+    expect(lease.inspect()).toMatchObject({ restarts: 1 })
+    await lease.close()
     await runtime.close()
   })
 

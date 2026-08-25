@@ -6,9 +6,23 @@
 pnpm add react @natsail/core @natsail/session @natsail/jetstream @natsail/react
 ```
 
-The provider owns neither the runtime nor the session registry. The application closes both objects.
+`NatsProvider` owns neither the runtime nor the session registry. The application closes both objects. `NatsManagedProvider` is the ownership-safe alternative: it creates both after commit, reuses the resource during React Strict Mode effect replay, and closes it after final unmount.
+
+```tsx
+<NatsManagedProvider
+  identity={accountId}
+  create={() => ({
+    runtime: createNatsRuntime(runtimeOptions),
+    sessions: createSessionRegistry({ idleCloseMs: 250 }),
+  })}
+>
+  <App />
+</NatsManagedProvider>
+```
 
 `useNatsJetStreamSubscription()` and its selector variant open one registry-shared, checkpointed JetStream source.
+
+`useNatsJetStreamReducer()` accepts a validated reducing definition and returns its atomic replay/live snapshot. `useNatsJetStreamReducerSelector()` can schedule React notifications immediately, in a microtask, or on the next animation frame. The underlying session still reduces every delivery serially; only rendering is coalesced.
 
 `useNatsConnection()` follows the runtime-owned connection for advanced nats.js operations without adding an application connection effect.
 

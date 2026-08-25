@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { createMemoryCheckpointStore } from '@natsail/checkpoints'
 import { createNatsRuntime, natsCodecs, type NatsRuntimeEvent } from '@natsail/core'
-import { consumeJetStream } from '@natsail/jetstream'
+import { consumeJetStream, createReducingJetStreamSessionSource } from '@natsail/jetstream'
 
 import { connectToTestNats, uniqueSubject } from './helpers.js'
 
@@ -123,6 +123,57 @@ describe('forced reconnect recovery', () => {
         { duplicate: false, sequence: 3, value: 'after' },
       ])
     await expect.poll(async () => (await checkpoints.load('reconnect'))?.sequence).toBe(3)
+  })
+
+  it('continues an atomic reducing session after a forced disconnect', async () => {
+    const adminConnection = await connectToTestNats()
+    const runtimeConnection = await connectToTestNats()
+    const manager = await jetstreamManager(adminConnection)
+    const client = jetstream(adminConnection)
+    const stream = `TEST_${crypto.randomUUID().replaceAll('-', '_').toUpperCase()}`
+    const subject = uniqueSubject('reducing-reconnect')
+
+    await manager.streams.add({
+      name: stream,
+      subjects: [subject],
+      storage: StorageType.Memory,
+    })
+
+    const runtime = createNatsRuntime({ connect: async () => runtimeConnection })
+    closeAfterTest.push(async () => {
+      await runtime.close()
+      await manager.streams.delete(stream)
+      await adminConnection.drain()
+    })
+
+    await client.publish(subject, 'before')
+    const snapshots: string[][] = []
+    const source = createReducingJetStreamSessionSource(
+      runtime,
+      {
+        stream,
+        filter: subject,
+        start: 'all',
+        recovery: { delayMs: 0 },
+        codec: natsCodecs.text,
+      },
+      {
+        scope: 'reconnect-values:v1',
+        initial: () => [] as string[],
+        reduce: (values, delivery) => [...values, delivery.value],
+      }
+    )
+    const lease = source(async (snapshot) => {
+      snapshots.push(snapshot.data)
+    })
+
+    await lease.ready
+    await expect.poll(() => snapshots.at(-1)).toEqual(['before'])
+    await runtime.reconnect({ reason: 'reducing integration test' })
+    await runtime.publish(subject, natsCodecs.text.encode('after'))
+    await runtimeConnection.flush()
+
+    await expect.poll(() => snapshots.at(-1)).toEqual(['before', 'after'])
   })
 
   it('reports connection state and structured reconnect diagnostics', async () => {

@@ -82,7 +82,7 @@ try {
       {
         verdict: 'passed',
         proven: [
-          'NatsProvider owns one shared runtime and session registry',
+          'NatsManagedProvider owns one Strict-Mode-safe runtime and session registry',
           'the reducer-backed React hook retains every delivered chat message',
           'Core NATS publish returns through the shared wildcard subscription',
           'the guided proof rail reports browser-observed results',
