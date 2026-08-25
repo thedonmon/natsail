@@ -1,11 +1,11 @@
 import { useMemo, useState, useSyncExternalStore } from 'react'
 import {
   combineLatest,
-  scan,
-  share,
+  distinctUntilChanged,
+  map,
   shareReplay,
   startWith,
-  Subject,
+  tap,
   type Observable,
   type Subscription,
 } from 'rxjs'
@@ -19,9 +19,13 @@ import {
   type TimelineEntry,
   type TimelineState,
 } from '@natsail/example-chat-ui'
-import type { JetStreamDelivery } from '@natsail/jetstream'
-import { observeNatsRuntimeStatus, observeNatsSessionValues } from '@natsail/rxjs'
-import { RecoverableChatFeed } from './chat-feed'
+import type { JetStreamStateSnapshot } from '@natsail/jetstream'
+import {
+  observeNatsJetStreamReducer,
+  observeNatsRuntimeStatus,
+  observeNatsSessionEvents,
+} from '@natsail/rxjs'
+import { ChatFeed, type ChatFeedModel } from './chat-feed'
 import { runtime, sessions } from './runtime'
 
 const names = ['Avery', 'Mika', 'Noor', 'Sol', 'Tess', 'Zed']
@@ -49,66 +53,47 @@ const readIdentity = (): { author: string; clientId: string } => {
 }
 
 const identity = readIdentity()
-const feed = new RecoverableChatFeed(runtime)
+const feed = new ChatFeed(runtime)
 
-const deliveries$ = observeNatsSessionValues(sessions, 'rxjs-chat:all-rooms', feed.source).pipe(
-  share({
-    connector: () => new Subject<JetStreamDelivery<ChatMessage>>(),
-    resetOnComplete: true,
-    resetOnError: true,
-    resetOnRefCountZero: true,
-  })
+const feedSnapshot$ = observeNatsJetStreamReducer(sessions, feed.definition).pipe(
+  tap((session) => feed.follow(session.value, session.error))
 )
 
-const entries$ = deliveries$.pipe(
-  scan<JetStreamDelivery<ChatMessage>, TimelineEntry[]>((entries, delivery) => {
-    if (entries.some((entry) => entry.message.id === delivery.value.id)) return entries
-    return [
-      ...entries,
-      {
-        message: delivery.value,
-        cursor: delivery.cursor.sequence,
-        delivery: 'applied' as const,
-      },
-    ].slice(-256)
-  }, []),
-  startWith([] as TimelineEntry[])
+const observedRoomCount$ = observeNatsJetStreamReducer(sessions, feed.definition).pipe(
+  map((session) => session.value?.data.roomIds.length ?? 0),
+  distinctUntilChanged()
 )
 
-const observedRoomCount$ = deliveries$.pipe(
-  scan<JetStreamDelivery<ChatMessage>, ReadonlySet<string>>(
-    (roomIds, delivery) => new Set([...roomIds, delivery.value.roomId]),
-    new Set<string>()
-  ),
-  startWith(new Set<string>() as ReadonlySet<string>)
+const registryInspection$ = observeNatsSessionEvents(sessions).pipe(
+  map(() => sessions.inspect()),
+  startWith(sessions.inspect())
 )
 
 interface ChatView {
   entries: TimelineEntry[]
+  snapshot?: JetStreamStateSnapshot<ChatFeedModel>
   runtimeState: NatsRuntimeConnectionState
   feedState: ReturnType<typeof feed.state$.getValue>
   observedRoomCount: number
+  sessionReferences: number
 }
 
 const view$ = combineLatest([
-  entries$,
+  feedSnapshot$,
   observedRoomCount$,
   feed.state$,
   observeNatsRuntimeStatus(runtime),
+  registryInspection$,
 ]).pipe(
-  scan(
-    (_current, [entries, observedRoomIds, feedState, runtimeStatus]): ChatView => ({
-      entries,
-      observedRoomCount: observedRoomIds.size,
+  map(
+    ([session, observedRoomCount, feedState, runtimeStatus, inspection]): ChatView => ({
+      entries: [...(session.value?.data.entries ?? [])],
+      ...(session.value === undefined ? {} : { snapshot: session.value }),
+      observedRoomCount,
+      sessionReferences: inspection.sessions[0]?.references ?? 0,
       feedState,
       runtimeState: runtimeStatus.state,
-    }),
-    {
-      entries: [],
-      observedRoomCount: 0,
-      feedState: feed.state$.value,
-      runtimeState: 'idle',
-    } satisfies ChatView
+    })
   ),
   shareReplay({ bufferSize: 1, refCount: true })
 )
@@ -116,6 +101,7 @@ const view$ = combineLatest([
 const initialView: ChatView = {
   entries: [],
   observedRoomCount: 0,
+  sessionReferences: 0,
   feedState: feed.state$.value,
   runtimeState: 'idle',
 }
@@ -203,17 +189,17 @@ export function App() {
       clientId={identity.clientId}
       author={identity.author}
       applicationSubtitle="RXJS JETSTREAM CHAT"
-      architectureDescription={`Two RxJS projections (${view.observedRoomCount} rooms observed) share one keyed session and ordered JetStream consumer.`}
-      topologyLabel="SHARED OBSERVABLE · ONE CONSUMER"
+      architectureDescription={`Two validated RxJS projections (${view.observedRoomCount} rooms observed, ${view.sessionReferences} active references) share one atomic reducer session and ordered JetStream consumer.`}
+      topologyLabel="ATOMIC REPLAY · TWO PROJECTIONS · ONE CONSUMER"
       upstreamLabel="JetStream"
-      sourceStarts={view.feedState.sourceStarts}
+      sourceStarts={1 + (view.snapshot?.restarts ?? 0)}
       connectionAction={{
         label:
           phase === 'gap'
-            ? 'Publishing into the gap…'
+            ? 'Reconnecting transport…'
             : phase === 'catching-up'
-              ? 'Applying retained messages…'
-              : 'Pause stream and publish 3',
+              ? 'Publishing recovery messages…'
+              : 'Reconnect and publish 3',
         disabled: phase !== 'live',
         onClick: () => void feed.recover(room.id).catch(() => undefined),
       }}

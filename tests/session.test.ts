@@ -5,6 +5,8 @@ import {
   createCoreSessionSource,
   createReducingSessionSource,
   createSessionRegistry,
+  defineSession,
+  SessionContractMismatchError,
 } from '@natsail/session'
 
 function controllableLease(): {
@@ -210,5 +212,89 @@ describe('session registry', () => {
 
     await first.release()
     await second.release()
+  })
+
+  it('rejects a validated key reused with different delivery semantics', async () => {
+    const registry = createSessionRegistry()
+    const firstSource = controllableLease()
+    const secondSource = controllableLease()
+    const first = defineSession({
+      key: 'conversation:contract',
+      contract: 'stream=events;start=all',
+      source: () => firstSource.lease,
+    })
+    const conflicting = defineSession({
+      key: 'conversation:contract',
+      contract: 'stream=events;start=new',
+      source: () => secondSource.lease,
+    })
+
+    const handle = registry.acquire(first)
+    expect(() => registry.acquire(conflicting)).toThrow(SessionContractMismatchError)
+    expect(registry.inspect()).toMatchObject({
+      closed: false,
+      activeSessions: 1,
+      sessions: [
+        {
+          key: 'conversation:contract',
+          contract: 'stream=events;start=all',
+          references: 1,
+          idle: false,
+        },
+      ],
+    })
+
+    await handle.release()
+  })
+
+  it('does not mix validated and unvalidated acquisitions for one key', async () => {
+    const registry = createSessionRegistry()
+    const sourceLease = controllableLease()
+    const source = () => sourceLease.lease
+    const definition = defineSession({
+      key: 'conversation:mixed-contract',
+      contract: 'events:v1',
+      source,
+    })
+
+    const handle = registry.acquire(definition)
+    expect(() => registry.acquire(definition.key, source)).toThrow(SessionContractMismatchError)
+
+    await handle.release()
+  })
+
+  it('reports session reference and lifecycle events for resource diagnostics', async () => {
+    const sourceLease = controllableLease()
+    const registry = createSessionRegistry({ idleCloseMs: 25 })
+    const iterator = registry.events[Symbol.asyncIterator]()
+    const definition = defineSession({
+      key: 'conversation:diagnostics',
+      contract: 'events:v1',
+      source: () => sourceLease.lease,
+    })
+
+    const handle = registry.acquire(definition)
+    expect((await iterator.next()).value).toMatchObject({
+      type: 'opened',
+      key: definition.key,
+      contract: definition.contract,
+      references: 0,
+    })
+    expect((await iterator.next()).value).toMatchObject({
+      type: 'retained',
+      key: definition.key,
+      references: 1,
+    })
+
+    await handle.ready
+    await handle.release()
+    expect(registry.inspect().sessions[0]).toMatchObject({
+      key: definition.key,
+      references: 0,
+      idle: true,
+    })
+
+    await iterator.return?.()
+    await registry.close()
   })
 })

@@ -21,17 +21,28 @@ const nkeyRoot = join(fixtureRoot, 'nkey')
 const tlsRoot = join(fixtureRoot, 'tls')
 const jwtRoot = join(fixtureRoot, 'jwt')
 const force = process.argv.includes('--force')
+const tlsCertificate = join(tlsRoot, 'server-cert.pem')
 
 const expectedFiles = [
   join(nkeyRoot, 'client.seed'),
   join(nkeyRoot, 'nats-nkey.conf'),
-  join(tlsRoot, 'server-cert.pem'),
+  tlsCertificate,
   join(tlsRoot, 'server-key.pem'),
   join(jwtRoot, 'client.creds'),
   join(jwtRoot, 'nats-jwt.conf'),
 ]
 
-if (!force && expectedFiles.every((file) => existsSync(file))) {
+const tlsCertificateIsFresh = () => {
+  if (!existsSync(tlsCertificate)) return false
+  try {
+    execFileSync('openssl', ['x509', '-checkend', '86400', '-noout', '-in', tlsCertificate])
+    return true
+  } catch {
+    return false
+  }
+}
+
+if (!force && expectedFiles.every((file) => existsSync(file)) && tlsCertificateIsFresh()) {
   console.log('Disposable NATS authentication fixtures are ready.')
   process.exit(0)
 }

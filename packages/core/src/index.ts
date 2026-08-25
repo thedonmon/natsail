@@ -550,10 +550,14 @@ class DefaultNatsRuntime implements NatsRuntime {
       return connection
     }
 
+    const reconnectCycle = this.observeReconnectCycle()
     try {
       await connection.reconnect()
+      await reconnectCycle.completed
     } catch (error) {
       if (!connection.isClosed()) throw error
+    } finally {
+      await reconnectCycle.cancel()
     }
 
     if (connection.isClosed()) {
@@ -561,6 +565,32 @@ class DefaultNatsRuntime implements NatsRuntime {
       return this.connection()
     }
     return connection
+  }
+
+  private observeReconnectCycle(): { completed: Promise<void>; cancel(): Promise<void> } {
+    const iterator = this.eventStream[Symbol.asyncIterator]()
+    const completed = (async () => {
+      let disconnected = false
+      while (true) {
+        const next = await iterator.next()
+        if (next.done) throw new Error('The NATS runtime closed during reconnect')
+        if (next.value.type !== 'status') continue
+        if (next.value.state === 'disconnected' || next.value.state === 'reconnecting') {
+          disconnected = true
+        } else if (disconnected && next.value.state === 'connected') {
+          return
+        } else if (next.value.state === 'closed') {
+          throw new Error('The NATS runtime closed during reconnect')
+        }
+      }
+    })()
+    void completed.catch(() => undefined)
+    return {
+      completed,
+      cancel: async () => {
+        await iterator.return?.()
+      },
+    }
   }
 
   async publish(

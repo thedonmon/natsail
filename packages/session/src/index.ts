@@ -17,6 +17,64 @@ export type SessionSource<T> = (accept: (value: T) => Promise<void>) => Subscrip
 
 export type SessionReducer<Value, State> = (state: State, value: Value) => State | Promise<State>
 
+/** One validated logical source shared by every framework adapter. */
+export interface SessionDefinition<T> {
+  readonly key: string
+  /** Stable description of every source option that affects delivery semantics. */
+  readonly contract: string
+  readonly source: SessionSource<T>
+}
+
+export class SessionContractMismatchError extends Error {
+  readonly name = 'SessionContractMismatchError'
+
+  constructor(
+    readonly key: string,
+    readonly activeContract: string,
+    readonly requestedContract: string
+  ) {
+    super(
+      `NATS session ${key} is already active with contract ${activeContract}; requested ${requestedContract}`
+    )
+  }
+}
+
+export interface SessionInspection {
+  readonly key: string
+  readonly contract?: string
+  readonly phase: SessionPhase
+  readonly references: number
+  readonly revision: number
+  readonly valueRevision: number
+  readonly idle: boolean
+}
+
+export interface SessionRegistryInspection {
+  readonly closed: boolean
+  readonly activeSessions: number
+  readonly sessions: readonly SessionInspection[]
+}
+
+export type SessionRegistryEventType =
+  | 'opened'
+  | 'retained'
+  | 'released'
+  | 'restarting'
+  | 'updated'
+  | 'closed'
+
+export interface SessionRegistryEvent {
+  readonly type: SessionRegistryEventType
+  readonly key: string
+  readonly contract?: string
+  readonly at: number
+  readonly phase: SessionPhase
+  readonly references: number
+  readonly revision: number
+  readonly valueRevision: number
+  readonly error?: unknown
+}
+
 export interface SessionHandle<T> {
   readonly key: string
   readonly ready: Promise<void>
@@ -28,15 +86,42 @@ export interface SessionHandle<T> {
 }
 
 export interface SessionRegistry {
+  acquire<T>(definition: SessionDefinition<T>): SessionHandle<T>
   acquire<T>(key: string, source: SessionSource<T>): SessionHandle<T>
   /** Restarts an active logical session by key. */
   restart(key: string): Promise<void>
+  /** Multicasts lifecycle and reference-count changes for leak and recovery diagnostics. */
+  readonly events: AsyncIterable<SessionRegistryEvent>
+  /** Returns a point-in-time view of every active logical session. */
+  inspect(): SessionRegistryInspection
   close(): Promise<void>
 }
 
 export interface SessionRegistryOptions {
   /** Delay before closing a session with no callers. Defaults to 0. */
   idleCloseMs?: number
+}
+
+type Deferred<T> = {
+  promise: Promise<T>
+  resolve(value: T | PromiseLike<T>): void
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: Deferred<T>['resolve']
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise
+  })
+  return { promise, resolve }
+}
+
+/** Freezes a validated session identity that React and RxJS can share safely. */
+export function defineSession<T>(definition: SessionDefinition<T>): SessionDefinition<T> {
+  if (definition.key.length === 0) throw new TypeError('Session definition key must not be empty')
+  if (definition.contract.length === 0) {
+    throw new TypeError('Session definition contract must not be empty')
+  }
+  return Object.freeze({ ...definition })
 }
 
 /** Adapts one Core NATS subscription into a shareable session source. */
@@ -83,7 +168,12 @@ class SharedSession<T> {
   private generation = 0
   private closeRequested = false
 
-  constructor(private readonly source: SessionSource<T>) {
+  constructor(
+    readonly key: string,
+    readonly contract: string | undefined,
+    private readonly source: SessionSource<T>,
+    private readonly emit: (event: SessionRegistryEvent) => void
+  ) {
     this.currentReady = this.start()
     void this.currentReady.catch(() => undefined)
   }
@@ -94,11 +184,25 @@ class SharedSession<T> {
 
   retain(): void {
     this.references += 1
+    this.report('retained')
   }
 
   release(): number {
     this.references -= 1
+    this.report('released')
     return this.references
+  }
+
+  inspect(idle: boolean): SessionInspection {
+    return {
+      key: this.key,
+      ...(this.contract === undefined ? {} : { contract: this.contract }),
+      phase: this.snapshot.phase,
+      references: this.references,
+      revision: this.snapshot.revision,
+      valueRevision: this.snapshot.valueRevision,
+      idle,
+    }
   }
 
   getSnapshot(): SessionSnapshot<T> {
@@ -124,6 +228,7 @@ class SharedSession<T> {
             revision: this.snapshot.revision + 1,
           })
         }
+        this.report('closed')
       }
     })()
     return this.closePromise
@@ -135,6 +240,7 @@ class SharedSession<T> {
     }
 
     if (!this.restartPromise) {
+      this.report('restarting')
       this.restartPromise = this.restartSession().finally(() => {
         this.restartPromise = undefined
       })
@@ -217,9 +323,95 @@ class SharedSession<T> {
 
   private update(snapshot: SessionSnapshot<T>): void {
     this.snapshot = snapshot
+    this.report('updated')
     for (const listener of this.listeners) {
       listener()
     }
+  }
+
+  private report(type: SessionRegistryEventType): void {
+    this.emit({
+      type,
+      key: this.key,
+      ...(this.contract === undefined ? {} : { contract: this.contract }),
+      at: Date.now(),
+      phase: this.snapshot.phase,
+      references: this.references,
+      revision: this.snapshot.revision,
+      valueRevision: this.snapshot.valueRevision,
+      ...(this.snapshot.error === undefined ? {} : { error: this.snapshot.error }),
+    })
+  }
+}
+
+type SessionEventSubscriber = {
+  readonly queue: SessionRegistryEvent[]
+  waiting: Deferred<IteratorResult<SessionRegistryEvent, undefined>> | undefined
+  closed: boolean
+}
+
+class SessionEventStream implements AsyncIterable<SessionRegistryEvent> {
+  private readonly subscribers = new Set<SessionEventSubscriber>()
+  private closed = false;
+
+  [Symbol.asyncIterator](): AsyncIterator<SessionRegistryEvent> {
+    const subscriber: SessionEventSubscriber = {
+      queue: [],
+      waiting: undefined,
+      closed: this.closed,
+    }
+    if (!subscriber.closed) this.subscribers.add(subscriber)
+
+    return {
+      next: () => {
+        const event = subscriber.queue.shift()
+        if (event) return Promise.resolve({ done: false, value: event })
+        if (subscriber.closed) return Promise.resolve({ done: true, value: undefined })
+        const waiting = deferred<IteratorResult<SessionRegistryEvent, undefined>>()
+        subscriber.waiting = waiting
+        return waiting.promise
+      },
+      return: async () => {
+        this.remove(subscriber)
+        return { done: true, value: undefined }
+      },
+    }
+  }
+
+  emit(event: SessionRegistryEvent): void {
+    if (this.closed) return
+    for (const subscriber of this.subscribers) {
+      if (subscriber.waiting) {
+        subscriber.waiting.resolve({ done: false, value: event })
+        subscriber.waiting = undefined
+      } else if (event.type === 'updated') {
+        let existing = -1
+        for (let index = subscriber.queue.length - 1; index >= 0; index -= 1) {
+          const queued = subscriber.queue[index]!
+          if (queued.type === 'updated' && queued.key === event.key) {
+            existing = index
+            break
+          }
+        }
+        if (existing === -1) subscriber.queue.push(event)
+        else subscriber.queue[existing] = event
+      } else {
+        subscriber.queue.push(event)
+      }
+    }
+  }
+
+  close(): void {
+    if (this.closed) return
+    this.closed = true
+    for (const subscriber of this.subscribers) this.remove(subscriber)
+  }
+
+  private remove(subscriber: SessionEventSubscriber): void {
+    subscriber.closed = true
+    this.subscribers.delete(subscriber)
+    subscriber.waiting?.resolve({ done: true, value: undefined })
+    subscriber.waiting = undefined
   }
 }
 
@@ -228,18 +420,46 @@ class DefaultSessionRegistry implements SessionRegistry {
   private readonly cleanupTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private closePromise?: Promise<void>
   private closeRequested = false
+  private readonly eventStream = new SessionEventStream()
+
+  readonly events: AsyncIterable<SessionRegistryEvent> = this.eventStream
 
   constructor(private readonly options: SessionRegistryOptions) {}
 
-  acquire<T>(key: string, source: SessionSource<T>): SessionHandle<T> {
+  acquire<T>(definition: SessionDefinition<T>): SessionHandle<T>
+  acquire<T>(key: string, source: SessionSource<T>): SessionHandle<T>
+  acquire<T>(
+    definitionOrKey: SessionDefinition<T> | string,
+    sourceArgument?: SessionSource<T>
+  ): SessionHandle<T> {
     if (this.closeRequested) {
       throw new Error('The session registry is closed')
     }
 
+    const key = typeof definitionOrKey === 'string' ? definitionOrKey : definitionOrKey.key
+    const contract = typeof definitionOrKey === 'string' ? undefined : definitionOrKey.contract
+    const source = typeof definitionOrKey === 'string' ? sourceArgument! : definitionOrKey.source
+
     let session = this.sessions.get(key) as SharedSession<T> | undefined
     if (!session) {
-      session = new SharedSession(source)
+      session = new SharedSession(key, contract, source, (event) => this.eventStream.emit(event))
       this.sessions.set(key, session as SharedSession<unknown>)
+      this.eventStream.emit({
+        type: 'opened',
+        key,
+        ...(contract === undefined ? {} : { contract }),
+        at: Date.now(),
+        phase: session.getSnapshot().phase,
+        references: 0,
+        revision: session.getSnapshot().revision,
+        valueRevision: session.getSnapshot().valueRevision,
+      })
+    } else if (contract !== session.contract) {
+      throw new SessionContractMismatchError(
+        key,
+        session.contract ?? '<unvalidated>',
+        contract ?? '<unvalidated>'
+      )
     }
     const cleanupTimer = this.cleanupTimers.get(key)
     if (cleanupTimer) {
@@ -287,6 +507,17 @@ class DefaultSessionRegistry implements SessionRegistry {
     return this.closePromise
   }
 
+  inspect(): SessionRegistryInspection {
+    const sessions = [...this.sessions.entries()].map(([key, session]) =>
+      session.inspect(this.cleanupTimers.has(key))
+    )
+    return {
+      closed: this.closeRequested,
+      activeSessions: sessions.length,
+      sessions,
+    }
+  }
+
   private async closeRegistry(): Promise<void> {
     for (const timer of this.cleanupTimers.values()) {
       clearTimeout(timer)
@@ -295,6 +526,7 @@ class DefaultSessionRegistry implements SessionRegistry {
     const sessions = [...this.sessions.values()]
     this.sessions.clear()
     await Promise.allSettled(sessions.map((session) => session.close()))
+    this.eventStream.close()
   }
 
   private async releaseIdleSession<T>(key: string, session: SharedSession<T>): Promise<void> {

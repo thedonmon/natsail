@@ -62,7 +62,10 @@ try {
   )
   await expect(page.locator('[data-deliveries]')).toHaveAttribute('data-deliveries', '5')
   await expect(page.locator('[data-source-starts]')).toHaveAttribute('data-source-starts', '1')
-  await expect(page.getByText(/Two RxJS projections share one keyed NATSail session/)).toBeVisible()
+  await page.getByText('How this example is wired').click()
+  await expect(page.locator('.architecture-details p')).toContainText(
+    'Two validated RxJS projections'
+  )
 
   const body = `RxJS round trip ${crypto.randomUUID().slice(0, 8)}`
   await page.locator('#probe-body').fill(body)
@@ -70,7 +73,7 @@ try {
   await expect(page.getByText(body)).toBeVisible()
   await expect(page.locator('[data-deliveries]')).toHaveAttribute('data-deliveries', '6')
 
-  await page.getByRole('button', { name: 'Pause stream and publish 3' }).click()
+  await page.getByRole('button', { name: 'Reconnect and publish 3' }).click()
   await expect(page.locator('[data-gateway-phase]').first()).toHaveAttribute(
     'data-gateway-phase',
     'gap'
@@ -82,7 +85,7 @@ try {
     'data-gateway-phase',
     'live'
   )
-  await expect(page.getByText(/Published while the RxJS consumer was paused/)).toHaveCount(3)
+  await expect(page.getByText(/Published after the forced reconnect/)).toHaveCount(3)
   await expect(page.locator('[data-deliveries]')).toHaveAttribute('data-deliveries', '9')
   await expect(page.locator('[data-source-starts]')).toHaveAttribute('data-source-starts', '1')
   await page.screenshot({ path: screenshot })
@@ -92,14 +95,14 @@ try {
       {
         verdict: 'passed',
         proven: [
-          'scan preserves the complete multi-room JetStream timeline',
-          'two RxJS projections share one NATSail session source',
+          'one atomic package reducer publishes the complete multi-room JetStream timeline after replay',
+          'two validated RxJS projections share one NATSail session definition and consumer',
           'a publish returns through the shared Observable with its global stream cursor',
-          'three messages published while the ordered consumer is closed replay after its checkpoint',
+          'three messages published after a forced transport reconnect reach the same reduced state',
           'the React view observes RxJS state without opening another NATS subscription',
         ],
         currentBoundary:
-          'Controlled gap injection wraps the direct JetStream source with a custom SessionSource lifecycle',
+          'Persisted materialized reducer state is not implemented; a fresh lease reconstructs state from atomic replay',
         screenshot,
       },
       null,

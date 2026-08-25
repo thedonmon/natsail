@@ -435,13 +435,13 @@ export function Workspace(props: WorkspaceProps) {
         }
       : props.mode === 'rxjs'
         ? {
-            title: 'Recover retained deliveries',
+            title: 'Survive a transport reconnect',
             instruction:
-              'Pause the ordered consumer. The app publishes three messages before it resumes from its checkpoint.',
+              'Force the shared runtime to reconnect, then publish three messages through the same runtime and reducer session.',
             result:
               props.timeline.catchUpCount > 0
-                ? `${props.timeline.catchUpCount} retained recovery run observed.`
-                : 'Waiting for one pause, publish, and resume cycle.',
+                ? `${props.timeline.catchUpCount} reconnect recovery run observed.`
+                : 'Waiting for one disconnect, reconnect, and publish cycle.',
             status: props.timeline.catchUpCount > 0 ? 'pass' : 'pending',
             action: props.connectionAction ? (
               <Button

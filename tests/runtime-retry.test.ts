@@ -188,6 +188,27 @@ describe('runtime initial connection retry', () => {
     await runtime.close()
   })
 
+  it('does not resolve reconnect before the runtime observes the new live connection', async () => {
+    const controlled = controllableConnection('nats://test')
+    controlled.reconnect.mockImplementationOnce(async () => undefined)
+    const runtime = createNatsRuntime({ connect: async () => controlled.connection })
+    await runtime.connection()
+
+    let settled = false
+    const reconnecting = runtime.reconnect().then(() => {
+      settled = true
+    })
+    await expect.poll(() => controlled.reconnect.mock.calls.length).toBe(1)
+    expect(settled).toBe(false)
+
+    controlled.emitStatus({ type: 'disconnect', server: 'nats://test' })
+    controlled.emitStatus({ type: 'reconnect', server: 'nats://test' })
+    await reconnecting
+    expect(settled).toBe(true)
+
+    await runtime.close()
+  })
+
   it('replaces a connection that closes during a forced reconnect', async () => {
     const first = controllableConnection('nats://first')
     const second = controllableConnection('nats://second')
@@ -233,12 +254,12 @@ function fakeConnection(): NatsConnection {
 function controllableConnection(server: string): {
   connection: NatsConnection
   reconnect: ReturnType<typeof vi.fn<() => Promise<void>>>
+  emitStatus(status: Status): void
   closePermanently(error?: Error): void
 } {
   let closed = false
   let waiting: ((result: IteratorResult<Status>) => void) | undefined
   const queued: Status[] = []
-  const reconnect = vi.fn<() => Promise<void>>().mockResolvedValue(undefined)
   let resolveClosed!: (error?: void | Error) => void
   const closedPromise = new Promise<void | Error>((resolve) => {
     resolveClosed = resolve
@@ -253,6 +274,10 @@ function controllableConnection(server: string): {
       queued.push(status)
     }
   }
+  const reconnect = vi.fn<() => Promise<void>>(async () => {
+    emit({ type: 'disconnect', server })
+    emit({ type: 'reconnect', server })
+  })
 
   const connection = {
     getServer: () => server,
@@ -284,6 +309,7 @@ function controllableConnection(server: string): {
   return {
     connection,
     reconnect,
+    emitStatus: emit,
     closePermanently: (error?: Error) => {
       closed = true
       resolveClosed(error)

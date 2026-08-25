@@ -72,21 +72,21 @@ const cleanup = async () => {
 
 const seedMessages = async (client) => {
   const values = [
-    ['general', 'Mika / systems', 'This retained room feed enters the app as one RxJS Observable.'],
+    ['general', 'Mika / systems', 'One atomic reducer rebuilds this retained room feed.'],
     [
       'gateway-lab',
       'Noor / frontend',
-      'Two RxJS projections share one keyed NATSail session and one ordered consumer.',
+      'Two validated RxJS projections share one NATSail definition and ordered consumer.',
     ],
     [
       'gateway-lab',
       'Avery / app',
-      'The transcript uses scan while the room evidence uses a separate projection.',
+      'Historical events stay hidden until the reducer publishes one caught-up timeline.',
     ],
     [
       'edge-cases',
       'Sol / runtime',
-      'Pause the consumer, publish into the gap, and resume after the processed checkpoint.',
+      'Force a transport reconnect and messages still return through the same reduced session.',
     ],
     [
       'release',
@@ -158,7 +158,7 @@ try {
 
   process.stdout.write(`\nREADY ${appUrl}\n`)
   process.stdout.write('The browser connects directly to ws://127.0.0.1:9223.\n')
-  process.stdout.write('Send a message or run the visible retained-recovery action.\n')
+  process.stdout.write('Send a message or run the visible transport-recovery action.\n')
   process.stdout.write('Press Ctrl-C to stop.\n\n')
 
   await new Promise((resolve, reject) => {

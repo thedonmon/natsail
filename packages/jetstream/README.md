@@ -6,9 +6,38 @@
 pnpm add @natsail/core @natsail/checkpoints @natsail/session @natsail/jetstream
 ```
 
-`consumeJetStream()` uses an ordered consumer with `AckPolicy.None`. It saves the application checkpoint only after the handler succeeds.
+`consumeJetStream()` uses an ordered consumer with `AckPolicy.None`. It saves the application checkpoint only after the handler succeeds. Its lease exposes `caughtUp`, `inspect()`, and lifecycle notifications. Every delivery includes the server pending count and a stable `replay: 'initial' | 'live'` classification based on the backlog captured when the consumer opens.
 
-`createJetStreamSessionSource()` adapts the consumer for one shared React and RxJS session. Each delivery retains its cursor and duplicate metadata.
+`createJetStreamSessionSource()` adapts the consumer for one shared React and RxJS session. Set `recovery` to let the package replace a failed ordered consumer after its last successfully processed cursor. Permanent configuration, retention, decode, duplicate, and application-handler failures stay terminal by default.
+
+Custom `recovery.delayMs` or `recovery.shouldRetry` functions require a stable `recovery.scope` when used in a validated definition. The scope prevents two callers from sharing a key while silently using different retry semantics.
+
+`defineJetStreamSession()` combines that source with a validated contract. `defineReducingJetStreamSession()` also folds the initial replay without publishing partially assembled application state, emits one atomic live snapshot at catch-up, and then emits every serially reduced live state:
+
+```ts
+import { defineReducingJetStreamSession } from '@natsail/jetstream'
+
+const conversation = defineReducingJetStreamSession(
+  runtime,
+  'conversation:123',
+  {
+    stream: 'CONVERSATIONS',
+    filter: 'conversations.123.events',
+    start: 'all',
+    recovery: { delayMs: 500 },
+    codec: natsCodecs.json<ConversationEvent>(),
+  },
+  {
+    scope: 'conversation-view:v2',
+    initial: () => emptyConversation,
+    reduce: applyConversationEvent,
+  }
+)
+```
+
+The reduced snapshot reports `replaying`, `reconnecting`, or `live`, the last cursor, initial replay count, and package recovery count. React and RxJS can acquire the same definition without duplicating the consumer.
+
+A reducing session does not accept `resume` yet. An event cursor is safe only when the matching materialized reducer state is restored atomically with it. Package-owned recovery preserves both within the active source lease; a fresh lease reconstructs state from an atomic replay.
 
 Normal consumers select a package-owned payload codec instead of constructing text encoders or decoders:
 
