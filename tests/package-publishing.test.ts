@@ -25,7 +25,12 @@ describe('package publishing', () => {
       module?: string
       name?: string
       private?: boolean
-      publishConfig?: { access?: string; provenance?: boolean; registry?: string }
+      publishConfig?: {
+        access?: string
+        provenance?: boolean
+        registry?: string
+        tag?: string
+      }
       repository?: { directory?: string; type?: string; url?: string }
       scripts?: { prepack?: string }
       types?: string
@@ -48,6 +53,7 @@ describe('package publishing', () => {
     expect(manifest.publishConfig).toEqual({
       access: 'public',
       registry: 'https://registry.npmjs.org/',
+      ...(directory === 'effect' ? { tag: 'next' } : {}),
     })
     expect(manifest.scripts?.prepack).toBe('pnpm build')
     await expect(readFile(new URL('README.md', packageRoot), 'utf8')).resolves.toContain(

@@ -237,6 +237,40 @@ describe('Effect adapter', () => {
     expect(controlled.close).toHaveBeenCalledOnce()
   })
 
+  it('composes subject delivery with Effect v4 chunk processing', async () => {
+    const controlled = controllableSubscription<number>()
+    const service = makeNatsail({
+      runtime: controlled.runtime,
+      sessions: createSessionRegistry(),
+    })
+    const batches: number[][] = []
+    const fiber = Effect.runFork(
+      service
+        .subscribe(
+          { subject: 'numbers.batch', decode: () => 0 },
+          { bufferSize: 2, overflowStrategy: 'suspend' }
+        )
+        .pipe(
+          Stream.take(5),
+          Stream.rechunk(2),
+          Stream.runForEachArray((batch) =>
+            Effect.sync(() => {
+              batches.push([...batch])
+            })
+          )
+        )
+    )
+
+    await vi.waitFor(() => expect(controlled.subscribe).toHaveBeenCalledOnce())
+    for (const value of [1, 2, 3, 4, 5]) {
+      await controlled.deliver(value)
+    }
+    await Effect.runPromise(Fiber.join(fiber))
+
+    expect(batches).toEqual([[1, 2], [3, 4], [5]])
+    expect(controlled.close).toHaveBeenCalledOnce()
+  })
+
   it('can fail a Core subject Stream instead of silently dropping a message', async () => {
     const controlled = controllableSubscription<number>()
     const service = makeNatsail({

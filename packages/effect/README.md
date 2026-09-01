@@ -56,6 +56,17 @@ The bound is measured in messages, not bytes. Core NATS remains ephemeral and at
 
 `NatsailSubjectError` distinguishes subscription creation, readiness, and source/decoding failure while retaining the original cause.
 
+For sustained streams, compose the subscription with Effect's native chunk operators instead of accumulating the entire stream:
+
+```ts
+const processMessages = messages.pipe(
+  Stream.rechunk(256),
+  Stream.runForEachArray((batch) => persistBatch(batch))
+)
+```
+
+`Stream.rechunk()` bounds each processing batch, and `runForEachArray()` invokes the application once per non-empty batch. Avoid `Stream.runCollect()` for unbounded subjects because it retains every message until the Stream completes.
+
 ## Service and request/reply
 
 The same scoped Layer supplies the `Natsail` service for publish, request/reply, reconnect, connection inspection, and escape hatches:
