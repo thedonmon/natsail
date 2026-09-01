@@ -88,7 +88,7 @@ The integration tests use NATS 2.14.4. Separate fixtures cover anonymous, token,
 | [`@natsail/session`](https://www.npmjs.com/package/@natsail/session)         | Keyed session sharing and lifecycle        | Core package                                           |
 | [`@natsail/effect`](https://www.npmjs.com/package/@natsail/effect)           | Scoped Effect services and session Streams | Core, session package, Effect peer                     |
 | [`@natsail/react`](https://www.npmjs.com/package/@natsail/react)             | React provider, status, and session hooks  | Core, session package, React peer                      |
-| [`@natsail/rxjs`](https://www.npmjs.com/package/@natsail/rxjs)               | Runtime and session Observable bindings    | Core, session package, RxJS peer                       |
+| [`@natsail/rxjs`](https://www.npmjs.com/package/@natsail/rxjs)               | Runtime and batched state Observables      | Core, JetStream, session packages, RxJS peer           |
 
 Applications install only the packages that they use.
 
@@ -100,7 +100,7 @@ Each package sets `sideEffects` to `false`. Each package also has a separate exp
 | ------------------------------- | --------- | --------------------------- | ------------------------------------------------------------- |
 | `@natsail/effect`               | Tested    | Effect v3                   | Scoped services, typed failures, Streams, and interruption    |
 | `@natsail/react`                | Tested    | React                       | Hooks and external-store bindings                             |
-| `@natsail/rxjs`                 | Tested    | RxJS                        | Observable bindings and cancellation                          |
+| `@natsail/rxjs`                 | Tested    | RxJS                        | Observable bindings, cancellation, and live state batching    |
 | `@natsail/react-rxjs`           | Deferred  | React and RxJS              | Repeated integration patterns, if real applications need them |
 | `@natsail/transport-cloudflare` | Deferred  | Cloudflare Workers          | Add only if official transports need Worker-specific policy   |
 | `@natsail/cloudflare-gateway`   | Prototype | Workers and Durable Objects | Browser fan-in, restart replay, and downstream cursor policy  |
@@ -506,6 +506,7 @@ RxJS can read snapshots, value deliveries, runtime events, or distinct connectio
 import {
   observeNatsCoreSubscription,
   observeNatsJetStreamReducer,
+  observeNatsJetStreamState,
   observeNatsRuntimeStatus,
   observeNatsSession,
   observeNatsSessionEvents,
@@ -517,6 +518,7 @@ const snapshots$ = observeNatsSession(sessions, conversation)
 const values$ = observeNatsSessionValues(sessions, conversation)
 const connection$ = observeNatsRuntimeStatus(runtime)
 const conversation$ = observeNatsJetStreamReducer(sessions, conversation)
+const renderState$ = observeNatsJetStreamState(sessions, conversation, { liveBatchMs: 16 })
 const sessionEvents$ = observeNatsSessionEvents(sessions)
 const orders$ = observeNatsCoreSubscription(sessions, runtime, 'orders', {
   subject: 'events.orders',
@@ -524,7 +526,7 @@ const orders$ = observeNatsCoreSubscription(sessions, runtime, 'orders', {
 })
 ```
 
-The value Observable replays the latest value once to a new subscriber. It emits equal consecutive deliveries. It errors or completes with the session.
+The value Observable replays the latest value once to a new subscriber. It emits equal consecutive deliveries. It errors or completes with the session. The JetStream state Observable keeps replay hydration immediate and atomic while coalescing subsequent cumulative live state for render-oriented consumers.
 
 The React, RxJS, and Effect helpers share one underlying subscription when they use the same registry and validated definition.
 

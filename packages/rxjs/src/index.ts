@@ -1,4 +1,5 @@
-import { distinctUntilChanged, filter, Observable } from 'rxjs'
+import { asyncScheduler, distinctUntilChanged, filter, Observable } from 'rxjs'
+import type { SchedulerLike, Subscription } from 'rxjs'
 
 import type {
   CoreSubscriptionOptions,
@@ -119,6 +120,99 @@ export function observeNatsJetStreamReducer<State>(
   definition: SessionDefinition<JetStreamStateSnapshot<State>>
 ): Observable<SessionSnapshot<JetStreamStateSnapshot<State>>> {
   return observeNatsSession(registry, definition)
+}
+
+export interface NatsailJetStreamStateOptions {
+  /**
+   * Maximum time that subsequent cumulative live states are coalesced. The
+   * initial replaying and hydrated live states remain immediate. Defaults to
+   * 16ms; use 0 to observe every reduced live state.
+   */
+  readonly liveBatchMs?: number
+  /** Overrides the RxJS async scheduler, primarily for tests or custom hosts. */
+  readonly scheduler?: SchedulerLike
+}
+
+/**
+ * Emits cumulative reduced JetStream state without duplicate session-lifecycle
+ * notifications. Replay and recovery phase changes are immediate; subsequent
+ * live states are coalesced to one latest value per bounded render window.
+ */
+export function observeNatsJetStreamState<State>(
+  registry: SessionRegistry,
+  definition: SessionDefinition<JetStreamStateSnapshot<State>>,
+  options: NatsailJetStreamStateOptions = {}
+): Observable<JetStreamStateSnapshot<State>> {
+  const liveBatchMs = options.liveBatchMs ?? 16
+  if (!Number.isFinite(liveBatchMs) || liveBatchMs < 0) {
+    throw new TypeError('NATSail RxJS liveBatchMs must be a finite non-negative number')
+  }
+
+  const values = observeNatsSessionValues(registry, definition)
+  if (liveBatchMs === 0) return values
+  const scheduler = options.scheduler ?? asyncScheduler
+
+  return new Observable((subscriber) => {
+    let seenLive = false
+    let pendingLive: JetStreamStateSnapshot<State> | undefined
+    let scheduledFlush: Subscription | undefined
+
+    const flush = () => {
+      scheduledFlush = undefined
+      if (pendingLive === undefined) return
+      const value = pendingLive
+      pendingLive = undefined
+      subscriber.next(value)
+    }
+    const cancelFlush = () => {
+      scheduledFlush?.unsubscribe()
+      scheduledFlush = undefined
+    }
+    const scheduleFlush = () => {
+      if (scheduledFlush !== undefined) return
+      let ranSynchronously = false
+      const scheduled = scheduler.schedule(() => {
+        ranSynchronously = true
+        flush()
+      }, liveBatchMs)
+      if (!ranSynchronously) scheduledFlush = scheduled
+    }
+    const source = values.subscribe({
+      next: (value) => {
+        if (value.phase !== 'live') {
+          cancelFlush()
+          flush()
+          seenLive = false
+          subscriber.next(value)
+          return
+        }
+        if (!seenLive) {
+          seenLive = true
+          subscriber.next(value)
+          return
+        }
+
+        pendingLive = value
+        scheduleFlush()
+      },
+      error: (error) => {
+        cancelFlush()
+        flush()
+        subscriber.error(error)
+      },
+      complete: () => {
+        cancelFlush()
+        flush()
+        subscriber.complete()
+      },
+    })
+
+    return () => {
+      cancelFlush()
+      pendingLive = undefined
+      source.unsubscribe()
+    }
+  })
 }
 
 /**
