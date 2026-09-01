@@ -171,7 +171,9 @@ export class RxjsChatController {
             ...(firstLive ? { historyReadyMs: performance.now() - this.loadStartedAt } : {}),
             stateUpdates: this.state.metrics.stateUpdates + 1,
             lastBatchSize: batchSize,
-            largestBatchSize: Math.max(this.state.metrics.largestBatchSize, batchSize),
+            largestBatchSize: firstLive
+              ? 0
+              : Math.max(this.state.metrics.largestBatchSize, batchSize),
           },
           ...(last
             ? {
@@ -269,8 +271,9 @@ export class RxjsChatController {
     if (!previous) return
     const inactive = message.conversationId !== this.state.activeConversationId
     const fromAnotherTab = message.role === 'user' && message.clientId !== this.clientId
-    const shouldNotify =
-      inactive || (document.hidden && message.clientId !== this.clientId) || fromAnotherTab
+    const arrivedWhileAway = document.hidden && message.clientId !== this.clientId
+    if (!inactive && !fromAnotherTab && !arrivedWhileAway) return
+    const shouldNotify = inactive || arrivedWhileAway || fromAnotherTab
     const conversation = demoConversations.find((item) => item.id === message.conversationId)!
 
     this.patch({
