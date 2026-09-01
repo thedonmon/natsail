@@ -90,14 +90,15 @@ export async function verifyChatLab({ adapter, baseUrl, devScript, screenshot })
     const beforeBurst = await numericMetric(primary, 'state-updates')
     await primary.getByRole('button', { name: 'Simulate busy room' }).click()
     await expect(primary.locator('.product-message')).toHaveCount(139, { timeout: 10_000 })
-    await expect.poll(() => numericMetric(primary, 'largest-ui-batch')).toBeGreaterThan(1)
+    await expect.poll(() => numericMetric(primary, 'largest-live-batch')).toBeGreaterThan(1)
     const afterBurst = await numericMetric(primary, 'state-updates')
     const result = {
       adapter,
       historyEvents: await numericMetric(primary, 'history-events'),
-      historyReady: await primary.locator('[data-metric="history-ready"]').textContent(),
+      adapterReady: await primary.locator('[data-metric="adapter-ready"]').textContent(),
+      reactRendered: await primary.locator('[data-metric="react-rendered"]').textContent(),
       liveStateUpdatesForBurst: afterBurst - beforeBurst,
-      largestUiBatch: await numericMetric(primary, 'largest-ui-batch'),
+      largestLiveBatch: await numericMetric(primary, 'largest-live-batch'),
       reactCommits: await numericMetric(primary, 'react-commits'),
     }
 

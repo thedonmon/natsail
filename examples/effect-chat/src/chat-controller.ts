@@ -78,7 +78,7 @@ const reduceConversationBatch = (
       message: delivery.value,
       cursor: delivery.cursor.sequence,
     })),
-  ].slice(-600),
+  ].slice(-10_000),
 })
 
 export class EffectChatController {
@@ -222,16 +222,16 @@ export class EffectChatController {
     )
   }
 
-  busyBurst = async (): Promise<void> => {
+  busyBurst = async (count: number): Promise<void> => {
     const conversation = this.state.activeConversationId
     const startedAt = Date.now()
-    const effects = Array.from({ length: 40 }, (_, index) => {
+    const effects = Array.from({ length: count }, (_, index) => {
       const message: DemoChatMessage = {
         id: `effect-burst-${crypto.randomUUID()}`,
         conversationId: conversation,
         role: 'assistant',
         author: 'Background agents',
-        body: `Background task ${String(index + 1).padStart(2, '0')} finished and published its compact progress update.`,
+        body: `Background task ${String(index + 1).padStart(4, '0')} finished and published its compact progress update.`,
         sentAt: new Date(startedAt + index).toISOString(),
         clientId: 'effect-busy-room',
       }
@@ -242,14 +242,23 @@ export class EffectChatController {
 
   dismissNotice = (): void => this.patch({ notice: undefined })
 
-  recordReactCommit = (revision: number, _duration: number): void => {
+  recordReactCommit = (revision: number, duration?: number): void => {
     if (revision === this.lastCommittedRevision) return
     this.lastCommittedRevision = revision
+    const firstLiveRender =
+      this.state.phase === 'live' && this.state.metrics.historyRenderedMs === undefined
     this.patch(
       {
         metrics: {
           ...this.state.metrics,
+          ...(firstLiveRender ? { historyRenderedMs: performance.now() - this.loadStartedAt } : {}),
           reactCommits: this.state.metrics.reactCommits + 1,
+          ...(duration === undefined
+            ? {}
+            : {
+                lastCommitMs: duration,
+                largestCommitMs: Math.max(this.state.metrics.largestCommitMs ?? 0, duration),
+              }),
         },
       },
       false

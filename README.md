@@ -118,7 +118,7 @@ The [gateway chat example](examples/gateway-chat/README.md) exercises that path 
 
 The [direct React chat example](examples/react-chat/README.md) uses `NatsManagedProvider`, `useNatsRuntimeStatus()`, and `useNatsCoreSubscriptionReducer()` against the local NATS WebSocket. Both rooms applications use the repository [chat UI package](examples/chat-ui/README.md), which contains shadcn primitives.
 
-The [RxJS](examples/rxjs-chat/README.md) and [Effect](examples/effect-chat/README.md) chat labs load identical conversation-scoped JetStream histories. Conversation switching exercises true replay, a Core NATS side channel provides cross-tab update notices, and both surfaces report the same history, batching, and React commit measurements.
+The [RxJS](examples/rxjs-chat/README.md) and [Effect](examples/effect-chat/README.md) chat labs load identical conversation-scoped JetStream histories, including 1,000 and 5,000-message browser workloads. Conversation switching exercises true replay, a Core NATS side channel provides cross-tab update notices, and both surfaces report adapter-ready, React-rendered, batching, and commit measurements. Exact React commit duration appears when a development or profiling build exposes it.
 
 The RxJS app uses one reducing session and frame-coalesced cumulative state. The Effect app uses `materializeJetStream()` with bounded queues, replay-private reduction, 16ms live batches, and structured interruption when the selected conversation changes.
 
@@ -239,7 +239,7 @@ pnpm example:rxjs-chat
 pnpm example:effect-chat
 ```
 
-Open <http://127.0.0.1:4177> for RxJS or <http://127.0.0.1:4178> for Effect. Both apps use the same 240, 96, 48, and 8-message conversations, live assistant responder, cross-tab notifications, 40-message busy-room scenario, and visible performance counters. RxJS uses a reducing shared session with frame-coalesced cumulative state; Effect uses native bounded materialization and structured cancellation.
+Open <http://127.0.0.1:4177> for RxJS or <http://127.0.0.1:4178> for Effect. Both apps use the same 8, 48, 96, 240, 1,000, and 5,000-message conversations, live assistant responder, cross-tab notifications, selectable 40/250/1,000-message busy-room scenarios, and visible performance counters. RxJS uses a reducing shared session with frame-coalesced cumulative state; Effect uses native bounded materialization and structured cancellation.
 
 Each command starts the local NATS fixtures when necessary and stops only fixtures that it started. See the [examples index](examples/README.md) for the behavioral difference.
 

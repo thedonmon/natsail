@@ -1,7 +1,9 @@
 import {
   Profiler,
+  memo,
   startTransition,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -60,9 +62,9 @@ export interface PerformanceChatProps {
   readonly notice?: DemoUpdateNotice
   readonly onConversationChange: (conversationId: string) => void
   readonly onSend: (body: string) => Promise<void>
-  readonly onBusyBurst: () => Promise<void>
+  readonly onBusyBurst: (count: number) => Promise<void>
   readonly onDismissNotice: () => void
-  readonly onReactCommit: (revision: number, duration: number) => void
+  readonly onReactCommit: (revision: number, duration?: number) => void
 }
 
 const relativeTime = (value: string): string => {
@@ -224,7 +226,7 @@ function LoadingTranscript({ conversation }: { conversation: DemoConversation })
   )
 }
 
-function Transcript({
+const Transcript = memo(function Transcript({
   entries,
   clientId,
 }: {
@@ -277,7 +279,7 @@ function Transcript({
       </MessageScroller>
     </MessageScrollerProvider>
   )
-}
+})
 
 function Composer({
   conversation,
@@ -342,16 +344,29 @@ function PerformancePanel({
   onBusyBurst,
 }: Pick<PerformanceChatProps, 'adapter' | 'metrics' | 'onBusyBurst' | 'phase'>) {
   const [running, setRunning] = useState(false)
+  const [burstSize, setBurstSize] = useState(40)
   const values = [
     ['History events', metrics.historyEvents],
     [
-      'History ready',
+      'Adapter ready',
       metrics.historyReadyMs === undefined ? '—' : `${metrics.historyReadyMs.toFixed(1)} ms`,
+    ],
+    [
+      'React rendered',
+      metrics.historyRenderedMs === undefined ? '—' : `${metrics.historyRenderedMs.toFixed(1)} ms`,
     ],
     ['State updates', metrics.stateUpdates],
     ['React commits', metrics.reactCommits],
     ['Last UI batch', metrics.lastBatchSize],
-    ['Largest UI batch', metrics.largestBatchSize],
+    ['Largest live batch', metrics.largestBatchSize],
+    [
+      'Last commit',
+      metrics.lastCommitMs === undefined ? '—' : `${metrics.lastCommitMs.toFixed(1)} ms`,
+    ],
+    [
+      'Largest commit',
+      metrics.largestCommitMs === undefined ? '—' : `${metrics.largestCommitMs.toFixed(1)} ms`,
+    ],
   ] as const
 
   return (
@@ -363,7 +378,10 @@ function PerformancePanel({
         </div>
         <GaugeIcon aria-hidden="true" />
       </div>
-      <p>These counters measure the same replay, live burst, and React surface in both examples.</p>
+      <p>
+        These counters measure the same replay, live burst, and React surface in both examples.
+        Exact commit duration requires a React development or profiling build.
+      </p>
       <dl>
         {values.map(([label, value]) => (
           <div key={label}>
@@ -378,8 +396,22 @@ function PerformancePanel({
         <ActivityIcon aria-hidden="true" />
         <div>
           <strong>Busy-room scenario</strong>
-          <span>Publish 40 small assistant updates as one realistic live burst.</span>
+          <span>Publish a bounded set of compact assistant updates as one live burst.</span>
         </div>
+      </div>
+      <div className="performance-panel__burst-options" aria-label="Live burst size">
+        {[40, 250, 1_000].map((count) => (
+          <Button
+            key={count}
+            type="button"
+            size="xs"
+            variant={burstSize === count ? 'secondary' : 'ghost'}
+            aria-pressed={burstSize === count}
+            onClick={() => setBurstSize(count)}
+          >
+            {count.toLocaleString()}
+          </Button>
+        ))}
       </div>
       <Button
         type="button"
@@ -387,11 +419,11 @@ function PerformancePanel({
         disabled={phase !== 'live' || running}
         onClick={() => {
           setRunning(true)
-          void onBusyBurst().finally(() => setRunning(false))
+          void onBusyBurst(burstSize).finally(() => setRunning(false))
         }}
       >
         <ChevronsUpIcon data-icon="inline-start" />
-        {running ? 'Publishing updates…' : 'Simulate busy room'}
+        {running ? `Publishing ${burstSize.toLocaleString()} updates…` : 'Simulate busy room'}
       </Button>
       <div className="performance-panel__legend">
         <span>
@@ -414,7 +446,17 @@ export function PerformanceChat(props: PerformanceChatProps) {
     props.conversations[0]!
   const [showMetrics, setShowMetrics] = useState(true)
   const tabCount = useTabPresence(props.adapter, props.clientId)
-  const lastProfiledRevision = useRef(-1)
+  const profiledCommit = useRef<
+    { readonly revision: number; readonly duration: number } | undefined
+  >(undefined)
+
+  useLayoutEffect(() => {
+    const profile = profiledCommit.current
+    props.onReactCommit(
+      props.revision,
+      profile?.revision === props.revision ? profile.duration : undefined
+    )
+  }, [props.onReactCommit, props.revision])
 
   return (
     <main className="chat-lab" data-example-mode={props.adapter} data-chat-phase={props.phase}>
@@ -501,9 +543,7 @@ export function PerformanceChat(props: PerformanceChatProps) {
         <Profiler
           id={`${props.adapter}-conversation`}
           onRender={(_id, _phase, actualDuration) => {
-            if (lastProfiledRevision.current === props.revision) return
-            lastProfiledRevision.current = props.revision
-            props.onReactCommit(props.revision, actualDuration)
+            profiledCommit.current = { revision: props.revision, duration: actualDuration }
           }}
         >
           <div className="chat-stage__conversation">

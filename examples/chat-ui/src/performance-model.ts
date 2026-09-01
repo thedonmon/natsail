@@ -37,10 +37,13 @@ export interface DemoConversationActivity {
 export interface DemoPerformanceMetrics {
   readonly historyEvents: number
   readonly historyReadyMs?: number
+  readonly historyRenderedMs?: number
   readonly stateUpdates: number
   readonly reactCommits: number
   readonly lastBatchSize: number
   readonly largestBatchSize: number
+  readonly lastCommitMs?: number
+  readonly largestCommitMs?: number
 }
 
 export interface DemoUpdateNotice {
@@ -92,6 +95,26 @@ export const demoConversations: readonly DemoConversation[] = [
     tone: 'rose',
     seededMessages: 8,
     updatedAt: '2026-08-31T22:40:00.000Z',
+  },
+  {
+    id: 'research-archive',
+    title: 'Research synthesis archive',
+    summary: 'One thousand messages from a long-running research and planning thread',
+    assistant: 'Iris',
+    initials: '1K',
+    tone: 'blue',
+    seededMessages: 1_000,
+    updatedAt: '2026-08-31T19:24:00.000Z',
+  },
+  {
+    id: 'incident-archive',
+    title: 'Full incident archive',
+    summary: 'Five thousand messages for the large-history browser benchmark',
+    assistant: 'Vale',
+    initials: '5K',
+    tone: 'rose',
+    seededMessages: 5_000,
+    updatedAt: '2026-08-30T21:12:00.000Z',
   },
 ]
 

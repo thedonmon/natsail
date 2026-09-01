@@ -1319,6 +1319,24 @@
   line-height: 1.45;
 }
 
+.performance-panel__burst-options {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.performance-panel__burst-options [data-slot='button'] {
+  min-width: 0;
+  color: var(--chat-subtle);
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  font-size: 9px;
+}
+
+.performance-panel__burst-options [aria-pressed='true'] {
+  color: var(--chat-ink);
+}
+
 .performance-panel > [data-slot='button'] {
   width: 100%;
   margin-top: 10px;

@@ -82,6 +82,44 @@ export const demoScenario = [
       'Open another tab and send a message.',
     ],
   },
+  {
+    id: 'research-archive',
+    title: 'Research synthesis archive',
+    assistant: 'Iris',
+    count: 1_000,
+    updatedAt: '2026-08-31T19:24:00.000Z',
+    user: [
+      'Can you connect the latest evidence back to the original research question?',
+      'Which assumption changed as this thread got longer?',
+      'Give me the finding and the supporting context without losing the caveats.',
+      'What would you verify before turning this synthesis into a recommendation?',
+    ],
+    assistantMessages: [
+      'The strongest signal is consistent across the retained sources. I kept the contradictory evidence beside it so reopening the thread does not erase how the conclusion was reached.',
+      'The initial assumption was too broad. The later evidence narrows it to the workflows that preserve an ordered checkpoint and expose recovery as an explicit state.',
+      'The finding is useful, but confidence depends on the replay boundary remaining stable under a larger retained history and live updates arriving during review.',
+      'I would verify the outliers, preserve the source trail, and rerun the comparison with a production browser profile before calling the recommendation final.',
+    ],
+  },
+  {
+    id: 'incident-archive',
+    title: 'Full incident archive',
+    assistant: 'Vale',
+    count: 5_000,
+    updatedAt: '2026-08-30T21:12:00.000Z',
+    user: [
+      'Walk me from the first alert to the latest mitigation without dropping intermediate decisions.',
+      'Did the system recover cleanly after the traffic shift?',
+      'Which timeline entry explains the gap between the dashboard and the durable record?',
+      'Can we load the full archive and still keep the page responsive?',
+    ],
+    assistantMessages: [
+      'The first alert preceded the customer-visible symptoms. The archive shows the mitigation, rollback, and validation steps in stream order so the timeline remains reproducible.',
+      'Recovery completed, and the later checkpoints confirm that both the live path and the durable consumer converged on the same state.',
+      'The dashboard sampled presentation updates while the durable record retained every event. That is why the event count is larger than the number of visible UI commits.',
+      'Yes. The adapter reduces the archive privately, React receives one assembled transcript, and subsequent traffic is delivered in bounded presentation batches.',
+    ],
+  },
 ]
 
 const messageAt = (conversation, index) => {
@@ -119,27 +157,33 @@ const assistantContext = [
   'The assistant response is another ordinary event on the same conversation subject.',
 ]
 
-export const createDemoMessages = (namespace) =>
-  demoScenario.flatMap((conversation, conversationIndex) =>
-    Array.from({ length: conversation.count }, (_, index) => {
-      const position = index % 5
-      const role = position === 0 || position === 3 ? 'user' : 'assistant'
-      const source = role === 'user' ? conversation.user : conversation.assistantMessages
-      const base = source[Math.floor(index / 2) % source.length]
-      const context = role === 'user' ? userContext : assistantContext
-      const detail = context[(index * 5 + conversationIndex * 3) % context.length]
-      const body = base.length < 28 || index % 7 === 0 ? base : `${base}\n\n${detail}`
-      return {
-        id: `${namespace}-seed-${conversation.id}-${String(index + 1).padStart(3, '0')}`,
-        conversationId: conversation.id,
-        role,
-        author: role === 'user' ? 'You' : conversation.assistant,
-        body,
-        sentAt: messageAt(conversation, index),
-        clientId: `${namespace}-fixture`,
-      }
-    })
-  )
+export const createDemoMessages = (namespace, conversationIds) =>
+  demoScenario
+    .filter((conversation) => !conversationIds || conversationIds.has(conversation.id))
+    .flatMap((conversation, conversationIndex) =>
+      Array.from({ length: conversation.count }, (_, index) => {
+        const position = index % 5
+        const role = position === 0 || position === 3 ? 'user' : 'assistant'
+        const source = role === 'user' ? conversation.user : conversation.assistantMessages
+        const base = source[Math.floor(index / 2) % source.length]
+        const context = role === 'user' ? userContext : assistantContext
+        const detail = context[(index * 5 + conversationIndex * 3) % context.length]
+        const contextualBody = base.length < 28 || index % 7 === 0 ? base : `${base}\n\n${detail}`
+        const body =
+          conversation.count >= 1_000
+            ? `${contextualBody}\n\nArchive checkpoint ${String(index + 1).padStart(4, '0')}.`
+            : contextualBody
+        return {
+          id: `${namespace}-seed-${conversation.id}-${String(index + 1).padStart(3, '0')}`,
+          conversationId: conversation.id,
+          role,
+          author: role === 'user' ? 'You' : conversation.assistant,
+          body,
+          sentAt: messageAt(conversation, index),
+          clientId: `${namespace}-fixture`,
+        }
+      })
+    )
 
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
 
@@ -180,9 +224,17 @@ const stopChild = async (child) => {
   if (child.exitCode === null) child.kill('SIGKILL')
 }
 
-const seedMessages = async (client, namespace, subjectPrefix) => {
-  for (const message of createDemoMessages(namespace)) {
-    await client.publish(`${subjectPrefix}.${message.conversationId}`, JSON.stringify(message))
+const seedMessages = async (client, namespace, subjectPrefix, conversationIds) => {
+  const messages = createDemoMessages(namespace, conversationIds)
+  const publishBatchSize = 256
+  for (let offset = 0; offset < messages.length; offset += publishBatchSize) {
+    await Promise.all(
+      messages
+        .slice(offset, offset + publishBatchSize)
+        .map((message) =>
+          client.publish(`${subjectPrefix}.${message.conversationId}`, JSON.stringify(message))
+        )
+    )
   }
 }
 
@@ -277,9 +329,8 @@ export async function runChatExample({
 
     connection = await connect({ servers: 'nats://127.0.0.1:4223' })
     manager = await jetstreamManager(connection)
-    let streamInfo
     try {
-      streamInfo = await manager.streams.info(stream)
+      await manager.streams.info(stream)
     } catch {
       await manager.streams.add({
         name: stream,
@@ -287,10 +338,27 @@ export async function runChatExample({
         storage: StorageType.Memory,
       })
       createdStream = true
-      streamInfo = await manager.streams.info(stream)
     }
-    if (streamInfo.state.messages === 0)
-      await seedMessages(jetstream(connection), namespace, subjectPrefix)
+    const subjectInfo = await manager.streams.info(stream, { subjects_filter: streamSubjects })
+    const subjectCounts = subjectInfo.state.subjects ?? {}
+    const incompleteConversations = demoScenario.filter(
+      (conversation) =>
+        (subjectCounts[`${subjectPrefix}.${conversation.id}`] ?? 0) < conversation.count
+    )
+    for (const conversation of incompleteConversations) {
+      const subject = `${subjectPrefix}.${conversation.id}`
+      if ((subjectCounts[subject] ?? 0) > 0) {
+        await manager.streams.purge(stream, { filter: subject })
+      }
+    }
+    if (incompleteConversations.length > 0) {
+      await seedMessages(
+        jetstream(connection),
+        namespace,
+        subjectPrefix,
+        new Set(incompleteConversations.map((conversation) => conversation.id))
+      )
+    }
     responder = startAssistantResponder(connection, jetstream(connection), namespace, subjectPrefix)
 
     vite = spawn(
