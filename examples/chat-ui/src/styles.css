@@ -833,8 +833,9 @@
 }
 
 .chat-stage {
+  position: relative;
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   min-width: 0;
   height: 100dvh;
   background: color-mix(in oklch, var(--chat-canvas) 94%, transparent);
@@ -914,11 +915,16 @@
 }
 
 .update-notice {
+  position: absolute;
+  z-index: 6;
+  top: 78px;
+  right: 20px;
+  left: 20px;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 10px;
-  margin: 12px 20px 0;
+  margin: 12px 0 0;
   padding: 10px 10px 10px 12px;
   border: 1px solid color-mix(in oklch, var(--chat-accent) 25%, transparent);
   border-radius: 10px;
@@ -1444,6 +1450,12 @@
   .chat-stage__header {
     min-height: 66px;
     padding: 10px 14px;
+  }
+
+  .update-notice {
+    top: 66px;
+    right: 14px;
+    left: 14px;
   }
 
   .tab-presence,
