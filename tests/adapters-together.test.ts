@@ -1,6 +1,6 @@
 /** @vitest-environment jsdom */
 
-import { Chunk, Effect, Fiber, Stream } from 'effect'
+import { Effect, Fiber, Stream } from 'effect'
 import { act, createElement } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { describe, expect, it, vi } from 'vitest'
@@ -68,9 +68,7 @@ describe('Effect, React, and RxJS adapter composition', () => {
     await act(async () => accept('hello'))
     expect(container.textContent).toBe('hello')
     expect(rxValues).toEqual(['hello'])
-    expect(Chunk.toReadonlyArray(await Effect.runPromise(Fiber.join(effectFiber)))).toEqual([
-      'hello',
-    ])
+    expect(await Effect.runPromise(Fiber.join(effectFiber))).toEqual(['hello'])
 
     rxSubscription.unsubscribe()
     expect(close).not.toHaveBeenCalled()

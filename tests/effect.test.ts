@@ -1,14 +1,23 @@
-import { Chunk, Effect, Fiber, Stream } from 'effect'
+import { Effect, Fiber, Stream } from 'effect'
 import { describe, expect, it, vi } from 'vitest'
 
-import type { NatsRuntime, NatsRuntimeEvent, SubscriptionLease } from '@natsail/core'
+import type {
+  CoreSubscriptionOptions,
+  MessageHandler,
+  NatsRuntime,
+  NatsRuntimeEvent,
+  SubscriptionLease,
+} from '@natsail/core'
 import {
   makeNatsail,
+  makeNatsailLayer,
   makeNatsailScopedLayer,
   Natsail,
   NatsailOperationError,
   NatsailSessionError,
   NatsailStreamBufferOverflowError,
+  NatsailSubjectError,
+  subscribe as subscribeEffect,
 } from '@natsail/effect'
 import {
   createSessionRegistry,
@@ -70,6 +79,40 @@ function controllableSource<T>(): {
   }
 }
 
+function controllableSubscription<T>(): {
+  readonly runtime: NatsRuntime
+  readonly subscribe: ReturnType<typeof vi.fn>
+  readonly close: ReturnType<typeof vi.fn>
+  deliver(value: T): Promise<void>
+  fail(error: unknown): void
+} {
+  let handler!: MessageHandler<T>
+  let closeSubscription!: () => void
+  let failSubscription!: (error: unknown) => void
+  const closed = new Promise<void>((resolve, reject) => {
+    closeSubscription = resolve
+    failSubscription = reject
+  })
+  const close = vi.fn(async () => closeSubscription())
+  const lease: SubscriptionLease = {
+    ready: Promise.resolve(),
+    closed,
+    close,
+  }
+  const subscribe = vi.fn((_options: CoreSubscriptionOptions<T>, next: MessageHandler<T>) => {
+    handler = next
+    return lease
+  })
+
+  return {
+    runtime: runtimeStub({ subscribe: subscribe as NatsRuntime['subscribe'] }),
+    subscribe,
+    close,
+    deliver: async (value) => handler(value, {} as never),
+    fail: failSubscription,
+  }
+}
+
 describe('Effect adapter', () => {
   it('maps runtime Promise failures into operation-tagged Effect failures', async () => {
     const cause = new Error('permission denied')
@@ -115,6 +158,158 @@ describe('Effect adapter', () => {
     expect(requestSignal?.aborted).toBe(true)
   })
 
+  it('creates a cold scoped Core subject Stream with wildcard and queue options', async () => {
+    const controlled = controllableSubscription<string>()
+    const resource = {
+      runtime: controlled.runtime,
+      sessions: createSessionRegistry(),
+    }
+    const stream = subscribeEffect(
+      {
+        subject: 'events.*',
+        queue: 'effect-workers',
+        decode: () => '',
+      },
+      { bufferSize: 4 }
+    )
+
+    expect(controlled.subscribe).not.toHaveBeenCalled()
+
+    const fiber = Effect.runFork(
+      stream.pipe(Stream.take(1), Stream.runCollect, Effect.provide(makeNatsailLayer(resource)))
+    )
+    await vi.waitFor(() => expect(controlled.subscribe).toHaveBeenCalledOnce())
+    await controlled.deliver('hello')
+
+    expect(await Effect.runPromise(Fiber.join(fiber))).toEqual(['hello'])
+    expect(controlled.subscribe).toHaveBeenCalledWith(
+      expect.objectContaining({ subject: 'events.*', queue: 'effect-workers' }),
+      expect.any(Function)
+    )
+    expect(controlled.close).toHaveBeenCalledOnce()
+  })
+
+  it('suspends the Core subscription handler when the bounded buffer is full', async () => {
+    const controlled = controllableSubscription<number>()
+    const service = makeNatsail({
+      runtime: controlled.runtime,
+      sessions: createSessionRegistry(),
+    })
+    let releaseFirst!: () => void
+    const firstMayFinish = new Promise<void>((resolve) => {
+      releaseFirst = resolve
+    })
+    const received: number[] = []
+    const fiber = Effect.runFork(
+      service
+        .subscribe(
+          { subject: 'numbers', decode: () => 0 },
+          { bufferSize: 1, overflowStrategy: 'suspend' }
+        )
+        .pipe(
+          Stream.take(3),
+          Stream.runForEach((value) =>
+            Effect.promise(async () => {
+              received.push(value)
+              if (value === 1) await firstMayFinish
+            })
+          )
+        )
+    )
+
+    await vi.waitFor(() => expect(controlled.subscribe).toHaveBeenCalledOnce())
+    await controlled.deliver(1)
+    await vi.waitFor(() => expect(received).toEqual([1]))
+    await controlled.deliver(2)
+
+    let thirdAccepted = false
+    const third = controlled.deliver(3).then(() => {
+      thirdAccepted = true
+    })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(thirdAccepted).toBe(false)
+
+    releaseFirst()
+    await third
+    await Effect.runPromise(Fiber.join(fiber))
+
+    expect(received).toEqual([1, 2, 3])
+    expect(controlled.close).toHaveBeenCalledOnce()
+  })
+
+  it('can fail a Core subject Stream instead of silently dropping a message', async () => {
+    const controlled = controllableSubscription<number>()
+    const service = makeNatsail({
+      runtime: controlled.runtime,
+      sessions: createSessionRegistry(),
+    })
+    let releaseFirst!: () => void
+    let markFirstStarted!: () => void
+    const firstMayFinish = new Promise<void>((resolve) => {
+      releaseFirst = resolve
+    })
+    const firstStarted = new Promise<void>((resolve) => {
+      markFirstStarted = resolve
+    })
+    const fiber = Effect.runFork(
+      service
+        .subscribe(
+          { subject: 'numbers', decode: () => 0 },
+          { bufferSize: 1, overflowStrategy: 'error' }
+        )
+        .pipe(
+          Stream.runForEach((value) =>
+            value === 1
+              ? Effect.promise(() => {
+                  markFirstStarted()
+                  return firstMayFinish
+                })
+              : Effect.void
+          )
+        )
+    )
+
+    await vi.waitFor(() => expect(controlled.subscribe).toHaveBeenCalledOnce())
+    await controlled.deliver(1)
+    await firstStarted
+    await controlled.deliver(2)
+    await expect(controlled.deliver(3)).rejects.toBeInstanceOf(NatsailStreamBufferOverflowError)
+    releaseFirst()
+
+    const error = await Effect.runPromise(Fiber.join(fiber).pipe(Effect.flip))
+    expect(error).toMatchObject({
+      _tag: 'NatsailStreamBufferOverflowError',
+      stream: 'subject:numbers',
+      capacity: 1,
+    })
+    expect(controlled.close).toHaveBeenCalledOnce()
+  })
+
+  it('maps Core subscription and decoding failures to the subject and source stage', async () => {
+    const controlled = controllableSubscription<string>()
+    const service = makeNatsail({
+      runtime: controlled.runtime,
+      sessions: createSessionRegistry(),
+    })
+    const cause = new SyntaxError('invalid message payload')
+    const fiber = Effect.runFork(
+      service.subscribe({ subject: 'events.decode', decode: () => '' }).pipe(Stream.runDrain)
+    )
+
+    await vi.waitFor(() => expect(controlled.subscribe).toHaveBeenCalledOnce())
+    controlled.fail(cause)
+
+    const error = await Effect.runPromise(Fiber.join(fiber).pipe(Effect.flip))
+    expect(error).toBeInstanceOf(NatsailSubjectError)
+    expect(error).toMatchObject({
+      _tag: 'NatsailSubjectError',
+      subject: 'events.decode',
+      stage: 'source',
+      cause,
+    })
+    expect(controlled.close).toHaveBeenCalledOnce()
+  })
+
   it('shares one registry source across concurrent Effect stream consumers', async () => {
     const controlled = controllableSource<string>()
     const sessions = createSessionRegistry()
@@ -127,10 +322,10 @@ describe('Effect adapter', () => {
 
     const result = await Effect.runPromise(
       Effect.gen(function* () {
-        const first = yield* Effect.fork(
+        const first = yield* Effect.forkChild(
           service.sessionValues(definition).pipe(Stream.take(1), Stream.runCollect)
         )
-        const second = yield* Effect.fork(
+        const second = yield* Effect.forkChild(
           service.sessionValues(definition).pipe(Stream.take(1), Stream.runCollect)
         )
 
@@ -145,7 +340,7 @@ describe('Effect adapter', () => {
       })
     )
 
-    expect(result.map(Chunk.toReadonlyArray)).toEqual([['hello'], ['hello']])
+    expect(result).toEqual([['hello'], ['hello']])
     expect(controlled.starts).toHaveBeenCalledOnce()
     expect(sessions.inspect().activeSessions).toBe(0)
   })
@@ -163,7 +358,9 @@ describe('Effect adapter', () => {
 
     const error = await Effect.runPromise(
       Effect.gen(function* () {
-        const fiber = yield* Effect.fork(service.sessionValues(definition).pipe(Stream.runDrain))
+        const fiber = yield* Effect.forkChild(
+          service.sessionValues(definition).pipe(Stream.runDrain)
+        )
         yield* Effect.promise(() =>
           vi.waitFor(() => expect(sessions.inspect().activeSessions).toBe(1))
         )
@@ -232,7 +429,7 @@ describe('Effect adapter', () => {
 
     const event = await Effect.runPromise(
       Effect.gen(function* () {
-        const fiber = yield* Effect.fork(
+        const fiber = yield* Effect.forkChild(
           service.runtimeEvents.pipe(Stream.take(1), Stream.runCollect)
         )
         yield* Effect.promise(() => vi.waitFor(() => expect(events.activeIterators()).toBe(1)))
@@ -241,7 +438,7 @@ describe('Effect adapter', () => {
       })
     )
 
-    expect(Chunk.toReadonlyArray(event)).toEqual([{ type: 'status', state: 'connected', at: 1 }])
+    expect(event).toEqual([{ type: 'status', state: 'connected', at: 1 }])
     await vi.waitFor(() => expect(events.activeIterators()).toBe(0))
   })
 

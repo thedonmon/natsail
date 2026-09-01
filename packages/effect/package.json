@@ -1,7 +1,7 @@
 {
   "name": "@natsail/effect",
   "version": "0.1.0",
-  "description": "Scoped Effect services and Streams for NATSail runtimes and shared sessions.",
+  "description": "Scoped Effect v4 Streams for Core NATS subjects, operations, and shared sessions.",
   "keywords": [
     "nats",
     "effect",
@@ -46,6 +46,6 @@
     "@natsail/session": "workspace:^"
   },
   "peerDependencies": {
-    "effect": "^3.22.0"
+    "effect": "4.0.0-rc.112"
   }
 }
