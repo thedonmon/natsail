@@ -1,5 +1,6 @@
 import { wsconnect } from '@nats-io/nats-core'
 import { createNatsRuntime } from '@natsail/core'
+import { makeNatsail } from '@natsail/effect'
 import { createSessionRegistry } from '@natsail/session'
 
 export const runtime = createNatsRuntime({
@@ -11,6 +12,7 @@ export const runtime = createNatsRuntime({
 })
 
 export const sessions = createSessionRegistry({ idleCloseMs: 0 })
+export const natsail = makeNatsail({ runtime, sessions })
 
 let closePromise: Promise<void> | undefined
 

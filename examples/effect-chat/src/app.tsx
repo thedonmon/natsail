@@ -1,11 +1,11 @@
 import { useSyncExternalStore } from 'react'
 
 import { demoConversations, PerformanceChat } from '@natsail/example-chat-ui'
-import { RxjsChatController } from './chat-feed'
-import { runtime, sessions } from './runtime'
+import { EffectChatController } from './chat-controller'
+import { natsail } from './runtime'
 
-const clientId = `rxjs-tab-${crypto.randomUUID().slice(0, 8)}`
-const controller = new RxjsChatController(runtime, sessions, clientId)
+const clientId = `effect-tab-${crypto.randomUUID().slice(0, 8)}`
+const controller = new EffectChatController(natsail, clientId)
 
 export const closeChatController = (): Promise<void> => controller.close()
 
@@ -18,7 +18,7 @@ export function App() {
 
   return (
     <PerformanceChat
-      adapter="rxjs"
+      adapter="effect"
       conversations={demoConversations}
       activeConversationId={state.activeConversationId}
       activity={state.activity}

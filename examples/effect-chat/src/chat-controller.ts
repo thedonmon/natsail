@@ -1,6 +1,7 @@
-import { type Subscription } from 'rxjs'
+import { Effect, Stream } from 'effect'
 
-import { natsCodecs, type NatsPayloadCodec, type NatsRuntime } from '@natsail/core'
+import { natsCodecs, type NatsPayloadCodec } from '@natsail/core'
+import type { NatsailService } from '@natsail/effect'
 import {
   demoConversations,
   isDemoChatMessage,
@@ -11,19 +12,17 @@ import {
   type DemoPerformanceMetrics,
   type DemoUpdateNotice,
 } from '@natsail/example-chat-ui'
-import { defineReducingJetStreamSession, type JetStreamDelivery } from '@natsail/jetstream'
-import { observeNatsCoreSubscription, observeNatsJetStreamState } from '@natsail/rxjs'
-import type { SessionRegistry } from '@natsail/session'
+import type { JetStreamDelivery } from '@natsail/jetstream'
 
-export const chatStream = 'NATSAIL_RXJS_CHAT'
-export const chatSubjectPrefix = 'natsail.examples.rxjs.chat'
+export const chatStream = 'NATSAIL_EFFECT_CHAT'
+export const chatSubjectPrefix = 'natsail.examples.effect.chat'
 
 const jsonCodec = natsCodecs.json<unknown>()
 const chatCodec: NatsPayloadCodec<DemoChatMessage> = {
   encode: (message) => jsonCodec.encode(message),
   decode: (data) => {
     const value = jsonCodec.decode(data)
-    if (!isDemoChatMessage(value)) throw new Error('Received an invalid RxJS chat message')
+    if (!isDemoChatMessage(value)) throw new Error('Received an invalid Effect chat message')
     return value
   },
 }
@@ -32,7 +31,7 @@ interface ConversationModel {
   readonly entries: readonly DemoChatEntry[]
 }
 
-export interface RxjsChatState {
+export interface EffectChatState {
   readonly activeConversationId: string
   readonly activity: Readonly<Record<string, DemoConversationActivity>>
   readonly entries: readonly DemoChatEntry[]
@@ -69,24 +68,28 @@ const selectedFromUrl = (): string => {
     : demoConversations[0]!.id
 }
 
-const reduceConversation = (
+const reduceConversationBatch = (
   state: ConversationModel,
-  delivery: JetStreamDelivery<DemoChatMessage>
+  deliveries: readonly JetStreamDelivery<DemoChatMessage>[]
 ): ConversationModel => ({
-  entries: [...state.entries, { message: delivery.value, cursor: delivery.cursor.sequence }].slice(
-    -600
-  ),
+  entries: [
+    ...state.entries,
+    ...deliveries.map((delivery) => ({
+      message: delivery.value,
+      cursor: delivery.cursor.sequence,
+    })),
+  ].slice(-600),
 })
 
-export class RxjsChatController {
+export class EffectChatController {
   private readonly listeners = new Set<() => void>()
-  private activeSubscription?: Subscription
-  private notificationSubscription?: Subscription
+  private activeAbort?: AbortController
+  private readonly notificationAbort = new AbortController()
   private loadStartedAt = performance.now()
   private previousEntryCount = 0
   private closed = false
   private lastCommittedRevision = -1
-  private state: RxjsChatState = {
+  private state: EffectChatState = {
     activeConversationId: selectedFromUrl(),
     activity: initialActivity(),
     entries: [],
@@ -97,15 +100,14 @@ export class RxjsChatController {
   }
 
   constructor(
-    private readonly runtime: NatsRuntime,
-    private readonly sessions: SessionRegistry,
+    private readonly natsail: NatsailService,
     readonly clientId: string
   ) {
     this.startNotifications()
     this.selectConversation(this.state.activeConversationId, false)
   }
 
-  readonly getSnapshot = (): RxjsChatState => this.state
+  readonly getSnapshot = (): EffectChatState => this.state
 
   readonly subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener)
@@ -114,7 +116,9 @@ export class RxjsChatController {
 
   selectConversation = (conversationId: string, updateUrl = true): void => {
     if (!demoConversations.some((conversation) => conversation.id === conversationId)) return
-    this.activeSubscription?.unsubscribe()
+    this.activeAbort?.abort()
+    const abort = new AbortController()
+    this.activeAbort = abort
     this.loadStartedAt = performance.now()
     this.previousEntryCount = 0
     this.patch({
@@ -134,9 +138,7 @@ export class RxjsChatController {
       window.history.replaceState(null, '', url)
     }
 
-    const definition = defineReducingJetStreamSession(
-      this.runtime,
-      `rxjs-performance-chat:${conversationId}`,
+    const snapshots = this.natsail.materializeJetStream(
       {
         stream: chatStream,
         filter: `${chatSubjectPrefix}.${conversationId}`,
@@ -147,53 +149,62 @@ export class RxjsChatController {
         codec: chatCodec,
       },
       {
-        scope: 'performance-chat:v1',
-        initial: () => ({ entries: [] }),
-        reduce: reduceConversation,
+        initial: (): ConversationModel => ({ entries: [] }),
+        reduceBatch: (state, deliveries) =>
+          Effect.sync(() => reduceConversationBatch(state, deliveries)),
+      },
+      {
+        bufferSize: 256,
+        batchSize: 256,
+        batchWithin: '16 millis',
       }
     )
 
-    this.activeSubscription = observeNatsJetStreamState(this.sessions, definition, {
-      liveBatchMs: 16,
-    }).subscribe({
-      next: (snapshot) => {
-        if (snapshot.phase !== 'live') return
-        const batchSize = Math.max(0, snapshot.data.entries.length - this.previousEntryCount)
-        this.previousEntryCount = snapshot.data.entries.length
-        const firstLive = this.state.phase !== 'live'
-        const last = snapshot.data.entries.at(-1)?.message
-        this.patch({
-          entries: snapshot.data.entries,
-          phase: 'live',
-          metrics: {
-            ...this.state.metrics,
-            historyEvents: snapshot.replay.delivered,
-            ...(firstLive ? { historyReadyMs: performance.now() - this.loadStartedAt } : {}),
-            stateUpdates: this.state.metrics.stateUpdates + 1,
-            lastBatchSize: batchSize,
-            largestBatchSize: Math.max(this.state.metrics.largestBatchSize, batchSize),
-          },
-          ...(last
-            ? {
-                activity: {
-                  ...this.state.activity,
-                  [conversationId]: {
-                    preview: last.body,
-                    updatedAt: last.sentAt,
-                    unread: 0,
-                  },
-                },
-              }
-            : {}),
-        })
-      },
-      error: () => this.patch({ phase: 'error' }),
+    void Effect.runPromise(
+      snapshots.pipe(
+        Stream.runForEach((snapshot) =>
+          Effect.sync(() => {
+            if (snapshot.phase !== 'live' || abort.signal.aborted) return
+            const batchSize = Math.max(0, snapshot.data.entries.length - this.previousEntryCount)
+            this.previousEntryCount = snapshot.data.entries.length
+            const firstLive = this.state.phase !== 'live'
+            const last = snapshot.data.entries.at(-1)?.message
+            this.patch({
+              entries: snapshot.data.entries,
+              phase: 'live',
+              metrics: {
+                ...this.state.metrics,
+                historyEvents: snapshot.replay.delivered,
+                ...(firstLive ? { historyReadyMs: performance.now() - this.loadStartedAt } : {}),
+                stateUpdates: this.state.metrics.stateUpdates + 1,
+                lastBatchSize: batchSize,
+                largestBatchSize: Math.max(this.state.metrics.largestBatchSize, batchSize),
+              },
+              ...(last
+                ? {
+                    activity: {
+                      ...this.state.activity,
+                      [conversationId]: {
+                        preview: last.body,
+                        updatedAt: last.sentAt,
+                        unread: 0,
+                      },
+                    },
+                  }
+                : {}),
+            })
+          })
+        )
+      ),
+      { signal: abort.signal }
+    ).catch(() => {
+      if (!abort.signal.aborted) this.patch({ phase: 'error' })
     })
   }
 
   send = async (body: string): Promise<void> => {
     const message: DemoChatMessage = {
-      id: `rxjs-user-${crypto.randomUUID()}`,
+      id: `effect-user-${crypto.randomUUID()}`,
       conversationId: this.state.activeConversationId,
       role: 'user',
       author: 'You',
@@ -201,32 +212,30 @@ export class RxjsChatController {
       sentAt: new Date().toISOString(),
       clientId: this.clientId,
     }
-    await this.runtime.publish(
-      `${chatSubjectPrefix}.${message.conversationId}`,
-      chatCodec.encode(message)
+    await Effect.runPromise(
+      this.natsail.publish(
+        `${chatSubjectPrefix}.${message.conversationId}`,
+        chatCodec.encode(message)
+      )
     )
   }
 
   busyBurst = async (): Promise<void> => {
     const conversation = this.state.activeConversationId
     const startedAt = Date.now()
-    await Promise.all(
-      Array.from({ length: 40 }, (_, index) => {
-        const message: DemoChatMessage = {
-          id: `rxjs-burst-${crypto.randomUUID()}`,
-          conversationId: conversation,
-          role: 'assistant',
-          author: 'Background agents',
-          body: `Background task ${String(index + 1).padStart(2, '0')} finished and published its compact progress update.`,
-          sentAt: new Date(startedAt + index).toISOString(),
-          clientId: 'rxjs-busy-room',
-        }
-        return this.runtime.publish(
-          `${chatSubjectPrefix}.${conversation}`,
-          chatCodec.encode(message)
-        )
-      })
-    )
+    const effects = Array.from({ length: 40 }, (_, index) => {
+      const message: DemoChatMessage = {
+        id: `effect-burst-${crypto.randomUUID()}`,
+        conversationId: conversation,
+        role: 'assistant',
+        author: 'Background agents',
+        body: `Background task ${String(index + 1).padStart(2, '0')} finished and published its compact progress update.`,
+        sentAt: new Date(startedAt + index).toISOString(),
+        clientId: 'effect-busy-room',
+      }
+      return this.natsail.publish(`${chatSubjectPrefix}.${conversation}`, chatCodec.encode(message))
+    })
+    await Effect.runPromise(Effect.all(effects, { concurrency: 'unbounded', discard: true }))
   }
 
   dismissNotice = (): void => this.patch({ notice: undefined })
@@ -248,20 +257,24 @@ export class RxjsChatController {
   async close(): Promise<void> {
     if (this.closed) return
     this.closed = true
-    this.activeSubscription?.unsubscribe()
-    this.notificationSubscription?.unsubscribe()
+    this.activeAbort?.abort()
+    this.notificationAbort.abort()
   }
 
   private startNotifications(): void {
-    this.notificationSubscription = observeNatsCoreSubscription(
-      this.sessions,
-      this.runtime,
-      'rxjs-performance-chat:notifications',
+    const notifications = this.natsail.subscribe(
       {
         subject: `${chatSubjectPrefix}.>`,
         codec: chatCodec,
-      }
-    ).subscribe({ next: (message) => this.receiveNotification(message) })
+      },
+      { bufferSize: 256, overflowStrategy: 'suspend' }
+    )
+    void Effect.runPromise(
+      notifications.pipe(
+        Stream.runForEach((message) => Effect.sync(() => this.receiveNotification(message)))
+      ),
+      { signal: this.notificationAbort.signal }
+    ).catch(() => undefined)
   }
 
   private receiveNotification(message: DemoChatMessage): void {
@@ -295,7 +308,7 @@ export class RxjsChatController {
     })
   }
 
-  private patch(patch: Partial<RxjsChatState>, incrementRevision = true): void {
+  private patch(patch: Partial<EffectChatState>, incrementRevision = true): void {
     if (this.closed) return
     this.state = {
       ...this.state,
