@@ -1,11 +1,11 @@
 # @natsail/effect
 
-`@natsail/effect` gives Effect v4 programs scoped Core NATS subject Streams, typed operations and failures, and optional shared-session Streams over one NATSail runtime.
+`@natsail/effect` gives Effect v4 programs scoped Core NATS and JetStream Streams, typed operations and failures, and optional shared-session Streams over one NATSail runtime.
 
 The current v4 adapter targets `effect@4.0.0-rc.112`. Install the matching Effect release candidate while this version is published under NATSail's prerelease tag.
 
 ```sh
-pnpm add effect@4.0.0-rc.112 @natsail/core @natsail/session @natsail/effect
+pnpm add effect@4.0.0-rc.112 @natsail/core @natsail/jetstream @natsail/session @natsail/effect
 ```
 
 ## Core subject Streams
@@ -67,6 +67,93 @@ const processMessages = messages.pipe(
 
 `Stream.rechunk()` bounds each processing batch, and `runForEachArray()` invokes the application once per non-empty batch. Avoid `Stream.runCollect()` for unbounded subjects because it retains every message until the Stream completes.
 
+## JetStream delivery
+
+Use `jetStreamEvents()` when the application needs both ordered deliveries and the exact replay-to-live boundary. `jetStreamDeliveries()` exposes the same delivery path without the control event:
+
+```ts
+import { natsCodecs } from '@natsail/core'
+import { jetStreamEvents } from '@natsail/effect'
+
+const events = jetStreamEvents(
+  {
+    stream: 'CHAT',
+    filter: 'chat.room.>',
+    start: 'all',
+    codec: natsCodecs.json<ChatEvent>(),
+    maxBufferedMessages: 64,
+    recovery: { delayMs: 500 },
+  },
+  {
+    bufferSize: 256,
+    overflowStrategy: 'suspend',
+  }
+)
+```
+
+The Stream is cold and scoped. NATSail owns the ordered consumer, checkpoint, duplicate policy, and package-level recovery. Effect owns downstream demand and structured cancellation. The default local Effect buffer is 32 events and suspends the awaited JetStream handler when full. Durable delivery deliberately supports only `suspend` and `error`; dropping or sliding would incorrectly allow the source checkpoint to advance past an event that was never admitted to the Effect Stream.
+
+Delivery into the bounded Stream is the ordered-consumer acceptance boundary. If durable completion must mean that a business Effect succeeded—not merely that the event entered the Stream—use `runJetStreamProcessor()` and its explicit-ack consumer.
+
+`maxBufferedMessages` or `maxBufferedBytes` controls the nats.js pull buffer. `bufferSize` controls the second, decoded Effect queue. Both bounds remain explicit.
+
+## Atomic replay materialization
+
+`materializeJetStream()` avoids rendering every intermediate historical state. It emits an initial `replaying` state, silently reduces bounded replay batches, emits one complete `live` state at catch-up, and then emits microbatched live updates:
+
+```ts
+import { Effect, Stream } from 'effect'
+
+import { materializeJetStream } from '@natsail/effect'
+
+const conversation = materializeJetStream(
+  {
+    stream: 'CHAT',
+    filter: `chat.room.${roomId}`,
+    start: 'all',
+    codec: chatEventCodec,
+    maxBufferedMessages: 64,
+    recovery: {},
+  },
+  {
+    initial: () => emptyConversation(),
+    reduceBatch: (state, deliveries) =>
+      Effect.sync(() => reduceConversationBatch(state, deliveries)),
+  },
+  {
+    bufferSize: 256,
+    batchSize: 256,
+    batchWithin: '16 millis',
+  }
+)
+
+const render = conversation.pipe(Stream.runForEach((snapshot) => updateConversation(snapshot.data)))
+```
+
+`reduceBatch` is a native Effect. Its typed error and service requirements remain in the returned Stream type. Package-owned recovery can resume admitted events while the current materialized state remains alive. A fresh materializer rebuilds from replay, so `resume` is rejected until a state store can commit the materialized state and cursor atomically.
+
+## Explicit-ack processing
+
+Use `runJetStreamProcessor()` for durable work queues or other named consumer workflows:
+
+```ts
+import { runJetStreamProcessor } from '@natsail/effect'
+
+const worker = runJetStreamProcessor(
+  {
+    stream: 'JOBS',
+    consumer: { mode: 'ensure', name: 'email-workers' },
+    filter: 'jobs.email',
+    start: 'all',
+    codec: emailJobCodec,
+    maxAckPending: 32,
+  },
+  (delivery) => sendEmail(delivery.value)
+)
+```
+
+The package waits for the handler Effect before the underlying processor acknowledges the message. Typed application failures remain typed Effect failures; connection, consumer-contract, and processor lifecycle failures use `NatsailJetStreamError`.
+
 ## Service and request/reply
 
 The same scoped Layer supplies the `Natsail` service for publish, request/reply, reconnect, connection inspection, and escape hatches:
@@ -95,7 +182,7 @@ Session Streams queue at most 32 snapshots by default. Overflow fails with `Nats
 
 Session snapshot buffering happens after the registry updates. Use direct subject Streams when downstream Effect demand must reach the NATSail delivery handler.
 
-NATSail continues to own connection and authentication recovery. The Effect adapter does not create a second connection or retry loop. The service exposes `runtime` and `sessions` for advanced nats.js, JetStream manager, processor, and custom session operations without leaving the Layer-owned lifecycle.
+NATSail continues to own connection, authentication, ordered-consumer recovery, and checkpoints. The Effect adapter does not create a second connection or retry loop. The service exposes `runtime` and `sessions` for JetStream manager calls and other advanced nats.js or custom session operations without leaving the Layer-owned lifecycle.
 
 ## License
 

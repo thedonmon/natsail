@@ -1,4 +1,5 @@
-import { Cause, Context, Data, Effect, Layer, Queue, Stream } from 'effect'
+import { Cause, Context, Data, Effect, Exit, Layer, Option, Queue, Stream } from 'effect'
+import type { Duration } from 'effect'
 
 import type {
   CoreRequestOptions,
@@ -9,6 +10,18 @@ import type {
   NatsRuntimeReconnectOptions,
   NatsRuntimeStatusEvent,
 } from '@natsail/core'
+import {
+  createJetStreamSessionSource,
+  processJetStream,
+  type JetStreamCatchUp,
+  type JetStreamDelivery,
+  type JetStreamLease,
+  type JetStreamProcessingDelivery,
+  type JetStreamProcessorOptions,
+  type ReducingJetStreamSessionOptions,
+  type JetStreamSessionSourceOptions,
+  type StreamCursor,
+} from '@natsail/jetstream'
 import type {
   SessionDefinition,
   SessionRegistry,
@@ -77,6 +90,63 @@ export interface NatsailSubjectStreamOptions {
   readonly overflowStrategy?: NatsailSubjectStreamOverflowStrategy
 }
 
+export type NatsailJetStreamErrorStage = 'subscribe' | 'ready' | 'catch-up' | 'source' | 'processor'
+
+export class NatsailJetStreamError extends Data.TaggedError('NatsailJetStreamError')<{
+  readonly stream: string
+  readonly filter: string | readonly string[]
+  readonly stage: NatsailJetStreamErrorStage
+  readonly message: string
+  readonly cause: unknown
+}> {}
+
+export type NatsailJetStreamStreamError = NatsailJetStreamError | NatsailStreamBufferOverflowError
+
+export interface NatsailJetStreamStreamOptions {
+  /** Maximum deliveries and control events waiting for Effect. Defaults to 32. */
+  readonly bufferSize?: number
+  /** Reliable streams suspend by default. `error` terminates before a delivery is lost. */
+  readonly overflowStrategy?: 'suspend' | 'error'
+}
+
+export type NatsailJetStreamEvent<T> =
+  | {
+      readonly type: 'delivery'
+      readonly delivery: JetStreamDelivery<T>
+    }
+  | {
+      readonly type: 'caught-up'
+      readonly catchUp: JetStreamCatchUp
+    }
+
+export interface NatsailJetStreamMaterializer<Value, State, E = never, R = never> {
+  readonly initial: () => State
+  /** Called serially with one non-empty bounded batch. */
+  readonly reduceBatch: (
+    state: State,
+    deliveries: readonly JetStreamDelivery<Value>[]
+  ) => Effect.Effect<State, E, R>
+}
+
+/** A fresh materializer must rebuild state and therefore cannot resume only an event cursor. */
+export type NatsailJetStreamMaterializeSourceOptions<T> = ReducingJetStreamSessionOptions<T>
+
+export interface NatsailJetStreamMaterializeOptions extends NatsailJetStreamStreamOptions {
+  /** Maximum deliveries reduced in one application call. Defaults to 256. */
+  readonly batchSize?: number
+  /** Maximum wait before a partial live batch is reduced. Defaults to 16ms. */
+  readonly batchWithin?: Duration.Input
+}
+
+export interface NatsailJetStreamMaterializedState<State> {
+  readonly phase: 'replaying' | 'live'
+  readonly data: State
+  readonly cursor?: StreamCursor
+  readonly replay: {
+    readonly delivered: number
+  }
+}
+
 export interface NatsailSessionStreamOptions {
   /** Maximum queued snapshots. Defaults to 32. Use `unbounded` only deliberately. */
   readonly bufferSize?: number | 'unbounded'
@@ -114,6 +184,27 @@ export interface NatsailService {
     options: CoreSubscriptionOptions<T>,
     streamOptions?: NatsailSubjectStreamOptions
   ): Stream.Stream<T, NatsailSubjectStreamError>
+  /** Ordered replay plus live delivery with an explicit caught-up event. */
+  jetStreamEvents<T>(
+    options: JetStreamSessionSourceOptions<T>,
+    streamOptions?: NatsailJetStreamStreamOptions
+  ): Stream.Stream<NatsailJetStreamEvent<T>, NatsailJetStreamStreamError>
+  /** Ordered JetStream deliveries without the caught-up control event. */
+  jetStreamDeliveries<T>(
+    options: JetStreamSessionSourceOptions<T>,
+    streamOptions?: NatsailJetStreamStreamOptions
+  ): Stream.Stream<JetStreamDelivery<T>, NatsailJetStreamStreamError>
+  /** Rebuilds replay silently, emits once at catch-up, then microbatches live state. */
+  materializeJetStream<Value, State, E, R>(
+    options: NatsailJetStreamMaterializeSourceOptions<Value>,
+    materializer: NatsailJetStreamMaterializer<Value, State, E, R>,
+    streamOptions?: NatsailJetStreamMaterializeOptions
+  ): Stream.Stream<NatsailJetStreamMaterializedState<State>, NatsailJetStreamStreamError | E, R>
+  /** Runs an explicit-ack processor and acknowledges only after the Effect succeeds. */
+  runJetStreamProcessor<T, E, R>(
+    options: JetStreamProcessorOptions<T>,
+    handler: (delivery: JetStreamProcessingDelivery<T>) => Effect.Effect<void, E, R>
+  ): Effect.Effect<void, NatsailJetStreamError | E, R>
   restartSession(key: string): Effect.Effect<void, NatsailOperationError>
   sessionSnapshots<T>(
     definition: SessionDefinition<T>,
@@ -144,6 +235,27 @@ interface ResolvedSubjectStreamOptions {
   readonly bufferSize: number
   readonly overflowStrategy: NatsailSubjectStreamOverflowStrategy
   readonly callbackStrategy: 'dropping' | 'sliding' | 'suspend'
+}
+
+interface ResolvedJetStreamStreamOptions {
+  readonly bufferSize: number
+  readonly overflowStrategy: 'suspend' | 'error'
+  readonly callbackStrategy: 'suspend' | 'dropping'
+}
+
+interface JetStreamMaterializerAccumulator<State> {
+  readonly phase: 'replaying' | 'live'
+  readonly data: State
+  readonly cursor?: StreamCursor
+  readonly replayDelivered: number
+}
+
+class JetStreamEffectFailure<E> {
+  constructor(readonly error: E) {}
+}
+
+class JetStreamEffectCause {
+  constructor(readonly cause: Cause.Cause<never>) {}
 }
 
 const DEFAULT_STREAM_BUFFER_SIZE = 32
@@ -221,6 +333,23 @@ function resolveSubjectStreamOptions(
   }
 }
 
+function resolveJetStreamStreamOptions(
+  options: NatsailJetStreamStreamOptions = {}
+): ResolvedJetStreamStreamOptions {
+  const bufferSize = options.bufferSize ?? DEFAULT_STREAM_BUFFER_SIZE
+  const overflowStrategy = options.overflowStrategy ?? 'suspend'
+
+  if (!Number.isSafeInteger(bufferSize) || bufferSize <= 0) {
+    throw new TypeError('NATSail Effect JetStream bufferSize must be a positive safe integer')
+  }
+
+  return {
+    bufferSize,
+    overflowStrategy,
+    callbackStrategy: overflowStrategy === 'error' ? 'dropping' : 'suspend',
+  }
+}
+
 function subjectError(
   options: CoreSubscriptionOptions<unknown>,
   stage: NatsailSubjectErrorStage,
@@ -232,6 +361,20 @@ function subjectError(
     stage,
     cause,
     message: `NATSail subject ${options.subject} ${stage} failed: ${describeCause(cause)}`,
+  })
+}
+
+function jetStreamError(
+  options: Pick<JetStreamSessionSourceOptions<unknown>, 'stream' | 'filter'>,
+  stage: NatsailJetStreamErrorStage,
+  cause: unknown
+): NatsailJetStreamError {
+  return new NatsailJetStreamError({
+    stream: options.stream,
+    filter: options.filter,
+    stage,
+    cause,
+    message: `NATSail JetStream ${options.stream} ${stage} failed: ${describeCause(cause)}`,
   })
 }
 
@@ -297,6 +440,252 @@ function createSubjectStream<T>(
       bufferSize: resolved.bufferSize,
       strategy: resolved.callbackStrategy,
     }
+  )
+}
+
+function createJetStreamEventStream<T>(
+  runtime: NatsRuntime,
+  options: JetStreamSessionSourceOptions<T>,
+  streamOptions?: NatsailJetStreamStreamOptions
+): Stream.Stream<NatsailJetStreamEvent<T>, NatsailJetStreamStreamError> {
+  const resolved = resolveJetStreamStreamOptions(streamOptions)
+  const streamName = `jetstream:${options.stream}`
+
+  return Stream.callback<NatsailJetStreamEvent<T>, NatsailJetStreamStreamError>(
+    (queue) =>
+      Effect.gen(function* () {
+        const effectSignal = yield* Effect.abortSignal
+        const signal = options.signal
+          ? AbortSignal.any([options.signal, effectSignal])
+          : effectSignal
+        let resolveCatchUpMarker!: () => void
+        let rejectCatchUpMarker!: (cause: unknown) => void
+        const catchUpMarkerEnqueued = new Promise<void>((resolve, reject) => {
+          resolveCatchUpMarker = resolve
+          rejectCatchUpMarker = reject
+        })
+        void catchUpMarkerEnqueued.catch(() => undefined)
+        const offerEvent = async (event: NatsailJetStreamEvent<T>): Promise<void> => {
+          const accepted = await Effect.runPromise(Queue.offer(queue, event))
+
+          if (!accepted && resolved.overflowStrategy === 'error' && queue.state._tag === 'Open') {
+            const overflow = new NatsailStreamBufferOverflowError({
+              stream: streamName,
+              capacity: resolved.bufferSize,
+              message: `NATSail JetStream ${options.stream} exceeded its ${resolved.bufferSize}-event Effect buffer`,
+            })
+            await Effect.runPromise(Queue.fail(queue, overflow))
+            throw overflow
+          }
+        }
+        const lease: JetStreamLease<T> = yield* Effect.acquireRelease(
+          Effect.try({
+            try: () => {
+              const source = createJetStreamSessionSource(runtime, { ...options, signal })
+              return source(async (delivery) => {
+                if (delivery.replay === 'live') await catchUpMarkerEnqueued
+                await offerEvent({ type: 'delivery', delivery })
+              }) as JetStreamLease<T>
+            },
+            catch: (cause) => jetStreamError(options, 'subscribe', cause),
+          }),
+          (active) => Effect.promise(() => active.close().catch(() => undefined))
+        )
+
+        yield* Effect.tryPromise({
+          try: () => lease.ready,
+          catch: (cause) => jetStreamError(options, 'ready', cause),
+        })
+        const catchUpEvent = lease.caughtUp.then(async (catchUp) => {
+          await offerEvent({ type: 'caught-up', catchUp })
+          return catchUp
+        })
+        void catchUpEvent.then(resolveCatchUpMarker, rejectCatchUpMarker)
+        yield* Effect.tryPromise({
+          try: () => catchUpEvent,
+          catch: (cause) =>
+            cause instanceof NatsailStreamBufferOverflowError
+              ? cause
+              : jetStreamError(options, 'catch-up', cause),
+        })
+        yield* Effect.tryPromise({
+          try: () => lease.closed,
+          catch: (cause) =>
+            cause instanceof NatsailStreamBufferOverflowError
+              ? cause
+              : jetStreamError(options, 'source', cause),
+        })
+      }).pipe(
+        Effect.matchEffect({
+          onFailure: (error) => Queue.fail(queue, error),
+          onSuccess: () => Queue.end(queue),
+        })
+      ),
+    {
+      bufferSize: resolved.bufferSize,
+      strategy: resolved.callbackStrategy,
+    }
+  )
+}
+
+function createJetStreamDeliveryStream<T>(
+  runtime: NatsRuntime,
+  options: JetStreamSessionSourceOptions<T>,
+  streamOptions?: NatsailJetStreamStreamOptions
+): Stream.Stream<JetStreamDelivery<T>, NatsailJetStreamStreamError> {
+  return createJetStreamEventStream(runtime, options, streamOptions).pipe(
+    Stream.filter(
+      (event): event is Extract<NatsailJetStreamEvent<T>, { readonly type: 'delivery' }> =>
+        event.type === 'delivery'
+    ),
+    Stream.map((event) => event.delivery)
+  )
+}
+
+function createJetStreamMaterializedStream<Value, State, E, R>(
+  runtime: NatsRuntime,
+  options: NatsailJetStreamMaterializeSourceOptions<Value>,
+  materializer: NatsailJetStreamMaterializer<Value, State, E, R>,
+  streamOptions: NatsailJetStreamMaterializeOptions = {}
+): Stream.Stream<NatsailJetStreamMaterializedState<State>, NatsailJetStreamStreamError | E, R> {
+  const batchSize = streamOptions.batchSize ?? 256
+  const batchWithin = streamOptions.batchWithin ?? '16 millis'
+
+  if (options.resume) {
+    throw new TypeError(
+      'A JetStream materializer cannot resume an event cursor without restoring matching materialized state'
+    )
+  }
+  if (!Number.isSafeInteger(batchSize) || batchSize <= 0) {
+    throw new TypeError('NATSail Effect JetStream batchSize must be a positive safe integer')
+  }
+
+  return Stream.suspend(() => {
+    const initial = materializer.initial()
+    const initialAccumulator: JetStreamMaterializerAccumulator<State> = {
+      phase: 'replaying',
+      data: initial,
+      replayDelivered: 0,
+    }
+    const initialSnapshot: NatsailJetStreamMaterializedState<State> = {
+      phase: 'replaying',
+      data: initial,
+      replay: { delivered: 0 },
+    }
+    const updates = createJetStreamEventStream(runtime, options, streamOptions).pipe(
+      Stream.groupedWithin(batchSize, batchWithin),
+      Stream.mapAccumEffect(
+        () => initialAccumulator,
+        (previous, events) =>
+          Effect.gen(function* () {
+            let data = previous.data
+            let phase = previous.phase
+            let cursor = previous.cursor
+            let replayDelivered = previous.replayDelivered
+            let pending: Array<JetStreamDelivery<Value>> = []
+            const snapshots: Array<NatsailJetStreamMaterializedState<State>> = []
+
+            const snapshot = (): NatsailJetStreamMaterializedState<State> => ({
+              phase: 'live',
+              data,
+              ...(cursor === undefined ? {} : { cursor }),
+              replay: { delivered: replayDelivered },
+            })
+
+            const reducePending = (): Effect.Effect<void, E, R> => {
+              if (pending.length === 0) return Effect.void
+
+              const deliveries = pending
+              pending = []
+              return materializer.reduceBatch(data, deliveries).pipe(
+                Effect.tap((nextData) =>
+                  Effect.sync(() => {
+                    data = nextData
+                    cursor = deliveries[deliveries.length - 1]?.cursor ?? cursor
+                    if (phase === 'replaying') replayDelivered += deliveries.length
+                  })
+                ),
+                Effect.asVoid
+              )
+            }
+
+            for (const event of events) {
+              if (event.type === 'delivery') {
+                pending.push(event.delivery)
+                continue
+              }
+
+              yield* reducePending()
+              phase = 'live'
+              replayDelivered = event.catchUp.delivered
+              cursor = event.catchUp.cursor ?? cursor
+              snapshots.push(snapshot())
+            }
+            const hasDeliveriesAfterLastSnapshot = pending.length > 0
+            yield* reducePending()
+            if (phase === 'live' && hasDeliveriesAfterLastSnapshot) snapshots.push(snapshot())
+
+            const next: JetStreamMaterializerAccumulator<State> = {
+              phase,
+              data,
+              replayDelivered,
+              ...(cursor === undefined ? {} : { cursor }),
+            }
+
+            return [next, snapshots] as const
+          })
+      )
+    )
+
+    return Stream.concat(Stream.succeed(initialSnapshot), updates)
+  })
+}
+
+function runJetStreamProcessorEffect<T, E, R>(
+  runtime: NatsRuntime,
+  options: JetStreamProcessorOptions<T>,
+  handler: (delivery: JetStreamProcessingDelivery<T>) => Effect.Effect<void, E, R>
+): Effect.Effect<void, NatsailJetStreamError | E, R> {
+  return Effect.scoped(
+    Effect.gen(function* () {
+      const context = yield* Effect.context<R>()
+      const effectSignal = yield* Effect.abortSignal
+      const signal = options.signal ? AbortSignal.any([options.signal, effectSignal]) : effectSignal
+      const processorOptions = { ...options, signal }
+      const lease = yield* Effect.acquireRelease(
+        Effect.try({
+          try: () =>
+            processJetStream(runtime, processorOptions, async (delivery) => {
+              const exit = await Effect.runPromiseExitWith(context)(handler(delivery), { signal })
+              if (Exit.isFailure(exit)) {
+                const expected = Cause.findErrorOption(exit.cause)
+                if (Option.isSome(expected)) throw new JetStreamEffectFailure(expected.value)
+                throw new JetStreamEffectCause(exit.cause as Cause.Cause<never>)
+              }
+            }),
+          catch: (cause) => jetStreamError(options, 'processor', cause),
+        }),
+        (active) => Effect.promise(() => active.close().catch(() => undefined))
+      )
+
+      yield* Effect.tryPromise({
+        try: () => lease.ready,
+        catch: (cause) => jetStreamError(options, 'processor', cause),
+      })
+      yield* Effect.tryPromise({
+        try: () => lease.closed,
+        catch: (cause) => cause,
+      }).pipe(
+        Effect.catch((cause) => {
+          if (cause instanceof JetStreamEffectCause) return Effect.failCause(cause.cause)
+          const error: E | NatsailJetStreamError =
+            cause instanceof JetStreamEffectFailure
+              ? (cause.error as E)
+              : jetStreamError(options, 'processor', cause)
+          return Effect.fail(error)
+        })
+      )
+    })
   )
 }
 
@@ -408,6 +797,14 @@ export function makeNatsail(resource: NatsailResource): NatsailService {
         })
       ),
     subscribe: (options, streamOptions) => createSubjectStream(runtime, options, streamOptions),
+    jetStreamEvents: (options, streamOptions) =>
+      createJetStreamEventStream(runtime, options, streamOptions),
+    jetStreamDeliveries: (options, streamOptions) =>
+      createJetStreamDeliveryStream(runtime, options, streamOptions),
+    materializeJetStream: (options, materializer, streamOptions) =>
+      createJetStreamMaterializedStream(runtime, options, materializer, streamOptions),
+    runJetStreamProcessor: (options, handler) =>
+      runJetStreamProcessorEffect(runtime, options, handler),
     restartSession: (key) => tryRuntimePromise('restart-session', () => sessions.restart(key)),
     sessionSnapshots: (definition, options) =>
       createSessionSnapshotStream(sessions, definition, options),
@@ -438,6 +835,58 @@ export function subscribe<T>(
   streamOptions?: NatsailSubjectStreamOptions
 ): Stream.Stream<T, NatsailSubjectStreamError, Natsail> {
   return Stream.unwrap(Natsail.useSync((service) => service.subscribe(options, streamOptions)))
+}
+
+/**
+ * Creates a cold ordered JetStream Stream with an explicit replay-complete
+ * event. NATSail remains the single owner of recovery and checkpoints.
+ */
+export function jetStreamEvents<T>(
+  options: JetStreamSessionSourceOptions<T>,
+  streamOptions?: NatsailJetStreamStreamOptions
+): Stream.Stream<NatsailJetStreamEvent<T>, NatsailJetStreamStreamError, Natsail> {
+  return Stream.unwrap(
+    Natsail.useSync((service) => service.jetStreamEvents(options, streamOptions))
+  )
+}
+
+/** Creates a cold ordered JetStream Stream containing delivery values only. */
+export function jetStreamDeliveries<T>(
+  options: JetStreamSessionSourceOptions<T>,
+  streamOptions?: NatsailJetStreamStreamOptions
+): Stream.Stream<JetStreamDelivery<T>, NatsailJetStreamStreamError, Natsail> {
+  return Stream.unwrap(
+    Natsail.useSync((service) => service.jetStreamDeliveries(options, streamOptions))
+  )
+}
+
+/**
+ * Rebuilds historical state without rendering every intermediate state, emits
+ * one atomic live snapshot at catch-up, and then emits microbatched updates.
+ */
+export function materializeJetStream<Value, State, E, R>(
+  options: NatsailJetStreamMaterializeSourceOptions<Value>,
+  materializer: NatsailJetStreamMaterializer<Value, State, E, R>,
+  streamOptions?: NatsailJetStreamMaterializeOptions
+): Stream.Stream<
+  NatsailJetStreamMaterializedState<State>,
+  NatsailJetStreamStreamError | E,
+  Natsail | R
+> {
+  return Stream.unwrap(
+    Natsail.useSync((service) => service.materializeJetStream(options, materializer, streamOptions))
+  )
+}
+
+/**
+ * Runs a named explicit-ack JetStream processor. The message is acknowledged
+ * only after the supplied Effect completes successfully.
+ */
+export function runJetStreamProcessor<T, E, R>(
+  options: JetStreamProcessorOptions<T>,
+  handler: (delivery: JetStreamProcessingDelivery<T>) => Effect.Effect<void, E, R>
+): Effect.Effect<void, NatsailJetStreamError | E, Natsail | R> {
+  return Natsail.use((service) => service.runJetStreamProcessor(options, handler))
 }
 
 /** Supplies an existing resource without taking ownership of it. */

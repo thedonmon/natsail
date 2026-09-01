@@ -350,6 +350,9 @@ importers:
       '@natsail/core':
         specifier: workspace:^
         version: link:../core
+      '@natsail/jetstream':
+        specifier: workspace:^
+        version: link:../jetstream
       '@natsail/session':
         specifier: workspace:^
         version: link:../session

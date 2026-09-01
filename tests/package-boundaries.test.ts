@@ -39,7 +39,11 @@ describe('package boundaries', () => {
       peerDependencies: Record<string, string>
     }
 
-    expect(Object.keys(effectManifest.dependencies)).toEqual(['@natsail/core', '@natsail/session'])
+    expect(Object.keys(effectManifest.dependencies)).toEqual([
+      '@natsail/core',
+      '@natsail/jetstream',
+      '@natsail/session',
+    ])
     expect(Object.keys(effectManifest.peerDependencies)).toEqual(['effect'])
     expect(Object.keys(reactManifest.dependencies)).toEqual([
       '@natsail/core',
