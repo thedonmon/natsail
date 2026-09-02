@@ -42,6 +42,7 @@ See the [resumable-stream research](docs/research/nats-resumable-streams.md) and
 | RxJS session value, runtime event, and status streams        | Tested      |
 | Effect, React, and RxJS sharing one logical session          | Tested      |
 | Effect scoped Layer, typed operations, and session Streams   | Tested      |
+| Effect JetStream replay, materialization, and processing     | Tested      |
 | Memory and IndexedDB checkpoint stores                       | Tested      |
 | Filter-scoped checkpoints and scope-conflict detection       | Tested      |
 | Shared JetStream sessions for React and RxJS                 | Tested      |
@@ -86,7 +87,7 @@ The integration tests use NATS 2.14.4. Separate fixtures cover anonymous, token,
 | [`@natsail/checkpoints`](https://www.npmjs.com/package/@natsail/checkpoints) | Memory and IndexedDB checkpoint stores     | None                                                   |
 | [`@natsail/jetstream`](https://www.npmjs.com/package/@natsail/jetstream)     | Ordered JetStream replay and resume        | Core package, checkpoint package, `@nats-io/jetstream` |
 | [`@natsail/session`](https://www.npmjs.com/package/@natsail/session)         | Keyed session sharing and lifecycle        | Core package                                           |
-| [`@natsail/effect`](https://www.npmjs.com/package/@natsail/effect)           | Scoped Effect services and session Streams | Core, session package, Effect peer                     |
+| [`@natsail/effect`](https://www.npmjs.com/package/@natsail/effect)           | Scoped Effect Core and JetStream Streams   | Core, JetStream, session packages, Effect peer         |
 | [`@natsail/react`](https://www.npmjs.com/package/@natsail/react)             | React provider, status, and session hooks  | Core, session package, React peer                      |
 | [`@natsail/rxjs`](https://www.npmjs.com/package/@natsail/rxjs)               | Runtime and session Observable bindings    | Core, session package, RxJS peer                       |
 
@@ -96,14 +97,14 @@ Each package sets `sideEffects` to `false`. Each package also has a separate exp
 
 ### Adapter packages
 
-| Package                         | Status    | Peer libraries              | Responsibility                                                |
-| ------------------------------- | --------- | --------------------------- | ------------------------------------------------------------- |
-| `@natsail/effect`               | Tested    | Effect v3                   | Scoped services, typed failures, Streams, and interruption    |
-| `@natsail/react`                | Tested    | React                       | Hooks and external-store bindings                             |
-| `@natsail/rxjs`                 | Tested    | RxJS                        | Observable bindings and cancellation                          |
-| `@natsail/react-rxjs`           | Deferred  | React and RxJS              | Repeated integration patterns, if real applications need them |
-| `@natsail/transport-cloudflare` | Deferred  | Cloudflare Workers          | Add only if official transports need Worker-specific policy   |
-| `@natsail/cloudflare-gateway`   | Prototype | Workers and Durable Objects | Browser fan-in, restart replay, and downstream cursor policy  |
+| Package                         | Status     | Peer libraries              | Responsibility                                                  |
+| ------------------------------- | ---------- | --------------------------- | --------------------------------------------------------------- |
+| `@natsail/effect`               | Prerelease | Effect v4 RC                | Bounded Core and JetStream Streams, materialization, processors |
+| `@natsail/react`                | Tested     | React                       | Hooks and external-store bindings                               |
+| `@natsail/rxjs`                 | Tested     | RxJS                        | Observable bindings and cancellation                            |
+| `@natsail/react-rxjs`           | Deferred   | React and RxJS              | Repeated integration patterns, if real applications need them   |
+| `@natsail/transport-cloudflare` | Deferred   | Cloudflare Workers          | Add only if official transports need Worker-specific policy     |
+| `@natsail/cloudflare-gateway`   | Prototype  | Workers and Durable Objects | Browser fan-in, restart replay, and downstream cursor policy    |
 
 Applications can install any combination of the Effect, React, and RxJS adapters. Connection, checkpoint, consumer-recovery, and logical-session policy stays in the framework-neutral packages below them. Effect Streams, React hooks, and RxJS Observables can attach to the same logical session without opening duplicate NATS consumers.
 
@@ -528,21 +529,33 @@ The value Observable replays the latest value once to a new subscriber. It emits
 
 The React, RxJS, and Effect helpers share one underlying subscription when they use the same registry and validated definition.
 
-Effect programs acquire the service from a scoped Layer. NATSail continues to own connection and replay policy; Effect owns structured cancellation and finalization:
+Effect v4 programs can consume Core NATS subjects and ordered JetStream replay directly from scoped, bounded Streams. NATSail continues to own connection, recovery, and checkpoint policy; Effect owns demand, structured cancellation, application effects, and finalization:
 
 ```ts
 import { Effect, Stream } from 'effect'
-import { Natsail, makeNatsailScopedLayer } from '@natsail/effect'
+import { makeNatsailScopedLayer, subscribe } from '@natsail/effect'
+import { natsCodecs } from '@natsail/core'
 
 const NatsLive = makeNatsailScopedLayer(Effect.sync(() => ({ runtime, sessions })))
 
-const program = Effect.gen(function* () {
-  const nats = yield* Natsail
-  yield* nats.sessionValues(conversation).pipe(Stream.runForEach((state) => Effect.log(state)))
-}).pipe(Effect.provide(NatsLive))
+const program = subscribe(
+  {
+    subject: 'chat.room.*',
+    codec: natsCodecs.json<ChatMessage>(),
+  },
+  {
+    bufferSize: 256,
+    overflowStrategy: 'suspend',
+  }
+).pipe(
+  Stream.runForEach((message) => Effect.log(message)),
+  Effect.provide(NatsLive)
+)
 ```
 
-The Layer closes its registry and runtime after success, failure, or interruption. Session Streams retain and release registry handles automatically. They use a bounded buffer and fail with a typed overflow error by default instead of silently dropping state. The raw runtime and registry remain available on the service for advanced operations.
+Each consumer owns one cold subscription that closes after success, failure, or interruption. Subject Streams suspend the awaited Core NATS handler when their bounded buffer is full by default. Applications can instead choose a typed overflow error, dropping, or sliding for best-effort data. JetStream Streams expose the replay-to-live boundary, reliable suspend-or-error buffering, atomic batched materialization, and named explicit-ack processors whose handlers are native Effects.
+
+Session Streams remain available when consumers should share one validated registry source. The raw runtime and registry remain available on the service for advanced operations.
 
 The definition contract records source configuration that affects delivery semantics. Reusing an active key with a different contract throws `SessionContractMismatchError` instead of silently attaching to the wrong consumer. `sessions.inspect()` and `sessions.events` expose reference counts, phases, revisions, idle resources, and restarts for diagnostics.
 
@@ -550,24 +563,24 @@ The definition contract records source configuration that affects delivery seman
 
 The current packages cover client runtime, replay, checkpoints, sessions, Effect, React, and RxJS. They do not cover every delivery or deployment model.
 
-| Boundary                     | Supported now                                                                                                                                                                        | Not supported yet                                                                                                                         |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| JetStream consumer model     | Ordered `AckPolicy.None` replay plus named explicit-ack processors with bind, ensure, owned, redelivery, and bounded pull policies.                                                  | Packaged progress heartbeats, confirmed acknowledgements, and higher-level `nak` or terminal-message policy.                              |
-| Checkpoint coordination      | Monotonic memory and IndexedDB checkpoints for one client-side backing store.                                                                                                        | Distributed coordination between multiple writers or a server-owned acknowledgement record.                                               |
-| Framework stream restoration | The AI example restores framework messages and active runs after a page reload. AI SDK replays one retained run. TanStack AI continues after its IndexedDB checkpoint.               | A server-owned run registry and cross-device recovery. AI SDK cannot continue from an arbitrary native chunk without earlier run events.  |
-| Cloudflare gateway           | Local Durable Object fan-out, storage-backed upstream checkpoints, restart replay, and bounded client catch-up.                                                                      | A published gateway package with production authentication, backpressure, eviction, and cost policy.                                      |
-| Cloudflare transport         | Official NATS WebSocket and Node TCP transports in local workerd.                                                                                                                    | Remote endpoint, production authentication, and Workers VPC validation.                                                                   |
-| Cross-tab connection sharing | A `SharedWorker` harness proves that two tabs can share one connection.                                                                                                              | A supported browser-broker protocol with defined authentication, lifecycle, and failure behavior.                                         |
-| Adapter ergonomics           | Validated definitions share atomic reducer state across Effect, React, and RxJS. Effect scopes own cancellation and cleanup; React can coalesce renders without dropping reductions. | The application still defines its domain reducer and bounded state shape. A cross-framework rendering bridge has not earned a package.    |
-| Materialized state resume    | Package-owned recovery preserves the reducer state and processed cursor within an active source lease. A fresh lease atomically rebuilds state from stream replay.                   | Persisted reducer resume requires a state store committed atomically with its event cursor. Passing `resume` to a reducing session fails. |
-| Package availability         | Seven package tarballs, Changesets versioning, release checks, provenance, and trusted-publishing automation.                                                                        | A new npm package needs its one-time bootstrap publication and trusted-publisher setting before routine OIDC releases.                    |
+| Boundary                     | Supported now                                                                                                                                                          | Not supported yet                                                                                                                         |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| JetStream consumer model     | Ordered `AckPolicy.None` replay plus named explicit-ack processors with bind, ensure, owned, redelivery, and bounded pull policies.                                    | Packaged progress heartbeats, confirmed acknowledgements, and higher-level `nak` or terminal-message policy.                              |
+| Checkpoint coordination      | Monotonic memory and IndexedDB checkpoints for one client-side backing store.                                                                                          | Distributed coordination between multiple writers or a server-owned acknowledgement record.                                               |
+| Framework stream restoration | The AI example restores framework messages and active runs after a page reload. AI SDK replays one retained run. TanStack AI continues after its IndexedDB checkpoint. | A server-owned run registry and cross-device recovery. AI SDK cannot continue from an arbitrary native chunk without earlier run events.  |
+| Cloudflare gateway           | Local Durable Object fan-out, storage-backed upstream checkpoints, restart replay, and bounded client catch-up.                                                        | A published gateway package with production authentication, backpressure, eviction, and cost policy.                                      |
+| Cloudflare transport         | Official NATS WebSocket and Node TCP transports in local workerd.                                                                                                      | Remote endpoint, production authentication, and Workers VPC validation.                                                                   |
+| Cross-tab connection sharing | A `SharedWorker` harness proves that two tabs can share one connection.                                                                                                | A supported browser-broker protocol with defined authentication, lifecycle, and failure behavior.                                         |
+| Adapter ergonomics           | Effect v4 directly owns bounded Core and JetStream Streams, atomic replay materialization, explicit-ack Effect handlers, and scoped cleanup.                           | Sustained slow-consumer and recovery load proofs plus production tuning guidance for the new Effect-native JetStream path.                |
+| Materialized state resume    | Package-owned recovery preserves the reducer state and processed cursor within an active source lease. A fresh lease atomically rebuilds state from stream replay.     | Persisted reducer resume requires a state store committed atomically with its event cursor. Passing `resume` to a reducing session fails. |
+| Package availability         | Seven package tarballs, Changesets versioning, release checks, provenance, and trusted-publishing automation.                                                          | A new npm package needs its one-time bootstrap publication and trusted-publisher setting before routine OIDC releases.                    |
 
 These boundaries define the next proofs. The examples and prototypes can continue to test them.
 
 ## Roadmap
 
 1. Replace the remaining application-owned NATS effects and service wrappers in a production worktree with validated definitions, atomic reducers, and managed ownership. Measure replay time, renders, resource counts, and recovery behavior before merging the migration.
-2. Prove the Effect adapter in an application workflow that combines a shared JetStream reducer, interruption, reconnect, and Layer shutdown while reporting resource counts.
+2. Prove Effect v4 Core and JetStream Streams under slow-consumer, replay, processor-failure, and recovery load; publish measured buffer and batching guidance.
 3. Design and prove a materialized-state store that commits reducer state and its JetStream cursor together, then allow fast persisted reducer resume without replaying the full retained stream.
 4. Add processor progress heartbeats, confirmed acknowledgements, and explicit `nak` or terminal-message policy after proving their failure semantics.
 5. Prove an atomic catch-up-to-live handoff in the Durable Object gateway. Add authentication, backpressure, eviction tests, and cost measurements.

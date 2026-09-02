@@ -1,47 +1,188 @@
 # @natsail/effect
 
-`@natsail/effect` gives Effect programs one scoped NATSail service, typed failures, cancellable event Streams, and reference-counted shared-session Streams.
+`@natsail/effect` gives Effect v4 programs scoped Core NATS and JetStream Streams, typed operations and failures, and optional shared-session Streams over one NATSail runtime.
+
+The current v4 adapter targets `effect@4.0.0-rc.112`. Install the matching Effect release candidate while this version is published under NATSail's prerelease tag.
 
 ```sh
-pnpm add effect @natsail/core @natsail/session @natsail/effect
+pnpm add effect@4.0.0-rc.112 @natsail/core @natsail/jetstream @natsail/session @natsail/effect
 ```
 
-The package targets stable Effect v3. It does not create a second connection, retry loop, checkpoint system, or consumer lifecycle. NATSail still owns those policies; Effect owns dependency injection, structured concurrency, interruption, and scope finalization.
+## Core subject Streams
+
+Use `subscribe()` when every Effect consumer should own one ephemeral Core NATS subscription:
 
 ```ts
 import { Effect, Stream } from 'effect'
 
-import { createNatsRuntime } from '@natsail/core'
-import { Natsail, makeNatsailScopedLayer } from '@natsail/effect'
-import { createSessionRegistry } from '@natsail/session'
+import { natsCodecs } from '@natsail/core'
+import { makeNatsailScopedLayer, subscribe } from '@natsail/effect'
 
 const NatsLive = makeNatsailScopedLayer(
   Effect.sync(() => ({
     runtime: createNatsRuntime({ connect: connectToNats }),
-    sessions: createSessionRegistry({ idleCloseMs: 250 }),
+    sessions: createSessionRegistry(),
   }))
 )
 
-const program = Effect.gen(function* () {
+const messages = subscribe(
+  {
+    subject: 'chat.room.*',
+    queue: 'chat-workers',
+    codec: natsCodecs.json<ChatMessage>(),
+  },
+  {
+    bufferSize: 256,
+    overflowStrategy: 'suspend',
+  }
+)
+
+const program = messages.pipe(
+  Stream.runForEach((message) => Effect.log(message)),
+  Effect.provide(NatsLive)
+)
+```
+
+The Stream is cold. Starting a consumer creates one subscription; completion, failure, or interruption closes it. Wildcard subjects, queue groups, codecs, and metadata-aware `decode(message)` functions use the same Core NATS options as `runtime.subscribe()`.
+
+Subject Streams queue at most 32 decoded messages by default. Their overflow policy is explicit:
+
+- `suspend` is the default and waits for downstream capacity before NATSail's awaited delivery handler returns.
+- `error` fails with `NatsailStreamBufferOverflowError` rather than losing a message.
+- `dropping` drops a new message when the buffer is full.
+- `sliding` keeps the newest messages by dropping the oldest buffered message.
+
+The bound is measured in messages, not bytes. Core NATS remains ephemeral and at-most-once: local backpressure cannot add server retention, acknowledgement, or replay. Use JetStream when an application cannot tolerate missed messages.
+
+`NatsailSubjectError` distinguishes subscription creation, readiness, and source/decoding failure while retaining the original cause.
+
+For sustained streams, compose the subscription with Effect's native chunk operators instead of accumulating the entire stream:
+
+```ts
+const processMessages = messages.pipe(
+  Stream.rechunk(256),
+  Stream.runForEachArray((batch) => persistBatch(batch))
+)
+```
+
+`Stream.rechunk()` bounds each processing batch, and `runForEachArray()` invokes the application once per non-empty batch. Avoid `Stream.runCollect()` for unbounded subjects because it retains every message until the Stream completes.
+
+## JetStream delivery
+
+Use `jetStreamEvents()` when the application needs both ordered deliveries and the exact replay-to-live boundary. `jetStreamDeliveries()` exposes the same delivery path without the control event:
+
+```ts
+import { natsCodecs } from '@natsail/core'
+import { jetStreamEvents } from '@natsail/effect'
+
+const events = jetStreamEvents(
+  {
+    stream: 'CHAT',
+    filter: 'chat.room.>',
+    start: 'all',
+    codec: natsCodecs.json<ChatEvent>(),
+    maxBufferedMessages: 64,
+    recovery: { delayMs: 500 },
+  },
+  {
+    bufferSize: 256,
+    overflowStrategy: 'suspend',
+  }
+)
+```
+
+The Stream is cold and scoped. NATSail owns the ordered consumer, checkpoint, duplicate policy, and package-level recovery. Effect owns downstream demand and structured cancellation. The default local Effect buffer is 32 events and suspends the awaited JetStream handler when full. Durable delivery deliberately supports only `suspend` and `error`; dropping or sliding would incorrectly allow the source checkpoint to advance past an event that was never admitted to the Effect Stream.
+
+Delivery into the bounded Stream is the ordered-consumer acceptance boundary. If durable completion must mean that a business Effect succeeded—not merely that the event entered the Stream—use `runJetStreamProcessor()` and its explicit-ack consumer.
+
+`maxBufferedMessages` or `maxBufferedBytes` controls the nats.js pull buffer. `bufferSize` controls the second, decoded Effect queue. Both bounds remain explicit.
+
+## Atomic replay materialization
+
+`materializeJetStream()` avoids rendering every intermediate historical state. It emits an initial `replaying` state, silently reduces bounded replay batches, emits one complete `live` state at catch-up, and then emits microbatched live updates:
+
+```ts
+import { Effect, Stream } from 'effect'
+
+import { materializeJetStream } from '@natsail/effect'
+
+const conversation = materializeJetStream(
+  {
+    stream: 'CHAT',
+    filter: `chat.room.${roomId}`,
+    start: 'all',
+    codec: chatEventCodec,
+    maxBufferedMessages: 64,
+    recovery: {},
+  },
+  {
+    initial: () => emptyConversation(),
+    reduceBatch: (state, deliveries) =>
+      Effect.sync(() => reduceConversationBatch(state, deliveries)),
+  },
+  {
+    bufferSize: 256,
+    batchSize: 256,
+    batchWithin: '16 millis',
+  }
+)
+
+const render = conversation.pipe(Stream.runForEach((snapshot) => updateConversation(snapshot.data)))
+```
+
+`reduceBatch` is a native Effect. Its typed error and service requirements remain in the returned Stream type. Package-owned recovery can resume admitted events while the current materialized state remains alive. A fresh materializer rebuilds from replay, so `resume` is rejected until a state store can commit the materialized state and cursor atomically.
+
+## Explicit-ack processing
+
+Use `runJetStreamProcessor()` for durable work queues or other named consumer workflows:
+
+```ts
+import { runJetStreamProcessor } from '@natsail/effect'
+
+const worker = runJetStreamProcessor(
+  {
+    stream: 'JOBS',
+    consumer: { mode: 'ensure', name: 'email-workers' },
+    filter: 'jobs.email',
+    start: 'all',
+    codec: emailJobCodec,
+    maxAckPending: 32,
+  },
+  (delivery) => sendEmail(delivery.value)
+)
+```
+
+The package waits for the handler Effect before the underlying processor acknowledges the message. Typed application failures remain typed Effect failures; connection, consumer-contract, and processor lifecycle failures use `NatsailJetStreamError`.
+
+## Service and request/reply
+
+The same scoped Layer supplies the `Natsail` service for publish, request/reply, reconnect, connection inspection, and escape hatches:
+
+```ts
+const request = Effect.gen(function* () {
   const nats = yield* Natsail
 
-  yield* nats.publish('chat.room.123', encodedMessage)
+  yield* nats.publish('jobs.created', encodedJob)
 
-  yield* nats
-    .sessionValues(conversationDefinition)
-    .pipe(Stream.runForEach((conversation) => Effect.log(conversation)))
+  return yield* nats.request({
+    subject: 'jobs.lookup',
+    data: encodedRequest,
+    codec: natsCodecs.json<Job>(),
+  })
 }).pipe(Effect.provide(NatsLive))
 ```
 
-`makeNatsailScopedLayer()` closes the session registry and runtime when the Layer scope exits, including failure or fiber interruption. `makeNatsailLayer()` supplies application-owned objects without closing them.
+An interrupted request aborts the underlying NATS request. `makeNatsailScopedLayer()` closes the session registry and runtime when the Layer scope exits. `makeNatsailLayer()` supplies application-owned objects without closing them.
 
-`sessionSnapshots()` and `sessionValues()` are cold Streams. Each Effect consumer retains one registry handle; consumers of the same validated definition still share one underlying NATS source. The handle is released whenever the stream completes, fails, or is interrupted.
+## Shared sessions
 
-Session Streams queue at most 32 snapshots by default. Overflow fails with `NatsailStreamBufferOverflowError` instead of silently losing state. Applications may choose `dropping`, `sliding`, a different bound, or an explicit `unbounded` buffer.
+`sessionSnapshots()` and `sessionValues()` remain available for application state that should share one validated `SessionRegistry` source. Each Effect consumer retains one registry handle, and the handle is released whenever the Stream completes, fails, or is interrupted.
 
-`NatsailOperationError` covers Promise operations and event iterators. `NatsailSessionError` distinguishes session acquisition from source failure. Both retain the original cause for tagged Effect recovery.
+Session Streams queue at most 32 snapshots by default. Overflow fails with `NatsailStreamBufferOverflowError`; applications may explicitly choose `dropping`, `sliding`, a different bound, or `unbounded`.
 
-The service exposes `runtime` and `sessions` as escape hatches. Advanced nats.js, JetStream manager, explicit-ack processor, and custom session operations remain available without leaving the Layer-owned lifecycle.
+Session snapshot buffering happens after the registry updates. Use direct subject Streams when downstream Effect demand must reach the NATSail delivery handler.
+
+NATSail continues to own connection, authentication, ordered-consumer recovery, and checkpoints. The Effect adapter does not create a second connection or retry loop. The service exposes `runtime` and `sessions` for JetStream manager calls and other advanced nats.js or custom session operations without leaving the Layer-owned lifecycle.
 
 ## License
 

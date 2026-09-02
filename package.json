@@ -49,7 +49,7 @@
     "@types/node": "^24.10.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
-    "effect": "3.22.1",
+    "effect": "4.0.0-rc.112",
     "fake-indexeddb": "6.2.5",
     "jsdom": "^26.0.0",
     "nats-jwt": "0.0.9",
