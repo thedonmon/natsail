@@ -20,10 +20,10 @@ The ordered consumer continues from its processed checkpoint. The transcript dis
 
 - `defineReducingJetStreamSession()` owns the in-lease recovery cursor, bounded byte capacity, retry policy, and timeline reducer.
 - Initial retained delivery is reduced privately and published as one atomic live timeline after `caughtUp` resolves.
-- `observeNatsJetStreamReducer()` adapts the validated definition without a custom source controller.
-- Two independent RxJS projections acquire the same definition. The registry contract guarantees that they share one keyed consumer.
+- `observeNatsJetStreamState()` adapts the validated definition, removes duplicate lifecycle notifications, and frame-coalesces cumulative live state without a custom source controller.
+- One shared state Observable feeds two independent RxJS projections from one keyed consumer and session reference.
 - The reduced state preserves the complete multi-room timeline, room projection, replay range, and global stream cursors.
-- `shareReplay()` gives the React external store the latest combined view.
+- `shareReplay()` gives both projections and the React external store the latest frame-batched view.
 - The ordered consumer survives a forced transport reconnect and continues receiving through the same reduced session afterward.
 - Package diagnostics expose active session references and consumer restart counts.
 - A normal message publish returns through the same Observable before the chat displays it.

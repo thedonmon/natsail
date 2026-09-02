@@ -4,6 +4,7 @@ import type { NatsRuntime, NatsRuntimeEvent, SubscriptionLease } from '@natsail/
 import {
   observeNatsCoreSubscription,
   observeNatsJetStreamReducer,
+  observeNatsJetStreamState,
   observeNatsRuntimeEvents,
   observeNatsRuntimeStatus,
   observeNatsSession,
@@ -187,6 +188,238 @@ describe('RxJS session adapter', () => {
 
     subscription.unsubscribe()
     await registry.close()
+  })
+
+  it('emits each reduced JetStream value once without session lifecycle duplicates', async () => {
+    const registry = createSessionRegistry()
+    const controlled = controllableSource<JetStreamStateSnapshot<string[]>>()
+    const definition = defineSession({
+      key: 'conversation:rxjs-state-values',
+      contract: 'conversation:v1',
+      source: controlled.source,
+    })
+    const states: Array<JetStreamStateSnapshot<string[]>> = []
+    let completions = 0
+    observeNatsJetStreamState(registry, definition, { liveBatchMs: 0 }).subscribe({
+      next: (state) => states.push(state),
+      complete: () => {
+        completions += 1
+      },
+    })
+    await Promise.resolve()
+
+    await controlled.deliver({
+      phase: 'replaying',
+      data: [],
+      restarts: 0,
+      replay: { delivered: 0, remaining: 2 },
+    })
+    await controlled.deliver({
+      phase: 'live',
+      data: ['one', 'two'],
+      restarts: 0,
+      replay: { delivered: 2, remaining: 0 },
+    })
+    await controlled.close()
+    await vi.waitFor(() => expect(completions).toBe(1))
+
+    expect(states.map(({ phase, data }) => ({ phase, data }))).toEqual([
+      { phase: 'replaying', data: [] },
+      { phase: 'live', data: ['one', 'two'] },
+    ])
+    await registry.close()
+  })
+
+  it('emits hydration immediately and coalesces cumulative live state to one render window', async () => {
+    vi.useFakeTimers()
+    try {
+      const registry = createSessionRegistry()
+      const controlled = controllableSource<JetStreamStateSnapshot<number>>()
+      const definition = defineSession({
+        key: 'conversation:rxjs-state-batches',
+        contract: 'conversation:v1',
+        source: controlled.source,
+      })
+      const states: Array<JetStreamStateSnapshot<number>> = []
+      let completions = 0
+      observeNatsJetStreamState(registry, definition, { liveBatchMs: 16 }).subscribe({
+        next: (state) => states.push(state),
+        complete: () => {
+          completions += 1
+        },
+      })
+      await Promise.resolve()
+
+      await controlled.deliver({
+        phase: 'replaying',
+        data: 0,
+        restarts: 0,
+        replay: { delivered: 0, remaining: 3 },
+      })
+      await controlled.deliver({
+        phase: 'live',
+        data: 3,
+        restarts: 0,
+        replay: { delivered: 3, remaining: 0 },
+      })
+      await controlled.deliver({
+        phase: 'live',
+        data: 4,
+        restarts: 0,
+        replay: { delivered: 3, remaining: 0 },
+      })
+      await controlled.deliver({
+        phase: 'live',
+        data: 5,
+        restarts: 0,
+        replay: { delivered: 3, remaining: 0 },
+      })
+
+      expect(states.map(({ phase, data }) => ({ phase, data }))).toEqual([
+        { phase: 'replaying', data: 0 },
+        { phase: 'live', data: 3 },
+      ])
+      await vi.advanceTimersByTimeAsync(15)
+      expect(states.at(-1)?.data).toBe(3)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(states.at(-1)?.data).toBe(5)
+
+      await controlled.deliver({
+        phase: 'live',
+        data: 6,
+        restarts: 0,
+        replay: { delivered: 3, remaining: 0 },
+      })
+      await controlled.close()
+      await Promise.resolve()
+
+      expect(states.at(-1)?.data).toBe(6)
+      expect(completions).toBe(1)
+      await registry.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('flushes pending live state before an immediate reconnect phase', async () => {
+    vi.useFakeTimers()
+    try {
+      const registry = createSessionRegistry()
+      const controlled = controllableSource<JetStreamStateSnapshot<number>>()
+      const definition = defineSession({
+        key: 'conversation:rxjs-state-reconnect',
+        contract: 'conversation:v1',
+        source: controlled.source,
+      })
+      const states: Array<{ phase: string; data: number }> = []
+      const subscription = observeNatsJetStreamState(registry, definition, {
+        liveBatchMs: 16,
+      }).subscribe((state) => states.push({ phase: state.phase, data: state.data }))
+      await Promise.resolve()
+
+      await controlled.deliver({
+        phase: 'live',
+        data: 1,
+        restarts: 0,
+        replay: { delivered: 1, remaining: 0 },
+      })
+      await controlled.deliver({
+        phase: 'live',
+        data: 2,
+        restarts: 0,
+        replay: { delivered: 1, remaining: 0 },
+      })
+      await controlled.deliver({
+        phase: 'reconnecting',
+        data: 2,
+        restarts: 1,
+        replay: { delivered: 1 },
+      })
+      await controlled.deliver({
+        phase: 'live',
+        data: 3,
+        restarts: 1,
+        replay: { delivered: 1, remaining: 0 },
+      })
+
+      expect(states).toEqual([
+        { phase: 'live', data: 1 },
+        { phase: 'live', data: 2 },
+        { phase: 'reconnecting', data: 2 },
+        { phase: 'live', data: 3 },
+      ])
+      subscription.unsubscribe()
+      await Promise.resolve()
+      expect(controlled.close).toHaveBeenCalledOnce()
+      await registry.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('turns a large cumulative live burst into one presentation update', async () => {
+    vi.useFakeTimers()
+    try {
+      const registry = createSessionRegistry()
+      const controlled = controllableSource<JetStreamStateSnapshot<number>>()
+      const definition = defineSession({
+        key: 'conversation:rxjs-state-burst',
+        contract: 'conversation:v1',
+        source: controlled.source,
+      })
+      const rendered: number[] = []
+      const subscription = observeNatsJetStreamState(registry, definition, {
+        liveBatchMs: 16,
+      }).subscribe((state) => rendered.push(state.data))
+      await Promise.resolve()
+
+      await controlled.deliver({
+        phase: 'replaying',
+        data: 0,
+        restarts: 0,
+        replay: { delivered: 0, remaining: 217 },
+      })
+      await controlled.deliver({
+        phase: 'live',
+        data: 217,
+        restarts: 0,
+        replay: { delivered: 217, remaining: 0 },
+      })
+      for (let data = 218; data <= 434; data += 1) {
+        await controlled.deliver({
+          phase: 'live',
+          data,
+          restarts: 0,
+          replay: { delivered: 217, remaining: 0 },
+        })
+      }
+
+      expect(rendered).toEqual([0, 217])
+      await vi.advanceTimersByTimeAsync(16)
+      expect(rendered).toEqual([0, 217, 434])
+
+      subscription.unsubscribe()
+      await registry.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('rejects invalid live state batch windows', () => {
+    const registry = createSessionRegistry()
+    const controlled = controllableSource<JetStreamStateSnapshot<number>>()
+    const definition = defineSession({
+      key: 'conversation:rxjs-state-invalid',
+      contract: 'conversation:v1',
+      source: controlled.source,
+    })
+
+    expect(() => observeNatsJetStreamState(registry, definition, { liveBatchMs: -1 })).toThrow(
+      'liveBatchMs'
+    )
+    expect(() =>
+      observeNatsJetStreamState(registry, definition, { liveBatchMs: Number.NaN })
+    ).toThrow('liveBatchMs')
   })
 
   it('converts runtime events to a cancellable Observable and distinct status stream', async () => {

@@ -64,7 +64,7 @@ try {
   await expect(page.locator('[data-source-starts]')).toHaveAttribute('data-source-starts', '1')
   await page.getByText('How this example is wired').click()
   await expect(page.locator('.architecture-details p')).toContainText(
-    'Two validated RxJS projections'
+    'One frame-coalesced RxJS state stream'
   )
 
   const body = `RxJS round trip ${crypto.randomUUID().slice(0, 8)}`
@@ -96,7 +96,7 @@ try {
         verdict: 'passed',
         proven: [
           'one atomic package reducer publishes the complete multi-room JetStream timeline after replay',
-          'two validated RxJS projections share one NATSail session definition and consumer',
+          'one frame-coalesced cumulative state Observable feeds two projections without duplicate session lifecycle notifications',
           'a publish returns through the shared Observable with its global stream cursor',
           'three messages published after a forced transport reconnect reach the same reduced state',
           'the React view observes RxJS state without opening another NATS subscription',

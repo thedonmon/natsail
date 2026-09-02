@@ -1,7 +1,9 @@
 import { useMemo, useState, useSyncExternalStore } from 'react'
 import {
+  catchError,
   combineLatest,
   distinctUntilChanged,
+  EMPTY,
   map,
   shareReplay,
   startWith,
@@ -21,7 +23,7 @@ import {
 } from '@natsail/example-chat-ui'
 import type { JetStreamStateSnapshot } from '@natsail/jetstream'
 import {
-  observeNatsJetStreamReducer,
+  observeNatsJetStreamState,
   observeNatsRuntimeStatus,
   observeNatsSessionEvents,
 } from '@natsail/rxjs'
@@ -55,12 +57,19 @@ const readIdentity = (): { author: string; clientId: string } => {
 const identity = readIdentity()
 const feed = new ChatFeed(runtime)
 
-const feedSnapshot$ = observeNatsJetStreamReducer(sessions, feed.definition).pipe(
-  tap((session) => feed.follow(session.value, session.error))
+const feedSnapshot$ = observeNatsJetStreamState(sessions, feed.definition, {
+  liveBatchMs: 16,
+}).pipe(
+  tap((snapshot) => feed.follow(snapshot)),
+  catchError((error) => {
+    feed.follow(undefined, error)
+    return EMPTY
+  }),
+  shareReplay({ bufferSize: 1, refCount: true })
 )
 
-const observedRoomCount$ = observeNatsJetStreamReducer(sessions, feed.definition).pipe(
-  map((session) => session.value?.data.roomIds.length ?? 0),
+const observedRoomCount$ = feedSnapshot$.pipe(
+  map((snapshot) => snapshot.data.roomIds.length),
   distinctUntilChanged()
 )
 
@@ -86,9 +95,9 @@ const view$ = combineLatest([
   registryInspection$,
 ]).pipe(
   map(
-    ([session, observedRoomCount, feedState, runtimeStatus, inspection]): ChatView => ({
-      entries: [...(session.value?.data.entries ?? [])],
-      ...(session.value === undefined ? {} : { snapshot: session.value }),
+    ([snapshot, observedRoomCount, feedState, runtimeStatus, inspection]): ChatView => ({
+      entries: [...snapshot.data.entries],
+      snapshot,
       observedRoomCount,
       sessionReferences: inspection.sessions[0]?.references ?? 0,
       feedState,
@@ -189,8 +198,8 @@ export function App() {
       clientId={identity.clientId}
       author={identity.author}
       applicationSubtitle="RXJS JETSTREAM CHAT"
-      architectureDescription={`Two validated RxJS projections (${view.observedRoomCount} rooms observed, ${view.sessionReferences} active references) share one atomic reducer session and ordered JetStream consumer.`}
-      topologyLabel="ATOMIC REPLAY · TWO PROJECTIONS · ONE CONSUMER"
+      architectureDescription={`One frame-coalesced RxJS state stream feeds two projections (${view.observedRoomCount} rooms observed, ${view.sessionReferences} active reference) from one atomic reducer session and ordered JetStream consumer.`}
+      topologyLabel="ATOMIC REPLAY · FRAME-BATCHED LIVE STATE · ONE CONSUMER"
       upstreamLabel="JetStream"
       sourceStarts={1 + (view.snapshot?.restarts ?? 0)}
       connectionAction={{
