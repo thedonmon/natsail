@@ -16,7 +16,6 @@ import {
   ChevronsUpIcon,
   ExternalLinkIcon,
   GaugeIcon,
-  LoaderCircleIcon,
   MessageSquareTextIcon,
   PanelRightCloseIcon,
   PanelRightOpenIcon,
@@ -28,9 +27,34 @@ import {
 } from 'lucide-react'
 
 import { Avatar, AvatarFallback } from '#components/ui/avatar'
+import { Alert, AlertAction, AlertDescription, AlertTitle } from '#components/ui/alert'
 import { Badge } from '#components/ui/badge'
+import { Bubble, BubbleContent } from '#components/ui/bubble'
 import { Button } from '#components/ui/button'
-import { Input } from '#components/ui/input'
+import {
+  Empty,
+  EmptyContent,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyMedia,
+  EmptyTitle,
+} from '#components/ui/empty'
+import {
+  InputGroup,
+  InputGroupAddon,
+  InputGroupButton,
+  InputGroupText,
+  InputGroupTextarea,
+  InputGroupInput,
+} from '#components/ui/input-group'
+import { Marker, MarkerContent } from '#components/ui/marker'
+import {
+  Message,
+  MessageAvatar,
+  MessageContent,
+  MessageFooter,
+  MessageHeader,
+} from '#components/ui/message'
 import {
   MessageScroller,
   MessageScrollerButton,
@@ -39,6 +63,8 @@ import {
   MessageScrollerProvider,
   MessageScrollerViewport,
 } from '#components/ui/message-scroller'
+import { Spinner } from '#components/ui/spinner'
+import { ToggleGroup, ToggleGroupItem } from '#components/ui/toggle-group'
 import type {
   DemoAdapter,
   DemoChatEntry,
@@ -63,6 +89,7 @@ export interface PerformanceChatProps {
   readonly onConversationChange: (conversationId: string) => void
   readonly onSend: (body: string) => Promise<void>
   readonly onBusyBurst: (count: number) => Promise<void>
+  readonly onRoomUpdate: () => Promise<void>
   readonly onDismissNotice: () => void
   readonly onReactCommit: (revision: number, duration?: number) => void
 }
@@ -149,19 +176,40 @@ function ConversationList({
           <span>Conversation lab</span>
         </div>
       </div>
-      <label className="chat-search">
-        <SearchIcon aria-hidden="true" />
-        <Input
-          value={query}
-          placeholder="Search conversations"
-          onChange={(event) => setQuery(event.target.value)}
-        />
-      </label>
+      <div className="chat-search">
+        <InputGroup>
+          <InputGroupAddon>
+            <SearchIcon aria-hidden="true" />
+          </InputGroupAddon>
+          <InputGroupInput
+            aria-label="Search conversations"
+            value={query}
+            placeholder="Search conversations"
+            onChange={(event) => setQuery(event.target.value)}
+          />
+        </InputGroup>
+      </div>
       <div className="chat-inbox__label">
         <span>Recent</span>
         <Badge variant="outline">{conversations.length}</Badge>
       </div>
       <nav className="conversation-list">
+        {visible.length === 0 ? (
+          <Empty className="conversation-list__empty">
+            <EmptyHeader>
+              <EmptyMedia variant="icon">
+                <SearchIcon />
+              </EmptyMedia>
+              <EmptyTitle>No conversations found</EmptyTitle>
+              <EmptyDescription>Try another title or clear the search.</EmptyDescription>
+            </EmptyHeader>
+            <EmptyContent>
+              <Button type="button" variant="ghost" size="sm" onClick={() => setQuery('')}>
+                Clear search
+              </Button>
+            </EmptyContent>
+          </Empty>
+        ) : null}
         {visible.map((conversation) => {
           const state = activity[conversation.id]
           const selected = conversation.id === activeConversationId
@@ -171,6 +219,7 @@ function ConversationList({
               type="button"
               className="conversation-card"
               data-selected={selected || undefined}
+              aria-current={selected ? 'page' : undefined}
               onClick={() => {
                 startTransition(() => onConversationChange(conversation.id))
               }}
@@ -187,8 +236,8 @@ function ConversationList({
                   {state?.preview ?? conversation.summary}
                 </span>
                 <span className="conversation-card__meta">
-                  {conversation.seededMessages} message history
-                  {state?.unread ? <b>{state.unread} new</b> : null}
+                  {conversation.seededMessages.toLocaleString()} message history
+                  {state?.unread ? <Badge>{state.unread} new</Badge> : null}
                 </span>
               </span>
             </button>
@@ -203,7 +252,9 @@ function ConversationList({
           <strong>You</strong>
           <span>Demo workspace</span>
         </div>
-        <WifiIcon aria-label="Connected" />
+        <Badge variant="outline" className="chat-inbox__connection">
+          <WifiIcon aria-hidden="true" /> Connected
+        </Badge>
       </div>
     </aside>
   )
@@ -211,18 +262,20 @@ function ConversationList({
 
 function LoadingTranscript({ conversation }: { conversation: DemoConversation }) {
   return (
-    <div className="chat-loading" role="status" aria-live="polite">
-      <div className="chat-loading__pulse">
-        <LoaderCircleIcon aria-hidden="true" />
-      </div>
-      <strong>Loading {conversation.seededMessages} messages</strong>
-      <span>Replaying {conversation.title} into one complete view…</span>
-      <div className="chat-loading__lines" aria-hidden="true">
-        <i />
-        <i />
-        <i />
-      </div>
-    </div>
+    <Empty className="chat-loading" role="status" aria-live="polite">
+      <EmptyHeader>
+        <EmptyMedia variant="icon">
+          <Spinner />
+        </EmptyMedia>
+        <EmptyTitle>Loading {conversation.seededMessages.toLocaleString()} messages</EmptyTitle>
+        <EmptyDescription>
+          {conversation.title} appears after its retained history reaches the live boundary.
+        </EmptyDescription>
+      </EmptyHeader>
+      <EmptyContent>
+        <Badge variant="outline">Atomic JetStream replay</Badge>
+      </EmptyContent>
+    </Empty>
   )
 }
 
@@ -238,9 +291,11 @@ const Transcript = memo(function Transcript({
       <MessageScroller className="product-transcript">
         <MessageScrollerViewport>
           <MessageScrollerContent className="product-transcript__content">
-            <div className="conversation-date">
-              <span>Conversation history</span>
-            </div>
+            <MessageScrollerItem messageId="conversation-history-marker">
+              <Marker variant="separator" className="conversation-date">
+                <MarkerContent>Conversation history</MarkerContent>
+              </Marker>
+            </MessageScrollerItem>
             {entries.map((entry, index) => {
               const user = entry.message.role === 'user'
               const followsSameRole = entries[index - 1]?.message.role === entry.message.role
@@ -249,27 +304,43 @@ const Transcript = memo(function Transcript({
                   key={entry.message.id}
                   messageId={entry.message.id}
                   scrollAnchor={entry.message.clientId === clientId}
-                  className="product-message"
-                  data-role={entry.message.role}
+                  className="product-message-item"
                   data-continued={followsSameRole || undefined}
                 >
-                  {!followsSameRole ? (
-                    <Avatar className="product-message__avatar">
-                      <AvatarFallback>{user ? 'YO' : 'AI'}</AvatarFallback>
-                    </Avatar>
-                  ) : (
-                    <span className="product-message__avatar-spacer" />
-                  )}
-                  <div className="product-message__body">
-                    {!followsSameRole ? (
-                      <header>
-                        <strong>{user ? 'You' : entry.message.author}</strong>
-                        <time>{messageTime(entry.message.sentAt)}</time>
-                      </header>
-                    ) : null}
-                    <p>{entry.message.body}</p>
-                    <span className="product-message__cursor">#{entry.cursor}</span>
-                  </div>
+                  <Message
+                    className="product-message"
+                    align={user ? 'end' : 'start'}
+                    data-role={entry.message.role}
+                  >
+                    <MessageAvatar
+                      className="product-message__avatar"
+                      data-empty={followsSameRole || undefined}
+                      aria-hidden={followsSameRole || undefined}
+                    >
+                      {followsSameRole ? null : (
+                        <Avatar>
+                          <AvatarFallback>{user ? 'YO' : 'AI'}</AvatarFallback>
+                        </Avatar>
+                      )}
+                    </MessageAvatar>
+                    <MessageContent className="product-message__body">
+                      {!followsSameRole ? (
+                        <MessageHeader>
+                          <strong>{user ? 'You' : entry.message.author}</strong>
+                          <time>{messageTime(entry.message.sentAt)}</time>
+                        </MessageHeader>
+                      ) : null}
+                      <Bubble
+                        variant={user ? 'tinted' : 'secondary'}
+                        align={user ? 'end' : 'start'}
+                      >
+                        <BubbleContent>{entry.message.body}</BubbleContent>
+                      </Bubble>
+                      <MessageFooter>
+                        <span className="product-message__cursor">stream #{entry.cursor}</span>
+                      </MessageFooter>
+                    </MessageContent>
+                  </Message>
                 </MessageScrollerItem>
               )
             })}
@@ -309,30 +380,37 @@ function Composer({
   }
 
   return (
-    <form className="product-composer" onSubmit={(event) => void submit(event)}>
-      <textarea
-        value={body}
-        rows={2}
-        maxLength={1_200}
-        disabled={disabled}
-        placeholder={`Message ${conversation.assistant}…`}
-        onChange={(event) => setBody(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key === 'Enter' && !event.shiftKey) {
-            event.preventDefault()
-            event.currentTarget.form?.requestSubmit()
-          }
-        }}
-      />
-      <footer>
-        <span>
-          <SparklesIcon aria-hidden="true" /> Assistant replies are published through NATS
-        </span>
-        <Button type="submit" size="icon" disabled={disabled || sending || !body.trim()}>
-          {sending ? <LoaderCircleIcon className="spin" /> : <SendIcon />}
-          <span className="sr-only">Send message</span>
-        </Button>
-      </footer>
+    <form className="product-composer-form" onSubmit={(event) => void submit(event)}>
+      <InputGroup className="product-composer">
+        <InputGroupTextarea
+          value={body}
+          rows={2}
+          maxLength={1_200}
+          disabled={disabled}
+          placeholder={`Message ${conversation.assistant}…`}
+          onChange={(event) => setBody(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' && !event.shiftKey) {
+              event.preventDefault()
+              event.currentTarget.form?.requestSubmit()
+            }
+          }}
+        />
+        <InputGroupAddon align="block-end" className="product-composer__footer">
+          <InputGroupText>
+            <SparklesIcon aria-hidden="true" /> Replies travel through NATS
+          </InputGroupText>
+          <InputGroupButton
+            type="submit"
+            variant="default"
+            size="icon-sm"
+            aria-label="Send message"
+            disabled={disabled || sending || !body.trim()}
+          >
+            {sending ? <Spinner /> : <SendIcon />}
+          </InputGroupButton>
+        </InputGroupAddon>
+      </InputGroup>
     </form>
   )
 }
@@ -342,77 +420,159 @@ function PerformancePanel({
   metrics,
   phase,
   onBusyBurst,
-}: Pick<PerformanceChatProps, 'adapter' | 'metrics' | 'onBusyBurst' | 'phase'>) {
+  onRoomUpdate,
+  onClose,
+}: Pick<PerformanceChatProps, 'adapter' | 'metrics' | 'onBusyBurst' | 'onRoomUpdate' | 'phase'> & {
+  onClose: () => void
+}) {
   const [running, setRunning] = useState(false)
+  const [notifying, setNotifying] = useState(false)
   const [burstSize, setBurstSize] = useState(40)
-  const values = [
-    ['History events', metrics.historyEvents],
-    [
-      'Adapter ready',
-      metrics.historyReadyMs === undefined ? '—' : `${metrics.historyReadyMs.toFixed(1)} ms`,
-    ],
-    [
-      'React rendered',
-      metrics.historyRenderedMs === undefined ? '—' : `${metrics.historyRenderedMs.toFixed(1)} ms`,
-    ],
-    ['State updates', metrics.stateUpdates],
-    ['React commits', metrics.reactCommits],
-    ['Last UI batch', metrics.lastBatchSize],
-    ['Largest live batch', metrics.largestBatchSize],
-    [
-      'Last commit',
-      metrics.lastCommitMs === undefined ? '—' : `${metrics.lastCommitMs.toFixed(1)} ms`,
-    ],
-    [
-      'Largest commit',
-      metrics.largestCommitMs === undefined ? '—' : `${metrics.largestCommitMs.toFixed(1)} ms`,
-    ],
+  const groups = [
+    {
+      label: 'Replay',
+      values: [
+        ['History events', metrics.historyEvents],
+        [
+          'Adapter ready',
+          metrics.historyReadyMs === undefined ? '—' : `${metrics.historyReadyMs.toFixed(1)} ms`,
+        ],
+        [
+          'React rendered',
+          metrics.historyRenderedMs === undefined
+            ? '—'
+            : `${metrics.historyRenderedMs.toFixed(1)} ms`,
+        ],
+      ],
+    },
+    {
+      label: 'Presentation',
+      values: [
+        ['State updates', metrics.stateUpdates],
+        ['React commits', metrics.reactCommits],
+        ['Last UI batch', metrics.lastBatchSize],
+        ['Largest live batch', metrics.largestBatchSize],
+        [
+          'Last commit',
+          metrics.lastCommitMs === undefined ? '—' : `${metrics.lastCommitMs.toFixed(1)} ms`,
+        ],
+        [
+          'Largest commit',
+          metrics.largestCommitMs === undefined ? '—' : `${metrics.largestCommitMs.toFixed(1)} ms`,
+        ],
+      ],
+    },
   ] as const
 
   return (
     <aside className="performance-panel" aria-labelledby="performance-title">
       <div className="performance-panel__heading">
         <div>
-          <span>LIVE MEASUREMENTS</span>
-          <h2 id="performance-title">{adapter === 'effect' ? 'Effect' : 'RxJS'} pipeline</h2>
+          <Badge variant="secondary">{adapter === 'effect' ? 'Effect' : 'RxJS'}</Badge>
+          <h2 id="performance-title">Stream inspector</h2>
         </div>
-        <GaugeIcon aria-hidden="true" />
+        <div className="performance-panel__heading-actions">
+          <GaugeIcon aria-hidden="true" />
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            className="performance-panel__close"
+            aria-label="Close performance panel"
+            onClick={onClose}
+          >
+            <XIcon />
+          </Button>
+        </div>
       </div>
       <p>
-        These counters measure the same replay, live burst, and React surface in both examples.
-        Exact commit duration requires a React development or profiling build.
+        One path from retained history to the React surface. Exact commit duration requires a
+        development or profiling build.
       </p>
-      <dl>
-        {values.map(([label, value]) => (
-          <div key={label}>
-            <dt>{label}</dt>
-            <dd className="tabular-nums" data-metric={label.toLowerCase().replaceAll(' ', '-')}>
-              {value}
-            </dd>
-          </div>
-        ))}
-      </dl>
-      <div className="performance-panel__callout">
-        <ActivityIcon aria-hidden="true" />
-        <div>
-          <strong>Busy-room scenario</strong>
-          <span>Publish a bounded set of compact assistant updates as one live burst.</span>
-        </div>
+      <div className="stream-tape" aria-label="Replay to render path">
+        <span data-kind="replay">
+          <i />
+          Replay
+        </span>
+        <b aria-hidden="true">→</b>
+        <span data-kind="adapter">
+          <i />
+          {adapter === 'effect' ? 'Effect' : 'RxJS'}
+        </span>
+        <b aria-hidden="true">→</b>
+        <span data-kind="react">
+          <i />
+          React
+        </span>
       </div>
-      <div className="performance-panel__burst-options" aria-label="Live burst size">
+      <div className="performance-panel__metrics">
+        {groups.map((group) => (
+          <section key={group.label}>
+            <h3>{group.label}</h3>
+            <dl>
+              {group.values.map(([label, value]) => (
+                <div key={label}>
+                  <dt>{label}</dt>
+                  <dd
+                    className="tabular-nums"
+                    data-metric={label.toLowerCase().replaceAll(' ', '-')}
+                  >
+                    {value}
+                  </dd>
+                </div>
+              ))}
+            </dl>
+          </section>
+        ))}
+      </div>
+      <Alert className="performance-panel__notification-test">
+        <BellIcon aria-hidden="true" />
+        <AlertTitle>Room notification</AlertTitle>
+        <AlertDescription>
+          Publish one real NATS update to an inactive room. Its banner stays until dismissed.
+        </AlertDescription>
+      </Alert>
+      <Button
+        type="button"
+        variant="outline"
+        disabled={phase !== 'live' || notifying}
+        onClick={() => {
+          setNotifying(true)
+          void onRoomUpdate().finally(() => setNotifying(false))
+        }}
+      >
+        <BellIcon data-icon="inline-start" />
+        {notifying ? 'Publishing room update…' : 'Trigger room notification'}
+      </Button>
+      <Alert className="performance-panel__callout">
+        <ActivityIcon aria-hidden="true" />
+        <AlertTitle>Busy-room scenario</AlertTitle>
+        <AlertDescription>
+          Publish compact assistant updates as one bounded live burst.
+        </AlertDescription>
+      </Alert>
+      <ToggleGroup
+        className="performance-panel__burst-options"
+        aria-label="Live burst size"
+        value={[String(burstSize)]}
+        variant="outline"
+        size="sm"
+        spacing={0}
+        onValueChange={(values) => {
+          const value = Number(values.at(-1))
+          if (value === 40 || value === 250 || value === 1_000) setBurstSize(value)
+        }}
+      >
         {[40, 250, 1_000].map((count) => (
-          <Button
+          <ToggleGroupItem
             key={count}
-            type="button"
-            size="xs"
-            variant={burstSize === count ? 'secondary' : 'ghost'}
-            aria-pressed={burstSize === count}
-            onClick={() => setBurstSize(count)}
+            value={String(count)}
+            aria-label={`${count.toLocaleString()} updates`}
           >
             {count.toLocaleString()}
-          </Button>
+          </ToggleGroupItem>
         ))}
-      </div>
+      </ToggleGroup>
       <Button
         type="button"
         variant="outline"
@@ -425,17 +585,6 @@ function PerformancePanel({
         <ChevronsUpIcon data-icon="inline-start" />
         {running ? `Publishing ${burstSize.toLocaleString()} updates…` : 'Simulate busy room'}
       </Button>
-      <div className="performance-panel__legend">
-        <span>
-          <i data-kind="replay" /> Atomic history
-        </span>
-        <span>
-          <i data-kind="live" /> Frame-batched live state
-        </span>
-        <span>
-          <i data-kind="react" /> React commit boundary
-        </span>
-      </div>
     </aside>
   )
 }
@@ -459,7 +608,12 @@ export function PerformanceChat(props: PerformanceChatProps) {
   }, [props.onReactCommit, props.revision])
 
   return (
-    <main className="chat-lab" data-example-mode={props.adapter} data-chat-phase={props.phase}>
+    <main
+      className="chat-lab"
+      data-example-mode={props.adapter}
+      data-chat-phase={props.phase}
+      data-metrics={showMetrics ? 'open' : 'closed'}
+    >
       <ConversationList
         conversations={props.conversations}
         activeConversationId={props.activeConversationId}
@@ -477,12 +631,16 @@ export function PerformanceChat(props: PerformanceChatProps) {
               <span>
                 {props.phase === 'live' ? (
                   <CheckIcon aria-hidden="true" />
+                ) : props.phase === 'error' ? (
+                  <XIcon aria-hidden="true" />
                 ) : (
-                  <LoaderCircleIcon className="spin" />
+                  <Spinner />
                 )}
                 {props.phase === 'live'
                   ? `${conversation.assistant} · caught up`
-                  : 'Reassembling history'}
+                  : props.phase === 'error'
+                    ? 'Stream unavailable'
+                    : 'Reassembling history'}
               </span>
             </div>
           </div>
@@ -512,32 +670,32 @@ export function PerformanceChat(props: PerformanceChatProps) {
         </header>
 
         {props.notice ? (
-          <div className="update-notice" role="status">
+          <Alert className="update-notice" role="status">
             <BellIcon aria-hidden="true" />
-            <div>
-              <strong>{props.notice.title}</strong>
-              <span>{props.notice.body}</span>
-            </div>
-            {props.notice.conversationId !== props.activeConversationId ? (
+            <AlertTitle>{props.notice.title}</AlertTitle>
+            <AlertDescription>{props.notice.body}</AlertDescription>
+            <AlertAction>
+              {props.notice.conversationId !== props.activeConversationId ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => props.onConversationChange(props.notice!.conversationId)}
+                >
+                  View
+                </Button>
+              ) : null}
               <Button
                 type="button"
                 variant="ghost"
-                size="sm"
-                onClick={() => props.onConversationChange(props.notice!.conversationId)}
+                size="icon-sm"
+                aria-label="Dismiss update"
+                onClick={props.onDismissNotice}
               >
-                View
+                <XIcon />
               </Button>
-            ) : null}
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-sm"
-              aria-label="Dismiss update"
-              onClick={props.onDismissNotice}
-            >
-              <XIcon />
-            </Button>
-          </div>
+            </AlertAction>
+          </Alert>
         ) : null}
 
         <Profiler
@@ -551,8 +709,12 @@ export function PerformanceChat(props: PerformanceChatProps) {
               <LoadingTranscript conversation={conversation} />
             ) : props.phase === 'error' ? (
               <div className="chat-error">
-                <strong>This conversation could not be loaded.</strong>
-                <span>Check the local NATS fixture and reload the example.</span>
+                <Alert variant="destructive">
+                  <AlertTitle>This conversation could not be loaded.</AlertTitle>
+                  <AlertDescription>
+                    Check the local NATS fixture, then reload the example.
+                  </AlertDescription>
+                </Alert>
               </div>
             ) : (
               <Transcript entries={props.entries} clientId={props.clientId} />
@@ -571,6 +733,8 @@ export function PerformanceChat(props: PerformanceChatProps) {
           metrics={props.metrics}
           phase={props.phase}
           onBusyBurst={props.onBusyBurst}
+          onRoomUpdate={props.onRoomUpdate}
+          onClose={() => setShowMetrics(false)}
         />
       ) : null}
     </main>

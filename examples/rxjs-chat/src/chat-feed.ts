@@ -231,6 +231,22 @@ export class RxjsChatController {
     )
   }
 
+  roomUpdate = async (): Promise<void> => {
+    const conversation = demoConversations.find(
+      (candidate) => candidate.id !== this.state.activeConversationId
+    )!
+    const message: DemoChatMessage = {
+      id: `rxjs-room-update-${crypto.randomUUID()}`,
+      conversationId: conversation.id,
+      role: 'assistant',
+      author: conversation.assistant,
+      body: 'A new room update arrived through the shared NATS subscription.',
+      sentAt: new Date().toISOString(),
+      clientId: 'rxjs-room-notification-test',
+    }
+    await this.runtime.publish(`${chatSubjectPrefix}.${conversation.id}`, chatCodec.encode(message))
+  }
+
   dismissNotice = (): void => this.patch({ notice: undefined })
 
   recordReactCommit = (revision: number, duration?: number): void => {

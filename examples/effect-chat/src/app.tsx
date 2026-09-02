@@ -31,6 +31,7 @@ export function App() {
       onConversationChange={controller.selectConversation}
       onSend={controller.send}
       onBusyBurst={controller.busyBurst}
+      onRoomUpdate={controller.roomUpdate}
       onDismissNotice={controller.dismissNotice}
       onReactCommit={controller.recordReactCommit}
     />

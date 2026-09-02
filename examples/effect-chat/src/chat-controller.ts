@@ -240,6 +240,24 @@ export class EffectChatController {
     await Effect.runPromise(Effect.all(effects, { concurrency: 'unbounded', discard: true }))
   }
 
+  roomUpdate = async (): Promise<void> => {
+    const conversation = demoConversations.find(
+      (candidate) => candidate.id !== this.state.activeConversationId
+    )!
+    const message: DemoChatMessage = {
+      id: `effect-room-update-${crypto.randomUUID()}`,
+      conversationId: conversation.id,
+      role: 'assistant',
+      author: conversation.assistant,
+      body: 'A new room update arrived through the shared NATS subscription.',
+      sentAt: new Date().toISOString(),
+      clientId: 'effect-room-notification-test',
+    }
+    await Effect.runPromise(
+      this.natsail.publish(`${chatSubjectPrefix}.${conversation.id}`, chatCodec.encode(message))
+    )
+  }
+
   dismissNotice = (): void => this.patch({ notice: undefined })
 
   recordReactCommit = (revision: number, duration?: number): void => {
