@@ -1,7 +1,7 @@
 {
   "name": "@natsail/effect",
   "version": "0.1.0",
-  "description": "Scoped Effect services and Streams for NATSail runtimes and shared sessions.",
+  "description": "Scoped Effect v4 Streams for Core NATS, JetStream, and shared sessions.",
   "keywords": [
     "nats",
     "effect",
@@ -35,7 +35,8 @@
   },
   "publishConfig": {
     "access": "public",
-    "registry": "https://registry.npmjs.org/"
+    "registry": "https://registry.npmjs.org/",
+    "tag": "next"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -43,9 +44,10 @@
   },
   "dependencies": {
     "@natsail/core": "workspace:^",
+    "@natsail/jetstream": "workspace:^",
     "@natsail/session": "workspace:^"
   },
   "peerDependencies": {
-    "effect": "^3.22.0"
+    "effect": "4.0.0-rc.112"
   }
 }
