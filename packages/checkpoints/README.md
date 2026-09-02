@@ -10,7 +10,7 @@ The memory store fits tests and session-only recovery. The IndexedDB store keeps
 
 A checkpoint can contain a logical source scope. The JetStream package derives this scope from normalized filters and an optional application version.
 
-See the [NATSail README](https://github.com/thedonmon/natsail#delivery-guarantees) for checkpoint semantics.
+See the [delivery model](https://github.com/thedonmon/natsail/blob/main/docs/DELIVERY.md) for checkpoint semantics.
 
 ## License
 
