@@ -1,4 +1,4 @@
-# RxJS chat example
+# RxJS chat lab
 
 > REPOSITORY EXAMPLE — included in the public repository. It is not published as an npm package.
 
@@ -8,31 +8,13 @@
 pnpm example:rxjs-chat
 ```
 
-Open <http://127.0.0.1:4177>. The app loads five retained messages from `NATSAIL_RXJS_CHAT` and displays their global stream cursors.
+Open <http://127.0.0.1:4177>. The default conversation reconstructs 240 retained user and assistant messages through a reducing JetStream session and `observeNatsJetStreamState()`.
 
-Send a message in any room. The publish returns through the shared RxJS state session before the transcript displays it.
+Switch between 8, 48, 96, 240, 1,000, and 5,000-message conversations to compare replay and render cost. Initial history remains private until catch-up and appears as one complete transcript. Cumulative live state is frame-coalesced with a 16ms window.
 
-Select **Reconnect and publish 3** to force the runtime transport through a visible disconnect and then publish three messages through the recovered runtime.
+Open another tab and send a message. The inactive tab receives a Core NATS notification, marks the conversation unread, and reconstructs durable history when selected. Use **Simulate busy room** to publish 40, 250, or 1,000 compact live updates and inspect the adapter-ready, React-rendered, batch-size, and commit counters. Exact React commit duration is available in development or profiling builds.
 
-The ordered consumer continues from its processed checkpoint. The transcript displays all three messages without a second session or consumer.
-
-## What it proves
-
-- `defineReducingJetStreamSession()` owns the in-lease recovery cursor, bounded byte capacity, retry policy, and timeline reducer.
-- Initial retained delivery is reduced privately and published as one atomic live timeline after `caughtUp` resolves.
-- `observeNatsJetStreamState()` adapts the validated definition, removes duplicate lifecycle notifications, and frame-coalesces cumulative live state without a custom source controller.
-- One shared state Observable feeds two independent RxJS projections from one keyed consumer and session reference.
-- The reduced state preserves the complete multi-room timeline, room projection, replay range, and global stream cursors.
-- `shareReplay()` gives both projections and the React external store the latest frame-batched view.
-- The ordered consumer survives a forced transport reconnect and continues receiving through the same reduced session afterward.
-- Package diagnostics expose active session references and consumer restart counts.
-- A normal message publish returns through the same Observable before the chat displays it.
-
-## Current boundary
-
-The reducer still belongs to the application because it defines the domain view and retention policy. Consumer lifecycle, checkpoint recovery, replay-to-live handoff, and framework adaptation belong to NATSail.
-
-The React bridge is also local. A separate `@natsail/react-rxjs` package remains unnecessary until more applications repeat this external-store adapter.
+The UI and fixture scenario are identical to the Effect chat lab. Only the streaming adapter and stream name differ.
 
 ## Verify
 

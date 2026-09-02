@@ -64,7 +64,7 @@ See the [resumable-stream research](docs/research/nats-resumable-streams.md) and
 | Native AI SDK `ChatTransport` over Core and JetStream        | Example     |
 | Native TanStack AI adapter over Core and JetStream           | Example     |
 | Full-page AI reply recovery with persisted chat state        | Example     |
-| RxJS rooms with shared JetStream recovery                    | Example     |
+| RxJS and Effect conversation replay/render comparison        | Example     |
 | Public npm metadata and seven-package tarball installation   | Tested      |
 
 The integration tests use NATS 2.14.4. Separate fixtures cover anonymous, token, user/password, NKey, operator JWT, and TLS connections.
@@ -118,9 +118,9 @@ The [gateway chat example](examples/gateway-chat/README.md) exercises that path 
 
 The [direct React chat example](examples/react-chat/README.md) uses `NatsManagedProvider`, `useNatsRuntimeStatus()`, and `useNatsCoreSubscriptionReducer()` against the local NATS WebSocket. Both rooms applications use the repository [chat UI package](examples/chat-ui/README.md), which contains shadcn primitives.
 
-The [RxJS chat example](examples/rxjs-chat/README.md) loads one retained multi-room feed from JetStream. Two RxJS projections share the same keyed session source.
+The [RxJS](examples/rxjs-chat/README.md) and [Effect](examples/effect-chat/README.md) chat labs load identical conversation-scoped JetStream histories, including 1,000 and 5,000-message browser workloads. Conversation switching exercises true replay, a Core NATS side channel provides cross-tab update notices, and both surfaces report adapter-ready, React-rendered, batching, and commit measurements. Exact React commit duration appears when a development or profiling build exposes it.
 
-The recovery action forces a visible transport reconnect and then publishes three messages through the recovered runtime. Two validated Observable projections continue through the same atomic reducer session and ordered consumer.
+The RxJS app uses one reducing session and frame-coalesced cumulative state. The Effect app uses `materializeJetStream()` with bounded queues, replay-private reduction, 16ms live batches, and structured interruption when the selected conversation changes.
 
 The repository [AI chat example](examples/ai-transport/README.md) loads earlier messages from a JetStream conversation subject. Native AI SDK or TanStack AI events carry each new answer.
 
@@ -232,13 +232,14 @@ Open <http://127.0.0.1:4176> and send the suggested message. During the answer, 
 
 The optional **Transport details** panel changes frameworks, compares JetStream with Core NATS, configures duplicates, and injects a random stream message.
 
-Run the RxJS rooms example:
+Run the matching RxJS and Effect chat labs:
 
 ```sh
 pnpm example:rxjs-chat
+pnpm example:effect-chat
 ```
 
-Open <http://127.0.0.1:4177>. Send a message or select **Reconnect and publish 3** to run the transport-recovery scenario.
+Open <http://127.0.0.1:4177> for RxJS or <http://127.0.0.1:4178> for Effect. Both apps use the same 8, 48, 96, 240, 1,000, and 5,000-message conversations, live assistant responder, cross-tab notifications, selectable 40/250/1,000-message busy-room scenarios, and visible performance counters. RxJS uses a reducing shared session with frame-coalesced cumulative state; Effect uses native bounded materialization and structured cancellation.
 
 Each command starts the local NATS fixtures when necessary and stops only fixtures that it started. See the [examples index](examples/README.md) for the behavioral difference.
 

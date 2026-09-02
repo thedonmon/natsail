@@ -5,7 +5,7 @@ import { App, closeChatController } from './app'
 import { closeExampleRuntime } from './runtime'
 
 const root = document.getElementById('app')
-if (!root) throw new Error('Missing RxJS example application root')
+if (!root) throw new Error('Missing Effect example application root')
 
 window.addEventListener(
   'pagehide',
