@@ -46,7 +46,7 @@ Call `runtime.inspect()` to read the current connection generation, resource res
 
 `runtime.connection()` exposes the runtime-owned nats.js connection for operations without a managed NATSail seam. Consumers must not close or drain that connection.
 
-See the [NATSail README](https://github.com/thedonmon/natsail#core-nats-example) for an example and delivery guarantees.
+See the [Core NATS example](https://github.com/thedonmon/natsail#core-nats-example) and the [delivery model](https://github.com/thedonmon/natsail/blob/main/docs/DELIVERY.md).
 
 ## License
 
