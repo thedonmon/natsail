@@ -13,6 +13,8 @@ describe('JetStream processor option validation', () => {
     ['ack wait', { ackWaitMs: 0 }, 'ackWaitMs'],
     ['maximum deliveries', { maxDeliver: 0 }, 'maxDeliver'],
     ['maximum pending acknowledgements', { maxAckPending: 0 }, 'maxAckPending'],
+    ['recovery attempts', { recovery: { maxAttempts: 0 } }, 'recovery maxAttempts'],
+    ['recovery delay', { recovery: { delayMs: -1 } }, 'recovery delay'],
     ['message buffer', { maxBufferedMessages: 0 }, 'maxBufferedMessages'],
     ['byte buffer', { maxBufferedMessages: undefined, maxBufferedBytes: 0 }, 'maxBufferedBytes'],
   ] as const)('rejects an invalid %s before acquiring a connection', (_name, patch, message) => {

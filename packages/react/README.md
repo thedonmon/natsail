@@ -26,7 +26,7 @@ pnpm add react @natsail/core @natsail/session @natsail/jetstream @natsail/react
 
 `useNatsConnection()` follows the runtime-owned connection for advanced nats.js operations without adding an application connection effect.
 
-`useNatsJetStreamProcessor()` owns one explicit-ack processor lease. Pass `null` options to disable it without conditionally calling a hook; change the key when its consumer configuration changes.
+`useNatsJetStreamProcessor()` owns one explicit-ack processor lease. Pass `null` options to disable it without conditionally calling a hook; change the key when its consumer configuration changes. A replacement waits for the previous lease to close, so an owned consumer cannot be recreated while its prior lease is still deleting it. When processor recovery is enabled, the hook reports `reconnecting` and the restart count without requiring a React remount.
 
 See the [NATSail README](https://github.com/thedonmon/natsail#shared-session-adapters) for React examples.
 

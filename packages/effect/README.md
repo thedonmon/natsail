@@ -147,12 +147,13 @@ const worker = runJetStreamProcessor(
     start: 'all',
     codec: emailJobCodec,
     maxAckPending: 32,
+    recovery: { delayMs: 500 },
   },
   (delivery) => sendEmail(delivery.value)
 )
 ```
 
-The package waits for the handler Effect before the underlying processor acknowledges the message. Typed application failures remain typed Effect failures; connection, consumer-contract, and processor lifecycle failures use `NatsailJetStreamError`.
+The package waits for the handler Effect before the underlying processor acknowledges the message. Package-owned recovery reopens the named consumer after infrastructure failures while preserving its acknowledgement floor. Typed application failures remain terminal typed Effect failures; consumer-contract and final processor lifecycle failures use `NatsailJetStreamError`.
 
 ## Service and request/reply
 

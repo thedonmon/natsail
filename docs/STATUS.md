@@ -27,6 +27,7 @@ The test suite uses NATS 2.14.4. Separate fixtures cover anonymous, token, user/
 - Duplicate drop, deliver, and error policies
 - Retention-gap error and continue policies
 - Named explicit-ack processing with redelivery
+- Package-owned infrastructure recovery for named explicit-ack processors
 - Bound, retained, and lease-owned processor lifecycles
 - Message-count and byte-capacity pull limits
 
@@ -36,7 +37,7 @@ The test suite uses NATS 2.14.4. Separate fixtures cover anonymous, token, user/
 - Contract checks for shared logical sources
 - Memory and IndexedDB checkpoint stores
 - Strict-Mode-safe React runtime ownership
-- React selectors, reducers, status, and processor hooks
+- React selectors, reducers, status, and processor hooks, including processor restart state
 - Frame-coalesced React JetStream state
 - RxJS runtime, session, Core, and JetStream Observables
 - Frame-coalesced RxJS cumulative state
