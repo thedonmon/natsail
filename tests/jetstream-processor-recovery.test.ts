@@ -92,20 +92,29 @@ function messageSource(
   } as unknown as ConsumerMessages
 }
 
-function consumer(deliveries: readonly JsMsg[], closedError?: Error, stayOpen = false): Consumer {
+function consumer(
+  deliveries: readonly JsMsg[],
+  closedError?: Error,
+  stayOpen = false,
+  currentInfo?: ConsumerInfo
+): Consumer {
   const messages = messageSource(deliveries, closedError, stayOpen)
   return {
     consume: vi.fn(async () => messages),
     delete: vi.fn(async () => true),
-    info: vi.fn(async () => ({
-      config: {
-        ack_policy: AckPolicy.Explicit,
-        deliver_policy: DeliverPolicy.All,
-        durable_name: 'processor',
-        filter_subject: subject,
-        replay_policy: ReplayPolicy.Instant,
-      },
-    })),
+    info: vi.fn(async () =>
+      currentInfo === undefined
+        ? {
+            config: {
+              ack_policy: AckPolicy.Explicit,
+              deliver_policy: DeliverPolicy.All,
+              durable_name: 'processor',
+              filter_subject: subject,
+              replay_policy: ReplayPolicy.Instant,
+            },
+          }
+        : currentInfo
+    ),
   } as unknown as Consumer
 }
 
@@ -246,11 +255,40 @@ describe('recovering explicit-ack JetStream processor', () => {
     await expect(lease.closed).resolves.toBeUndefined()
   })
 
+  it('surfaces an owned-consumer deletion failure from close', async () => {
+    const activeConsumer = consumer([], undefined, true)
+    jetStreamMocks.getConsumer.mockResolvedValue(activeConsumer)
+    const deletionError = new Error('consumer delete failed')
+    jetStreamMocks.deleteConsumer.mockRejectedValue(deletionError)
+    const nats = runtime()
+    const lease = processJetStream(
+      nats,
+      {
+        stream,
+        consumer: { mode: 'owned', name: 'processor' },
+        filter: subject,
+        start: 'all',
+        recovery: { maxAttempts: 2, delayMs: 0 },
+        codec: natsCodecs.text,
+      },
+      async () => undefined
+    )
+
+    await lease.ready
+    await expect(lease.close()).rejects.toBe(deletionError)
+    expect(jetStreamMocks.deleteConsumer).toHaveBeenCalledOnce()
+    await nats.close().catch(() => undefined)
+  })
+
   it('recreates a deleted start:new consumer after the last safe acknowledgement boundary', async () => {
-    const firstInfo = consumerInfo({ deliver_policy: DeliverPolicy.New })
+    const firstInfo = consumerInfo({
+      deliver_policy: DeliverPolicy.New,
+      metadata: { 'natsail.io/processor-owner': 'natsail' },
+    })
     const resumedInfo = consumerInfo({
       deliver_policy: DeliverPolicy.StartSequence,
       opt_start_seq: 2,
+      metadata: { 'natsail.io/processor-owner': 'natsail' },
     })
     jetStreamMocks.infoConsumer
       .mockReset()
@@ -258,6 +296,7 @@ describe('recovering explicit-ack JetStream processor', () => {
       .mockResolvedValueOnce(firstInfo)
       .mockRejectedValueOnce({ code: 404 })
       .mockResolvedValueOnce(resumedInfo)
+      .mockResolvedValue(resumedInfo)
     const activeConsumer = consumer([message(2, 'published-in-gap')], undefined, true)
     jetStreamMocks.getConsumer
       .mockResolvedValueOnce(consumer([message(1, 'before-gap')], new Error('consumer deleted')))
@@ -294,6 +333,60 @@ describe('recovering explicit-ack JetStream processor', () => {
       restarts: 1,
       acknowledged: { stream: 2 },
     })
+
+    await lease.close()
+    await nats.close()
+  })
+
+  it('preserves a start:new creation boundary when recovery happens before the first message', async () => {
+    const firstInfo = {
+      ...consumerInfo({
+        deliver_policy: DeliverPolicy.New,
+        metadata: { 'natsail.io/processor-owner': 'natsail' },
+      }),
+      delivered: { consumer_seq: 0, stream_seq: 41, last_active: 0 },
+    }
+    const resumedInfo = consumerInfo({
+      deliver_policy: DeliverPolicy.StartSequence,
+      opt_start_seq: 42,
+      metadata: { 'natsail.io/processor-owner': 'natsail' },
+    })
+    jetStreamMocks.infoConsumer
+      .mockReset()
+      .mockRejectedValueOnce({ code: 404 })
+      .mockResolvedValueOnce(firstInfo)
+      .mockRejectedValueOnce({ code: 404 })
+      .mockResolvedValueOnce(resumedInfo)
+      .mockResolvedValue(resumedInfo)
+    jetStreamMocks.getConsumer
+      .mockResolvedValueOnce(
+        consumer([], new Error('consumer deleted before delivery'), false, firstInfo)
+      )
+      .mockResolvedValueOnce(consumer([], undefined, true, resumedInfo))
+    const nats = runtime()
+    const lease = processJetStream(
+      nats,
+      {
+        stream,
+        consumer: { mode: 'owned', name: 'processor' },
+        filter: subject,
+        start: 'new',
+        recovery: { maxAttempts: 2, delayMs: 0 },
+        codec: natsCodecs.text,
+      },
+      async () => undefined
+    )
+
+    await lease.ready
+    await vi.waitFor(() => expect(jetStreamMocks.getConsumer).toHaveBeenCalledTimes(2))
+    expect(jetStreamMocks.addConsumer).toHaveBeenNthCalledWith(
+      2,
+      stream,
+      expect.objectContaining({
+        deliver_policy: DeliverPolicy.StartSequence,
+        opt_start_seq: 42,
+      })
+    )
 
     await lease.close()
     await nats.close()

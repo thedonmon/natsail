@@ -8,7 +8,7 @@ import {
 import type { NatsConnection } from '@nats-io/nats-core'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { createNatsRuntime } from '@natsail/core'
+import { createNatsRuntime, type NatsRuntime } from '@natsail/core'
 import {
   classifyJetStreamProcessorDrift,
   createJetStreamProcessorController,
@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => ({
   add: vi.fn(),
   delete: vi.fn(),
   info: vi.fn(),
+  manager: vi.fn(),
   pause: vi.fn(),
   resume: vi.fn(),
   update: vi.fn(),
@@ -31,7 +32,7 @@ vi.mock('@nats-io/jetstream', async (importOriginal) => {
   const original = await importOriginal<typeof import('@nats-io/jetstream')>()
   return {
     ...original,
-    jetstreamManager: () => ({ consumers: mocks }),
+    jetstreamManager: (connection: NatsConnection) => mocks.manager(connection),
   }
 })
 
@@ -115,6 +116,7 @@ describe('JetStream processor administration', () => {
       active = info(active!.config, { paused: false })
       return { paused: false }
     })
+    mocks.manager.mockReset().mockImplementation(() => ({ consumers: mocks }))
   })
 
   it.each([
@@ -126,11 +128,17 @@ describe('JetStream processor administration', () => {
     [{ replicas: 0 }, 'replicas'],
     [{ metadata: { _nats_internal: 'no' } }, 'metadata'],
     [{ driftPolicy: 'recreate-owned' }, 'cannot use driftPolicy recreate-owned'],
+    [{ start: 'latest' }, 'start must be all, new, or an after sequence'],
+    [{ consumer: { mode: 'adopt', name: 'processor' } }, 'consumer.mode'],
     [{ start: { after: -1 } }, 'start.after'],
+    [{ start: { after: Number.MAX_SAFE_INTEGER } }, 'room for the next sequence'],
   ] as const)('rejects invalid administration options %#', (patch, message) => {
-    expect(() => validateJetStreamProcessorAdminOptions({ ...baseOptions, ...patch })).toThrow(
-      message
-    )
+    expect(() =>
+      validateJetStreamProcessorAdminOptions({
+        ...baseOptions,
+        ...patch,
+      } as JetStreamProcessorAdminOptions)
+    ).toThrow(message)
   })
 
   it('compares only explicitly requested optional fields and canonicalizes maps and filters', () => {
@@ -238,6 +246,26 @@ describe('JetStream processor administration', () => {
     expect(controller.inspect()).toEqual(inspection)
   })
 
+  it('recreates the connection-bound consumer API after runtime connection replacement', async () => {
+    const first = {} as NatsConnection
+    const second = {} as NatsConnection
+    let connection = first
+    const activeRuntime = {
+      connection: vi.fn(async () => connection),
+    } as unknown as NatsRuntime
+    const controller = createJetStreamProcessorController(activeRuntime, baseOptions)
+
+    await controller.refresh()
+    await controller.refresh()
+    expect(mocks.manager).toHaveBeenCalledTimes(1)
+    expect(mocks.manager).toHaveBeenLastCalledWith(first)
+
+    connection = second
+    await controller.refresh()
+    expect(mocks.manager).toHaveBeenCalledTimes(2)
+    expect(mocks.manager).toHaveBeenLastCalledWith(second)
+  })
+
   it('recreates only owned immutable drift from the ack-floor boundary and stays stable', async () => {
     active = info(
       {
@@ -275,6 +303,127 @@ describe('JetStream processor administration', () => {
     expect(mocks.delete).toHaveBeenCalledOnce()
   })
 
+  it('preserves an undelivered start:new creation boundary during recreation', async () => {
+    active = info(
+      {
+        deliver_policy: DeliverPolicy.New,
+        metadata: { 'natsail.io/processor-owner': 'natsail' },
+      },
+      {
+        delivered: {
+          consumer_seq: 0,
+          stream_seq: 41,
+          last_active: 0,
+        },
+        ack_floor: {
+          consumer_seq: 0,
+          stream_seq: 0,
+          last_active: 0,
+        },
+        num_ack_pending: 0,
+      }
+    )
+    const controller = createJetStreamProcessorController(runtime(), {
+      ...baseOptions,
+      consumer: { mode: 'owned', name: 'processor' },
+      start: 'all',
+    })
+
+    await expect(controller.reconcile()).resolves.toMatchObject({
+      status: 'recreated',
+      deliveryBoundary: 42,
+    })
+    expect(mocks.add).toHaveBeenCalledWith(
+      'EVENTS',
+      expect.objectContaining({
+        deliver_policy: DeliverPolicy.StartSequence,
+        opt_start_seq: 42,
+      })
+    )
+  })
+
+  it('rolls a failed owned recreation back to the acknowledgement boundary', async () => {
+    active = info(
+      {
+        deliver_policy: DeliverPolicy.New,
+        metadata: { 'natsail.io/processor-owner': 'natsail' },
+      },
+      {
+        ack_floor: {
+          consumer_seq: 6,
+          stream_seq: 18,
+          last_active: 0,
+        },
+      }
+    )
+    const recreationError = new Error('replacement rejected')
+    mocks.add
+      .mockReset()
+      .mockRejectedValueOnce(recreationError)
+      .mockImplementationOnce(async (_stream, config) => {
+        active = info(config)
+        return active
+      })
+    const controller = createJetStreamProcessorController(runtime(), {
+      ...baseOptions,
+      consumer: { mode: 'owned', name: 'processor' },
+      start: 'all',
+    })
+
+    await expect(controller.reconcile()).rejects.toBe(recreationError)
+    expect(mocks.delete).toHaveBeenCalledOnce()
+    expect(mocks.add).toHaveBeenCalledTimes(2)
+    expect(mocks.add).toHaveBeenLastCalledWith(
+      'EVENTS',
+      expect.objectContaining({
+        deliver_policy: DeliverPolicy.StartSequence,
+        opt_start_seq: 19,
+      })
+    )
+    expect(active?.config).toMatchObject({
+      deliver_policy: DeliverPolicy.StartSequence,
+      opt_start_seq: 19,
+    })
+    expect(controller.inspect()).toMatchObject({
+      active: {
+        deliverPolicy: DeliverPolicy.StartSequence,
+        startSequence: 19,
+      },
+    })
+  })
+
+  it('refuses to recreate start:new after unacknowledged delivery without a safe boundary', async () => {
+    active = info(
+      {
+        deliver_policy: DeliverPolicy.New,
+        metadata: { 'natsail.io/processor-owner': 'natsail' },
+      },
+      {
+        delivered: {
+          consumer_seq: 1,
+          stream_seq: 41,
+          last_active: 0,
+        },
+        ack_floor: {
+          consumer_seq: 0,
+          stream_seq: 0,
+          last_active: 0,
+        },
+        num_ack_pending: 1,
+      }
+    )
+    const controller = createJetStreamProcessorController(runtime(), {
+      ...baseOptions,
+      consumer: { mode: 'owned', name: 'processor' },
+      start: 'all',
+    })
+
+    await expect(controller.reconcile()).rejects.toMatchObject({
+      code: 'reconciliation-rejected',
+    })
+    expect(mocks.delete).not.toHaveBeenCalled()
+  })
+
   it('pauses until a future deadline, resumes, and deletes owned consumers', async () => {
     active = info({ metadata: { 'natsail.io/processor-owner': 'natsail' } })
     const controller = createJetStreamProcessorController(runtime(), {
@@ -283,10 +432,17 @@ describe('JetStream processor administration', () => {
     })
     await expect(controller.pause(new Date(0))).rejects.toThrow('in the future')
     const until = new Date(Date.now() + 60_000)
-    await expect(controller.pause(until)).resolves.toMatchObject({ state: { paused: true } })
+    await expect(controller.pause(until)).resolves.toMatchObject({
+      status: 'paused',
+      until: until.toISOString(),
+      inspection: { state: { paused: true } },
+    })
     expect(mocks.pause).toHaveBeenCalledWith('EVENTS', 'processor', until)
-    await expect(controller.resume()).resolves.toMatchObject({ state: { paused: false } })
-    await expect(controller.delete()).resolves.toBe(true)
+    await expect(controller.resume()).resolves.toMatchObject({
+      status: 'resumed',
+      inspection: { state: { paused: false } },
+    })
+    await expect(controller.delete()).resolves.toEqual({ status: 'deleted' })
     expect(controller.inspect().active).toBeUndefined()
   })
 

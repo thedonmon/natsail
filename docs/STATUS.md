@@ -1,6 +1,6 @@
 # Project status and roadmap
 
-NATSail is a public `0.x` package family. The repository publishes nine packages under the `@natsail` npm scope.
+NATSail is a public `0.x` package family. The repository builds nine packages under the `@natsail` npm scope; seven are currently published.
 
 The test suite uses NATS 2.14.4. Separate fixtures cover anonymous, token, user/password, NKey, operator JWT, and TLS connections.
 
@@ -18,7 +18,7 @@ The test suite uses NATS 2.14.4. Separate fixtures cover anonymous, token, user/
 - Connection-wide limits for consumers, buffered messages, and buffered bytes
 - Dependency-free counters, gauges, and deterministic duration telemetry isolated from runtime operations
 - Optional OpenTelemetry metrics adapter with no Core OpenTelemetry dependency
-- SharedWorker broker protocol with immutable tenant/auth identity and refreshable credentials
+- SharedWorker broker protocol with immutable tenant/auth identity, refreshable credentials, brokered publish/request, and idle runtime cleanup
 
 ### JetStream
 
@@ -61,9 +61,9 @@ The test suite uses NATS 2.14.4. Separate fixtures cover anonymous, token, user/
 - Full-page AI reply recovery with retained state
 - Local Cloudflare Worker WebSocket and TCP transport proofs
 - Local Durable Object fan-out and restart replay
-- Published SharedWorker browser broker with protocol-v1 validation, fallback policy, and two-tab acceptance coverage
+- Package-ready SharedWorker browser broker with protocol-v1 validation, fallback policy, and two-tab acceptance coverage
 - Changesets, package checks, provenance, and trusted publishing
-- Machine-readable local 1,000/5,000 replay and configurable live-burst benchmark foundation
+- Machine-readable local RxJS/Effect public-path comparison for 1,000/5,000 replay and configurable live bursts
 
 ## Current limits
 
@@ -120,4 +120,4 @@ Named processors support explicit acknowledgements, redelivery, rich cached insp
 
 All nine package tarballs pass repository checks. Routine releases use Changesets and GitHub trusted publishing.
 
-A new npm package still needs its first publication and trusted-publisher configuration before routine OIDC releases can publish it.
+The browser-broker and OpenTelemetry packages still need their first publication and trusted-publisher configuration before routine OIDC releases can publish them.

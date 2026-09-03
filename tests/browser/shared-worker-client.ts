@@ -1,13 +1,9 @@
-import { wsconnect } from '@nats-io/nats-core'
-
 import {
   createBrowserBrokerClient,
   type BrowserBrokerClient,
   type BrowserBrokerStats,
 } from '@natsail/browser-broker'
 import type { SubscriptionLease } from '@natsail/core'
-
-declare const __NATS_WS_URL__: string
 
 interface DeliveryWaiter {
   resolve(value: string): void
@@ -17,6 +13,7 @@ interface DeliveryWaiter {
 const queuedDeliveries = new Map<string, string[]>()
 const waitingDeliveries = new Map<string, DeliveryWaiter[]>()
 const leases = new Map<string, SubscriptionLease>()
+const encoder = new TextEncoder()
 const decoder = new TextDecoder()
 let client: BrowserBrokerClient
 
@@ -71,15 +68,9 @@ void (async () => {
       await client.close()
     },
     nextMessage,
-    publish: async (subject, value) => {
-      const connection = await wsconnect({ servers: __NATS_WS_URL__, timeout: 2_000 })
-      try {
-        connection.publish(subject, value)
-        await connection.flush()
-      } finally {
-        await connection.drain()
-      }
-    },
+    publish: (subject, value) => client.publish(subject, encoder.encode(value)),
+    request: async (subject, value) =>
+      decoder.decode(await client.request(subject, encoder.encode(value))),
     stats: () => client.stats(),
     subscribe: async (subject) => {
       const lease = client.createSource({ key: subject, contract: 'core-text:v1' })(
@@ -98,6 +89,7 @@ declare global {
       close(): Promise<void>
       nextMessage(subject: string): Promise<string>
       publish(subject: string, value: string): Promise<void>
+      request(subject: string, value: string): Promise<string>
       stats(): Promise<BrowserBrokerStats>
       subscribe(subject: string): Promise<void>
     }

@@ -13,15 +13,27 @@ import { createBrowserBrokerWorker } from '@natsail/browser-broker'
 import { createSessionRegistry } from '@natsail/session'
 
 const sessions = createSessionRegistry()
+let runtime: NatsRuntime | undefined
+const runtimeForWorker = () => (runtime ??= createRuntime())
 const broker = createBrowserBrokerWorker({
   sessions,
   createSource: ({ identity, descriptor, credentials, resumeAfter }) =>
     createApplicationSessionSource({
+      runtime: runtimeForWorker(),
       tenant: identity.tenant,
       source: descriptor.key,
       credentials,
       resumeAfter,
     }),
+  publish: ({ identity, operation, data, credentials }) =>
+    publishAllowedOperation(runtimeForWorker(), { identity, operation, data, credentials }),
+  request: ({ identity, operation, data, credentials }) =>
+    requestAllowedOperation(runtimeForWorker(), { identity, operation, data, credentials }),
+  closeIdleResources: async () => {
+    const active = runtime
+    runtime = undefined
+    await active?.close()
+  },
   maxTabQueueItems: 256,
   maxTabQueueBytes: 1024 * 1024,
   maxRetainedItems: 1024,
@@ -67,15 +79,24 @@ const handle = sessions.acquire({
   contract: 'browser-broker:conversation-events:v1',
   source,
 })
+
+await client.publish('send-message', encodedMessage)
+const reply = await client.request('lookup-message', encodedQuery)
 ```
 
 Tenant and authentication context are immutable for a connected port and form part of physical source identity. Credentials do not: they have a monotonic revision and can be refreshed without changing logical identity. A conflicting contract for an active identity fails with `code: 'contract-mismatch'` instead of creating a second physical source.
+
+`publish()` and `request()` accept application operation names and encoded bytes. Worker callbacks map those names to authorized NATS subjects or services for the supplied identity; don't pass arbitrary tab strings directly to NATS. Request replies return encoded `Uint8Array` values through a transferable buffer.
+
+A timeout or worker replacement can reject a publish or request after the worker has started it. The client does not automatically replay these ambiguous operations. Use application idempotency keys or deduplication before retrying work that must run at most once.
 
 ## Lag and restart behavior
 
 Queue limits apply independently to each tab and include its pending items plus its one in-flight batch. If either its item or encoded-byte limit is exceeded, only that tab receives `resume-required` with reason `lagged`; the broker never silently drops a reliable delivery. Recreate the application session from its last accepted cursor. Other tabs continue normally.
 
-`client.reconnect()` opens a replacement worker port, repeats credential bootstrap, and reattaches every active source after its last acknowledged cursor. Message decoding or source failures remain explicit. The client also attempts this path after a MessagePort `messageerror`. The worker heartbeat sweep releases references for tabs that stop responding.
+`client.reconnect()` opens a replacement worker port, repeats credential bootstrap, and reattaches every active source after its last acknowledged cursor. One source-specific reattach failure closes only that lease; transport/bootstrap failures close every lease because no replacement worker is usable. Message decoding or source failures remain explicit. The client also attempts this path after a MessagePort `messageerror`. The worker heartbeat sweep releases references for tabs that stop responding.
+
+If source attachment or a tab's downstream handler fails, the client detaches that subscription instead of leaving an unacknowledged host reference behind. Credential updates notify every listener with a separate byte copy. If any listener rejects the revision, the broker invalidates only that tenant/auth identity and leaves other identities live.
 
 SharedWorker is not available in every browser or embedding mode. Non-strict applications can supply an explicit tab-local fallback that uses the same protocol and SessionSource contract:
 
@@ -94,7 +115,7 @@ Use `strict: true` when opening a separate per-tab runtime would violate connect
 
 ## Protocol v1
 
-Every message carries `protocol: 'natsail.browser-broker'` and `version: 1`. Tab commands are `hello`, `attach`, `detach`, `ack`, `refresh-credentials`, `restart`, `stats`, `heartbeat`, and `close`. Worker messages are `result`, `state`, and `batch`. `parseBrowserBrokerCommand()` and `parseBrowserBrokerMessage()` reject malformed fields and unsupported versions.
+Every message carries `protocol: 'natsail.browser-broker'` and `version: 1`. Tab commands are `hello`, `attach`, `detach`, `ack`, `refresh-credentials`, `publish`, `request`, `restart`, `stats`, `heartbeat`, and `close`. Each `attach` includes a required `reattach` boolean. A reattach replays complete retained unacknowledged history; truncated history produces `resume-required` instead of a partial replay. Worker messages are `result`, `state`, and `batch`. `parseBrowserBrokerCommand()` and `parseBrowserBrokerMessage()` reject malformed fields and unsupported versions.
 
 The protocol is same-origin transport, not authorization. The worker source factory must still enforce the authenticated tenant's allowed source mapping. Never accept an arbitrary NATS subject, stream, or consumer name from an untrusted page.
 
@@ -102,7 +123,7 @@ The protocol is same-origin transport, not authorization. The worker source fact
 
 Pass the Stage 1 sink to the worker and client. The package reports active tabs, physical sources, caller-reported upstream connections, aggregate queue item/byte depth, lag, fallback, source restart, connection reconnect, and worker replacement. Attributes contain only stable action/source dimensions; tenant IDs, auth contexts, credentials, source keys, contracts, stream names, and cursors are excluded.
 
-The caller owns the upstream runtime, so call `broker.reportConnection('opened' | 'reconnected' | 'closed')` from its connection lifecycle to populate physical-connection telemetry accurately.
+Call `broker.reportConnection('opened' | 'reconnected' | 'closed')` from the upstream connection lifecycle to populate physical-connection telemetry accurately. Use `closeIdleResources` to close and reset the worker runtime after the final physical source or broker host closes; later work waits for cleanup before the application recreates it.
 
 ## Scope
 

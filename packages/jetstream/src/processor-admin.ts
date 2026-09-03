@@ -9,7 +9,7 @@ import {
   type ConsumerUpdateConfig,
 } from '@nats-io/jetstream'
 
-import { type NatsRuntime } from '@natsail/core'
+import { type NatsConnection, type NatsRuntime } from '@natsail/core'
 
 export type JetStreamProcessorStart = 'all' | 'new' | { after: number }
 
@@ -202,10 +202,25 @@ export interface JetStreamProcessorController {
   refresh(): Promise<JetStreamProcessorReconciliationInspection>
   /** Creates, validates, updates, or safely recreates the consumer according to its mode and policy. */
   reconcile(): Promise<JetStreamProcessorReconciliationResult>
-  pause(until: Date): Promise<JetStreamProcessorReconciliationInspection>
-  resume(): Promise<JetStreamProcessorReconciliationInspection>
+  pause(until: Date): Promise<JetStreamProcessorPauseResult>
+  resume(): Promise<JetStreamProcessorResumeResult>
   /** Deletes only package-owned consumers. The ownership guard is enforced at runtime. */
-  delete(): Promise<boolean>
+  delete(): Promise<JetStreamProcessorDeleteResult>
+}
+
+export interface JetStreamProcessorPauseResult {
+  readonly status: 'paused'
+  readonly until: string
+  readonly inspection: JetStreamProcessorReconciliationInspection
+}
+
+export interface JetStreamProcessorResumeResult {
+  readonly status: 'resumed'
+  readonly inspection: JetStreamProcessorReconciliationInspection
+}
+
+export interface JetStreamProcessorDeleteResult {
+  readonly status: 'deleted'
 }
 
 interface JetStreamProcessorReconcileContext {
@@ -280,15 +295,27 @@ export function validateJetStreamProcessorAdminOptions(
   if (options.consumer.name.trim().length === 0) {
     throw new TypeError('JetStream processor consumer name must not be empty')
   }
+  const consumerModes: readonly JetStreamProcessorConsumer['mode'][] = ['bind', 'ensure', 'owned']
+  if (!consumerModes.includes(options.consumer.mode)) {
+    throw new TypeError('JetStream processor consumer.mode must be bind, ensure, or owned')
+  }
   const filters = typeof options.filter === 'string' ? [options.filter] : options.filter
   if (filters.length === 0 || filters.some((filter) => filter.trim().length === 0)) {
     throw new TypeError('JetStream processor filter must contain at least one subject')
   }
+  if (options.start !== 'all' && options.start !== 'new' && typeof options.start !== 'object') {
+    throw new TypeError('JetStream processor start must be all, new, or an after sequence')
+  }
   if (
     typeof options.start === 'object' &&
-    (!Number.isSafeInteger(options.start.after) || options.start.after < 0)
+    (options.start === null ||
+      !Number.isSafeInteger(options.start.after) ||
+      options.start.after < 0 ||
+      options.start.after === Number.MAX_SAFE_INTEGER)
   ) {
-    throw new RangeError('JetStream processor start.after must be a non-negative integer')
+    throw new RangeError(
+      'JetStream processor start.after must be a non-negative safe integer with room for the next sequence'
+    )
   }
   if (
     options.ackWaitMs !== undefined &&
@@ -605,8 +632,50 @@ function isMissingConsumer(error: unknown): boolean {
   )
 }
 
+function deliverySequenceAfter(boundary: number): number {
+  if (!Number.isSafeInteger(boundary) || boundary < 0 || boundary === Number.MAX_SAFE_INTEGER) {
+    throw new JetStreamProcessorConfigurationError(
+      'reconciliation-rejected',
+      'The JetStream acknowledgement boundary cannot be represented safely'
+    )
+  }
+  return boundary + 1
+}
+
+function rollbackConfigAtBoundary(config: ConsumerConfig, boundary: number): ConsumerConfig {
+  const { opt_start_seq: _startSequence, opt_start_time: _startTime, ...retained } = config
+  return {
+    ...retained,
+    deliver_policy: DeliverPolicy.StartSequence,
+    opt_start_seq: deliverySequenceAfter(boundary),
+  }
+}
+
+function processorRecreationBoundary(info: ConsumerInfo): number {
+  const acknowledged = info.ack_floor.stream_seq
+  if (acknowledged > 0) return acknowledged
+  if (
+    info.config.deliver_policy === DeliverPolicy.StartSequence &&
+    info.config.opt_start_seq !== undefined &&
+    info.config.opt_start_seq > 0
+  ) {
+    return info.config.opt_start_seq - 1
+  }
+  if (info.config.deliver_policy === DeliverPolicy.New) {
+    if (info.delivered.consumer_seq === 0 && info.num_ack_pending === 0) {
+      return info.delivered.stream_seq
+    }
+    throw new JetStreamProcessorConfigurationError(
+      'reconciliation-rejected',
+      'The unacknowledged start:new creation boundary is unavailable; refusing unsafe recreation'
+    )
+  }
+  return acknowledged
+}
+
 class ProcessorController implements JetStreamProcessorController {
   private tail: Promise<void> = Promise.resolve()
+  private consumerConnection?: NatsConnection
   private consumerApi?: ConsumerAPI
   private active: JetStreamProcessorNormalizedConfig | undefined
   private state: JetStreamProcessorConsumerStateInspection | undefined
@@ -656,7 +725,7 @@ class ProcessorController implements JetStreamProcessorController {
     })
   }
 
-  pause(until: Date): Promise<JetStreamProcessorReconciliationInspection> {
+  pause(until: Date): Promise<JetStreamProcessorPauseResult> {
     if (this.options.consumer.mode === 'bind') {
       return Promise.reject(
         new JetStreamProcessorConfigurationError(
@@ -672,11 +741,11 @@ class ProcessorController implements JetStreamProcessorController {
       const consumers = await this.consumers()
       await consumers.pause(this.options.stream, this.options.consumer.name, until)
       await this.read(consumers)
-      return this.inspect()
+      return { status: 'paused', until: until.toISOString(), inspection: this.inspect() }
     })
   }
 
-  resume(): Promise<JetStreamProcessorReconciliationInspection> {
+  resume(): Promise<JetStreamProcessorResumeResult> {
     if (this.options.consumer.mode === 'bind') {
       return Promise.reject(
         new JetStreamProcessorConfigurationError(
@@ -689,11 +758,11 @@ class ProcessorController implements JetStreamProcessorController {
       const consumers = await this.consumers()
       await consumers.resume(this.options.stream, this.options.consumer.name)
       await this.read(consumers)
-      return this.inspect()
+      return { status: 'resumed', inspection: this.inspect() }
     })
   }
 
-  delete(): Promise<boolean> {
+  delete(): Promise<JetStreamProcessorDeleteResult> {
     if (this.options.consumer.mode !== 'owned') {
       return Promise.reject(
         new JetStreamProcessorConfigurationError(
@@ -712,11 +781,15 @@ class ProcessorController implements JetStreamProcessorController {
         )
       }
       const deleted = await consumers.delete(this.options.stream, this.options.consumer.name)
-      if (deleted) {
-        this.active = undefined
-        this.state = undefined
+      if (!deleted) {
+        throw new JetStreamProcessorConfigurationError(
+          'reconciliation-rejected',
+          'The owned JetStream consumer was not deleted'
+        )
       }
-      return deleted
+      this.active = undefined
+      this.state = undefined
+      return { status: 'deleted' }
     })
   }
 
@@ -730,8 +803,20 @@ class ProcessorController implements JetStreamProcessorController {
   }
 
   private async consumers(): Promise<ConsumerAPI> {
-    if (this.consumerApi !== undefined) return this.consumerApi
-    const connection = await this.runtime.connection()
+    let connection: NatsConnection
+    try {
+      connection = await this.runtime.connection()
+    } catch (error) {
+      // Runtime shutdown rejects new connection acquisition before managed
+      // processor resources close. The already-bound API remains the only path
+      // for deleting an owned consumer during that ordered shutdown.
+      if (this.consumerApi !== undefined) return this.consumerApi
+      throw error
+    }
+    if (this.consumerApi !== undefined && this.consumerConnection === connection) {
+      return this.consumerApi
+    }
+    this.consumerConnection = connection
     this.consumerApi = (await jetstreamManager(connection)).consumers
     return this.consumerApi
   }
@@ -780,6 +865,7 @@ class ProcessorController implements JetStreamProcessorController {
         return this.rejected(policy, 'missing', [], ['durableName'])
       }
       const boundary = this.options.consumer.mode === 'owned' ? this.context.resumeAfter : undefined
+      const deliveryBoundary = boundary === undefined ? undefined : deliverySequenceAfter(boundary)
       const start = boundary === undefined ? this.options.start : ({ after: boundary } as const)
       await consumers.add(
         this.options.stream,
@@ -793,7 +879,7 @@ class ProcessorController implements JetStreamProcessorController {
         editableDrift: [],
         immutableDrift: [],
         after: normalizeJetStreamProcessorActive(afterInfo),
-        ...(boundary === undefined ? {} : { deliveryBoundary: boundary + 1 }),
+        ...(deliveryBoundary === undefined ? {} : { deliveryBoundary }),
       }
     }
 
@@ -836,7 +922,8 @@ class ProcessorController implements JetStreamProcessorController {
       if (this.options.consumer.mode !== 'owned' || policy !== 'recreate-owned') {
         return this.rejected(policy, 'drift', drift.editable, drift.immutable, before)
       }
-      const boundary = beforeInfo.ack_floor.stream_seq
+      const boundary = processorRecreationBoundary(beforeInfo)
+      const deliveryBoundary = deliverySequenceAfter(boundary)
       await consumers.delete(this.options.stream, this.options.consumer.name)
       try {
         await consumers.add(
@@ -844,8 +931,21 @@ class ProcessorController implements JetStreamProcessorController {
           jetStreamProcessorConsumerConfig(this.options, { after: boundary })
         )
       } catch (error) {
-        // Best-effort rollback keeps an owned consumer available if recreation fails.
-        await consumers.add(this.options.stream, beforeInfo.config).catch(() => undefined)
+        let rollbackInfo: ConsumerInfo
+        try {
+          rollbackInfo = await consumers.add(
+            this.options.stream,
+            rollbackConfigAtBoundary(beforeInfo.config, boundary)
+          )
+        } catch (rollbackError) {
+          throw new AggregateError(
+            [error, rollbackError],
+            'JetStream consumer recreation and safe rollback both failed'
+          )
+        }
+        this.active = normalizeJetStreamProcessorActive(rollbackInfo)
+        this.state = inspectJetStreamProcessorConsumerState(rollbackInfo)
+        this.effectiveStart = { after: boundary }
         throw error
       }
       this.effectiveStart = { after: boundary }
@@ -857,7 +957,7 @@ class ProcessorController implements JetStreamProcessorController {
         immutableDrift: drift.immutable,
         before,
         after: normalizeJetStreamProcessorActive(afterInfo),
-        deliveryBoundary: boundary + 1,
+        deliveryBoundary,
       }
     }
 

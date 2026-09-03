@@ -184,9 +184,12 @@ const conversationSource = browser.createSource({
   key: 'conversation-feed',
   contract: 'conversation-events:v1',
 })
+
+await browser.publish('send-message', encodedMessage)
+const reply = await browser.request('lookup-message', encodedQuery)
 ```
 
-Per-tab item and encoded-byte queues are bounded independently. A lagging tab receives an explicit resume-required error from its last acknowledged JetStream cursor; other tabs continue. Tenant/authentication context is immutable source identity, while credentials can be refreshed through the authenticated tab bootstrap. See the [browser broker guide](packages/browser-broker/README.md) for worker setup, fallback policy, and protocol v1.
+Per-tab item and encoded-byte queues are bounded independently. A lagging tab receives an explicit resume-required error from its last acknowledged JetStream cursor; other tabs continue. Tenant/authentication context is immutable source identity, while credentials can be refreshed through the authenticated tab bootstrap. Publish and request use logical operation names that the worker maps to authorized NATS subjects or services. See the [browser broker guide](packages/browser-broker/README.md) for worker setup, idle runtime cleanup, fallback policy, and protocol v1.
 
 ## Batching and cooperative reducers
 

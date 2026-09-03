@@ -107,4 +107,6 @@ Choose consumer ownership explicitly:
 
 Recovery retries infrastructure failures. Decoder, handler, and consumer-contract failures remain terminal. Use the lease's `inspect()` and `subscribe()` to show `connecting`, `live`, `reconnecting`, `closed`, or `error` state and restart counts. Close every lease when its owner is done.
 
+Use `createJetStreamProcessorController()` for serialized administration without a handler loop. `pause()`, `resume()`, and `delete()` return discriminated `paused`, `resumed`, and `deleted` results. Owned-consumer deletion failures reject the operation or lease close; do not treat a rejected close as successful cleanup.
+
 See the [JetStream package guide](https://github.com/thedonmon/natsail/tree/main/packages/jetstream#readme), [delivery guarantees](https://github.com/thedonmon/natsail/blob/main/docs/DELIVERY.md), and [npm package](https://www.npmjs.com/package/@natsail/jetstream).

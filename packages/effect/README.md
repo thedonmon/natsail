@@ -175,6 +175,8 @@ const conversation = materializeJetStream(
 const render = conversation.pipe(Stream.runForEach((snapshot) => updateConversation(snapshot.data)))
 ```
 
+`materializeNatsJetStreamEvents(events, materializer, options)` applies the same batching and atomic replay rules to an existing `NatsailJetStreamEvent` Stream. Use it when another component already owns event acquisition; `materializeJetStream()` remains the managed NATS source path.
+
 `reduceBatch` is a native Effect. Its typed error and service requirements remain in the returned Stream type. Package-owned recovery can resume admitted events while the current materialized state remains alive. A fresh materializer rebuilds from replay, so `resume` is rejected until a state store can commit the materialized state and cursor atomically.
 
 `batchSize` and `batchWithin` remain compatible aliases. The shared policy additionally supports byte bounds with `sizeOf`. Durable JetStream queues remain lossless: their only overflow modes are backpressure (`suspend`) or a typed `error`.

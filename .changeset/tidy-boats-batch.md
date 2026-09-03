@@ -7,4 +7,4 @@
 '@natsail/effect': minor
 ---
 
-Add shared count/byte/time batching and cooperative work budgets, atomic bounded JetStream reducer hydration, 16ms cumulative live coalescing, and deterministic adapter scheduling while preserving legacy adapter batch options.
+Add shared count/byte/time batching and cooperative work budgets, atomic bounded JetStream reducer hydration with fresh retry batches, 16ms cumulative live coalescing, a public Effect event-stream materializer, and deterministic adapter scheduling while preserving legacy adapter batch options.

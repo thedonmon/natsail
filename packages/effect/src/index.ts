@@ -24,6 +24,7 @@ import type {
   NatsRuntimeEvent,
   NatsRuntimeReconnectOptions,
   NatsRuntimeStatusEvent,
+  NatsailTelemetryReporter,
   NatsailWorkBudget,
 } from '@natsail/core'
 import {
@@ -597,12 +598,12 @@ function createJetStreamDeliveryStream<T>(
   )
 }
 
-function createJetStreamMaterializedStream<Value, State, E, R>(
-  runtime: NatsRuntime,
-  options: NatsailJetStreamMaterializeSourceOptions<Value>,
+function materializeJetStreamEventStream<Value, State, E, R, SourceError, SourceContext>(
+  events: Stream.Stream<NatsailJetStreamEvent<Value>, SourceError, SourceContext>,
   materializer: NatsailJetStreamMaterializer<Value, State, E, R>,
-  streamOptions: NatsailJetStreamMaterializeOptions<Value> = {}
-): Stream.Stream<NatsailJetStreamMaterializedState<State>, NatsailJetStreamStreamError | E, R> {
+  streamOptions: NatsailJetStreamMaterializeOptions<Value> = {},
+  telemetry?: NatsailTelemetryReporter
+): Stream.Stream<NatsailJetStreamMaterializedState<State>, SourceError | E, SourceContext | R> {
   const configuredPolicy = streamOptions.batchPolicy
   const batchPolicy = defineNatsailBatchPolicy<JetStreamDelivery<Value>>({
     ...configuredPolicy,
@@ -614,21 +615,11 @@ function createJetStreamMaterializedStream<Value, State, E, R>(
   const batchSize = batchPolicy.maxItems!
   const batchWithin = batchPolicy.maxWaitMs!
 
-  if (options.resume) {
-    throw new TypeError(
-      'A JetStream materializer cannot resume an event cursor without restoring matching materialized state'
-    )
-  }
-  const work =
-    streamOptions.workBudget === undefined
-      ? undefined
-      : createNatsailWorkController(
-          streamOptions.workBudget,
-          runtime[NATS_RUNTIME_ADAPTER].telemetry,
-          'effect'
-        )
-
   return Stream.suspend(() => {
+    const work =
+      streamOptions.workBudget === undefined
+        ? undefined
+        : createNatsailWorkController(streamOptions.workBudget, telemetry, 'effect')
     const initial = materializer.initial()
     const initialAccumulator: JetStreamMaterializerAccumulator<State> = {
       phase: 'replaying',
@@ -640,7 +631,7 @@ function createJetStreamMaterializedStream<Value, State, E, R>(
       data: initial,
       replay: { delivered: 0 },
     }
-    const updates = createJetStreamEventStream(runtime, options, streamOptions).pipe(
+    const updates = events.pipe(
       (events) =>
         Stream.aggregateWithin(
           events,
@@ -747,6 +738,34 @@ function createJetStreamMaterializedStream<Value, State, E, R>(
 
     return Stream.concat(Stream.succeed(initialSnapshot), updates)
   })
+}
+
+/** Materializes an existing JetStream event stream with the service's batching semantics. */
+export function materializeNatsJetStreamEvents<Value, State, E, R, SourceError, SourceContext>(
+  events: Stream.Stream<NatsailJetStreamEvent<Value>, SourceError, SourceContext>,
+  materializer: NatsailJetStreamMaterializer<Value, State, E, R>,
+  options: NatsailJetStreamMaterializeOptions<Value> = {}
+): Stream.Stream<NatsailJetStreamMaterializedState<State>, SourceError | E, SourceContext | R> {
+  return materializeJetStreamEventStream(events, materializer, options)
+}
+
+function createJetStreamMaterializedStream<Value, State, E, R>(
+  runtime: NatsRuntime,
+  options: NatsailJetStreamMaterializeSourceOptions<Value>,
+  materializer: NatsailJetStreamMaterializer<Value, State, E, R>,
+  streamOptions: NatsailJetStreamMaterializeOptions<Value> = {}
+): Stream.Stream<NatsailJetStreamMaterializedState<State>, NatsailJetStreamStreamError | E, R> {
+  if (options.resume) {
+    throw new TypeError(
+      'A JetStream materializer cannot resume an event cursor without restoring matching materialized state'
+    )
+  }
+  return materializeJetStreamEventStream(
+    createJetStreamEventStream(runtime, options, streamOptions),
+    materializer,
+    streamOptions,
+    runtime[NATS_RUNTIME_ADAPTER]?.telemetry
+  )
 }
 
 function runJetStreamProcessorEffect<T, E, R>(

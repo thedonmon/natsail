@@ -60,6 +60,22 @@ export type BrowserBrokerSourceFactory = (
   context: BrowserBrokerSourceContext
 ) => SessionSource<BrowserBrokerDelivery>
 
+export interface BrowserBrokerOperationContext {
+  readonly identity: BrowserBrokerIdentity
+  /** Application-defined operation key. The worker must map it to an authorized NATS operation. */
+  readonly operation: string
+  readonly data: Uint8Array
+  readonly credentials: BrowserBrokerCredentials
+}
+
+export type BrowserBrokerPublishHandler = (
+  context: BrowserBrokerOperationContext
+) => void | Promise<void>
+
+export type BrowserBrokerRequestHandler = (
+  context: BrowserBrokerOperationContext
+) => Uint8Array | Promise<Uint8Array>
+
 interface ProtocolEnvelope {
   readonly protocol: typeof NATS_BROWSER_BROKER_PROTOCOL
   readonly version: typeof NATS_BROWSER_BROKER_PROTOCOL_VERSION
@@ -78,6 +94,7 @@ export type BrowserBrokerCommand =
       readonly requestId: number
       readonly subscriptionId: string
       readonly source: BrowserBrokerSourceDescriptor
+      readonly reattach: boolean
       readonly resumeAfter?: BrowserBrokerCursor
     })
   | (ProtocolEnvelope & {
@@ -97,6 +114,12 @@ export type BrowserBrokerCommand =
       readonly requestId: number
       readonly credentialRevision: number
       readonly credentials: ArrayBuffer
+    })
+  | (ProtocolEnvelope & {
+      readonly type: 'publish' | 'request'
+      readonly requestId: number
+      readonly operation: string
+      readonly data: ArrayBuffer
     })
   | (ProtocolEnvelope & {
       readonly type: 'close' | 'heartbeat' | 'stats'
@@ -232,6 +255,13 @@ function integerField(value: unknown, field: string): number {
   return value as number
 }
 
+function booleanField(value: unknown, field: string): boolean {
+  if (typeof value !== 'boolean') {
+    throw new BrowserBrokerError('invalid-command', `${field} must be a boolean`)
+  }
+  return value
+}
+
 function requestId(value: unknown): number {
   const id = integerField(value, 'requestId')
   if (id === 0) throw new BrowserBrokerError('invalid-command', 'requestId must be positive')
@@ -243,6 +273,13 @@ function arrayBuffer(value: unknown, field: string): ArrayBuffer {
     throw new BrowserBrokerError('invalid-command', `${field} must be an ArrayBuffer`)
   }
   return value as ArrayBuffer
+}
+
+function byteArray(value: unknown, field: string): Uint8Array {
+  if (!(value instanceof Uint8Array)) {
+    throw new BrowserBrokerError('invalid-command', `${field} must be a Uint8Array`)
+  }
+  return value
 }
 
 function parseIdentity(value: unknown): BrowserBrokerIdentity {
@@ -311,6 +348,7 @@ export function parseBrowserBrokerCommand(value: unknown): BrowserBrokerCommand 
         requestId: id,
         subscriptionId: stringField(candidate.subscriptionId, 'subscriptionId'),
         source: parseSource(candidate.source),
+        reattach: booleanField(candidate.reattach, 'reattach'),
         ...(candidate.resumeAfter === undefined
           ? {}
           : { resumeAfter: parseCursor(candidate.resumeAfter) }),
@@ -339,6 +377,15 @@ export function parseBrowserBrokerCommand(value: unknown): BrowserBrokerCommand 
         requestId: id,
         credentialRevision: integerField(candidate.credentialRevision, 'credentialRevision'),
         credentials: arrayBuffer(candidate.credentials, 'credentials'),
+      }
+    case 'publish':
+    case 'request':
+      return {
+        ...envelope(),
+        type: candidate.type,
+        requestId: id,
+        operation: stringField(candidate.operation, 'operation'),
+        data: arrayBuffer(candidate.data, 'data'),
       }
     case 'close':
     case 'heartbeat':
@@ -479,12 +526,24 @@ function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
 
 function parseCredentialSnapshot(value: unknown): BrowserBrokerCredentialSnapshot {
   const candidate = record(value)
-  if (!(candidate.bytes instanceof Uint8Array)) {
-    throw new BrowserBrokerError('invalid-command', 'credentials.bytes must be a Uint8Array')
-  }
   return {
     revision: integerField(candidate.revision, 'credentials.revision'),
-    bytes: candidate.bytes,
+    bytes: byteArray(candidate.bytes, 'credentials.bytes'),
+  }
+}
+
+function parseStats(value: unknown): BrowserBrokerStats {
+  const candidate = record(value)
+  return {
+    tabCount: integerField(candidate.tabCount, 'stats.tabCount'),
+    activeConnectionCount: integerField(
+      candidate.activeConnectionCount,
+      'stats.activeConnectionCount'
+    ),
+    physicalSourceCount: integerField(candidate.physicalSourceCount, 'stats.physicalSourceCount'),
+    subscriptionCount: integerField(candidate.subscriptionCount, 'stats.subscriptionCount'),
+    queuedItems: integerField(candidate.queuedItems, 'stats.queuedItems'),
+    queuedBytes: integerField(candidate.queuedBytes, 'stats.queuedBytes'),
   }
 }
 
@@ -503,11 +562,14 @@ function copyCursor(cursor: BrowserBrokerCursor | undefined): BrowserBrokerCurso
 
 class MutableCredentials implements BrowserBrokerCredentials {
   private listeners = new Set<(snapshot: BrowserBrokerCredentialSnapshot) => void>()
+  private bytes: Uint8Array
 
   constructor(
     private revision: number,
-    private bytes: Uint8Array
-  ) {}
+    bytes: Uint8Array
+  ) {
+    this.bytes = copyBytes(bytes)
+  }
 
   current(): BrowserBrokerCredentialSnapshot {
     return { revision: this.revision, bytes: copyBytes(this.bytes) }
@@ -518,7 +580,7 @@ class MutableCredentials implements BrowserBrokerCredentials {
     return () => this.listeners.delete(listener)
   }
 
-  update(revision: number, bytes: Uint8Array): void {
+  update(revision: number, bytes: Uint8Array): unknown | undefined {
     if (revision <= this.revision) {
       throw new BrowserBrokerError(
         'credentials-stale',
@@ -528,11 +590,20 @@ class MutableCredentials implements BrowserBrokerCredentials {
     this.bytes.fill(0)
     this.revision = revision
     this.bytes = copyBytes(bytes)
-    const snapshot = this.current()
-    for (const listener of this.listeners) listener(snapshot)
+    let listenerFailure: unknown
+    for (const listener of this.listeners) {
+      try {
+        listener(this.current())
+      } catch (error) {
+        listenerFailure ??= error
+        // One source cannot prevent the remaining identity-bound sources from
+        // observing a credential revision that has already been committed.
+      }
+    }
+    return listenerFailure
   }
 
-  accept(revision: number, bytes: Uint8Array): void {
+  accept(revision: number, bytes: Uint8Array): unknown | undefined {
     if (revision < this.revision) {
       throw new BrowserBrokerError(
         'credentials-stale',
@@ -546,9 +617,9 @@ class MutableCredentials implements BrowserBrokerCredentials {
           `Credential revision ${revision} has conflicting bytes`
         )
       }
-      return
+      return undefined
     }
-    this.update(revision, bytes)
+    return this.update(revision, bytes)
   }
 
   dispose(): void {
@@ -588,7 +659,11 @@ interface HostClient {
   identity?: BrowserBrokerIdentity
   credentialKey?: string
   lastSeenAt: number
+  queuedCommands: number
+  readonly activeCommands: Set<Promise<void>>
+  closing: boolean
   closed: boolean
+  publishPending: Promise<void>
   pending: Promise<void>
 }
 
@@ -602,6 +677,7 @@ interface PhysicalSource {
   readonly unsubscribe: () => void
   log: LogEntry[]
   logBytes: number
+  logTruncated: boolean
   lastValueRevision: number
   idleTimer: ReturnType<typeof setTimeout> | undefined
   closed: boolean
@@ -610,6 +686,16 @@ interface PhysicalSource {
 export interface BrowserBrokerWorkerOptions {
   readonly sessions: SessionRegistry
   readonly createSource: BrowserBrokerSourceFactory
+  /** Optional application-authorized publish mapping for tab operation keys. */
+  readonly publish?: BrowserBrokerPublishHandler
+  /** Optional application-authorized request mapping for tab operation keys. */
+  readonly request?: BrowserBrokerRequestHandler
+  /**
+   * Releases and resets worker-owned runtime resources after the final physical
+   * source closes, and when the broker host closes. A later operation waits for
+   * this hook before asking the application to lazily recreate those resources.
+   */
+  readonly closeIdleResources?: () => void | Promise<void>
   /** Per-tab outstanding item limit, including the one in-flight batch. Defaults to 256. */
   readonly maxTabQueueItems?: number
   /** Per-tab outstanding encoded-byte limit. Defaults to 1 MiB. */
@@ -673,7 +759,10 @@ class DefaultBrowserBrokerWorkerHost implements BrowserBrokerWorkerHost {
   private readonly clientTimeoutMs: number
   private readonly sweepTimer?: ReturnType<typeof setInterval>
   private activeConnections = 0
+  private activeOperations = 0
   private closed = false
+  private resourcesActive = false
+  private idleResourceClose: Promise<void> | undefined
 
   constructor(private readonly options: BrowserBrokerWorkerOptions) {
     this.maxTabQueueItems = positiveInteger(options.maxTabQueueItems, 256, 'maxTabQueueItems')
@@ -716,17 +805,43 @@ class DefaultBrowserBrokerWorkerHost implements BrowserBrokerWorkerHost {
       port,
       subscriptions: new Map(),
       lastSeenAt: this.now(),
+      queuedCommands: 0,
+      activeCommands: new Set(),
+      closing: false,
       closed: false,
+      publishPending: Promise.resolve(),
       pending: Promise.resolve(),
     }
     this.clients.set(port, client)
     port.onmessage = (event: MessageEvent<unknown>) => {
+      if (this.closed || client.closed || client.closing) return
+      client.lastSeenAt = this.now()
+      client.queuedCommands += 1
+      const execute = () => this.receive(client, event.data)
+      const type =
+        typeof event.data === 'object' && event.data !== null
+          ? (event.data as Record<string, unknown>).type
+          : undefined
+      if (type === 'close') client.closing = true
+      if (type === 'publish' || type === 'request' || type === 'heartbeat') {
+        const predecessor = type === 'publish' ? client.publishPending : Promise.resolve()
+        const active = predecessor.then(execute).finally(() => {
+          client.queuedCommands -= 1
+        })
+        if (type === 'publish') client.publishPending = active.catch(() => undefined)
+        client.activeCommands.add(active)
+        void active.finally(() => client.activeCommands.delete(active)).catch(() => undefined)
+        return
+      }
       client.pending = client.pending
-        .then(() => this.receive(client, event.data))
+        .then(execute)
+        .finally(() => {
+          client.queuedCommands -= 1
+        })
         .catch(() => undefined)
     }
     port.onmessageerror = () => {
-      void this.closeClient(client)
+      void this.enqueueClientClose(client)
     }
     port.start()
   }
@@ -762,8 +877,10 @@ class DefaultBrowserBrokerWorkerHost implements BrowserBrokerWorkerHost {
   async sweepIdleClients(at = this.now()): Promise<void> {
     await Promise.all(
       [...this.clients.values()]
-        .filter((client) => at - client.lastSeenAt >= this.clientTimeoutMs)
-        .map((client) => this.closeClient(client))
+        .filter(
+          (client) => client.queuedCommands === 0 && at - client.lastSeenAt >= this.clientTimeoutMs
+        )
+        .map((client) => this.enqueueClientClose(client))
     )
   }
 
@@ -771,13 +888,21 @@ class DefaultBrowserBrokerWorkerHost implements BrowserBrokerWorkerHost {
     if (this.closed) return
     this.closed = true
     if (this.sweepTimer) clearInterval(this.sweepTimer)
-    await Promise.all([...this.clients.values()].map((client) => this.closeClient(client)))
-    await Promise.all([...this.sources.values()].map((source) => this.teardownSource(source)))
-    for (const store of this.credentialStores.values()) store.dispose()
-    this.credentialStores.clear()
+    try {
+      await Promise.all(
+        [...this.clients.values()].flatMap((client) => [client.pending, ...client.activeCommands])
+      )
+      await Promise.all([...this.clients.values()].map((client) => this.closeClient(client)))
+      await Promise.all([...this.sources.values()].map((source) => this.teardownSource(source)))
+      await this.closeIdleResources()
+    } finally {
+      for (const store of this.credentialStores.values()) store.dispose()
+      this.credentialStores.clear()
+    }
   }
 
   private async receive(client: HostClient, value: unknown): Promise<void> {
+    if (this.closed || client.closed) return
     let command: BrowserBrokerCommand
     try {
       command = parseBrowserBrokerCommand(value)
@@ -790,19 +915,26 @@ class DefaultBrowserBrokerWorkerHost implements BrowserBrokerWorkerHost {
       return
     }
 
-    client.lastSeenAt = this.now()
     try {
-      const result = await this.handleCommand(client, command)
-      this.postResult(client, command.requestId, result)
+      const handled = await this.handleCommand(client, command)
+      this.postResult(client, command.requestId, handled.result, handled.transfers)
     } catch (error) {
       this.postFailure(client, command.requestId, error)
     }
   }
 
-  private async handleCommand(client: HostClient, command: BrowserBrokerCommand): Promise<unknown> {
+  private async handleCommand(
+    client: HostClient,
+    command: BrowserBrokerCommand
+  ): Promise<{ readonly result?: unknown; readonly transfers?: Transferable[] }> {
     if (command.type === 'hello') {
-      this.hello(client, command)
-      return { protocolVersion: NATS_BROWSER_BROKER_PROTOCOL_VERSION }
+      await this.hello(client, command)
+      return { result: { protocolVersion: NATS_BROWSER_BROKER_PROTOCOL_VERSION } }
+    }
+    if (command.type === 'close') {
+      await Promise.all([...client.activeCommands])
+      await this.closeClient(client)
+      return {}
     }
     if (!client.identity || !client.credentialKey) {
       throw new BrowserBrokerError('not-connected', 'hello must be the first command on a port')
@@ -811,37 +943,74 @@ class DefaultBrowserBrokerWorkerHost implements BrowserBrokerWorkerHost {
     switch (command.type) {
       case 'attach':
         await this.attach(client, command)
-        return undefined
+        return {}
       case 'detach':
         await this.detach(client, command.subscriptionId)
-        return undefined
+        return {}
       case 'ack':
         this.ack(client, command)
-        return undefined
-      case 'refresh-credentials':
-        this.credentialStores
-          .get(client.credentialKey)!
-          .update(command.credentialRevision, new Uint8Array(command.credentials))
-        return undefined
+        return {}
+      case 'refresh-credentials': {
+        const incoming = new Uint8Array(command.credentials)
+        let listenerFailure: unknown
+        try {
+          listenerFailure = this.credentialStores
+            .get(client.credentialKey)!
+            .update(command.credentialRevision, incoming)
+        } finally {
+          incoming.fill(0)
+        }
+        if (listenerFailure !== undefined) {
+          await this.invalidateIdentity(client, client.credentialKey)
+          throw new BrowserBrokerError(
+            'source-failed',
+            'A source rejected the refreshed credentials; the broker identity was closed'
+          )
+        }
+        return {}
+      }
+      case 'publish': {
+        if (!this.options.publish) {
+          throw new BrowserBrokerError('unavailable', 'Brokered publish is not configured')
+        }
+        await this.withResources(async () => {
+          await this.options.publish!(
+            this.operationContext(client, command.operation, command.data)
+          )
+          this.telemetryEvent('publish')
+        })
+        return {}
+      }
+      case 'request': {
+        if (!this.options.request) {
+          throw new BrowserBrokerError('unavailable', 'Brokered request is not configured')
+        }
+        const response = await this.withResources(() =>
+          this.options.request!(this.operationContext(client, command.operation, command.data))
+        )
+        if (!(response instanceof Uint8Array)) {
+          throw new BrowserBrokerError('source-failed', 'Brokered request must return Uint8Array')
+        }
+        const result = copyBuffer(response)
+        this.telemetryEvent('request')
+        return { result, transfers: [result] }
+      }
       case 'restart':
         await this.restart(client, command.subscriptionId)
-        return undefined
+        return {}
       case 'stats':
-        return this.inspect()
+        return { result: this.inspect() }
       case 'heartbeat':
-        return undefined
-      case 'close':
-        await this.closeClient(client)
-        return undefined
+        return {}
       default:
         throw new BrowserBrokerError('invalid-command', 'Unexpected hello command')
     }
   }
 
-  private hello(
+  private async hello(
     client: HostClient,
     command: Extract<BrowserBrokerCommand, { type: 'hello' }>
-  ): void {
+  ): Promise<void> {
     if (client.identity) {
       if (identityKey(client.identity) !== identityKey(command.identity)) {
         throw new BrowserBrokerError(
@@ -853,15 +1022,25 @@ class DefaultBrowserBrokerWorkerHost implements BrowserBrokerWorkerHost {
     }
     const identity = cloneIdentity(command.identity)
     const key = identityKey(identity)
+    const incoming = new Uint8Array(command.credentials)
     let store = this.credentialStores.get(key)
-    if (!store) {
-      store = new MutableCredentials(
-        command.credentialRevision,
-        new Uint8Array(command.credentials)
+    let listenerFailure: unknown
+    try {
+      if (!store) {
+        store = new MutableCredentials(command.credentialRevision, incoming)
+        this.credentialStores.set(key, store)
+      } else {
+        listenerFailure = store.accept(command.credentialRevision, incoming)
+      }
+    } finally {
+      incoming.fill(0)
+    }
+    if (listenerFailure !== undefined) {
+      await this.invalidateIdentity(client, key)
+      throw new BrowserBrokerError(
+        'source-failed',
+        'A source rejected the refreshed credentials; the broker identity was closed'
       )
-      this.credentialStores.set(key, store)
-    } else {
-      store.accept(command.credentialRevision, new Uint8Array(command.credentials))
     }
     client.identity = identity
     client.credentialKey = key
@@ -873,6 +1052,7 @@ class DefaultBrowserBrokerWorkerHost implements BrowserBrokerWorkerHost {
     client: HostClient,
     command: Extract<BrowserBrokerCommand, { type: 'attach' }>
   ): Promise<void> {
+    await this.awaitIdleResources()
     if (client.subscriptions.has(command.subscriptionId)) {
       throw new BrowserBrokerError(
         'subscription-exists',
@@ -890,8 +1070,15 @@ class DefaultBrowserBrokerWorkerHost implements BrowserBrokerWorkerHost {
       )
     }
     if (!source) {
-      source = this.openSource(identity, command.source, command.resumeAfter)
-      created = true
+      try {
+        source = await this.openSource(identity, command.source, command.resumeAfter)
+        created = true
+      } catch (error) {
+        await this.closeIdleResources().catch(() => {
+          this.telemetryEvent('idle-resource-close-failed')
+        })
+        throw error
+      }
     }
     if (source.idleTimer) {
       clearTimeout(source.idleTimer)
@@ -912,24 +1099,34 @@ class DefaultBrowserBrokerWorkerHost implements BrowserBrokerWorkerHost {
     client.subscriptions.set(subscription.id, subscription)
     source.subscriptions.add(subscription)
     this.postState(subscription, 'connecting')
-    if (!created) this.enqueueRetained(subscription, command.resumeAfter)
+    if (!created && command.reattach) this.enqueueRetained(subscription, command.resumeAfter)
     this.telemetryEvent('subscription-attached')
 
-    const snapshot = source.handle.getSnapshot()
-    if (snapshot.phase === 'error') await this.restartSource(source)
-    await source.handle.ready
-    if (!subscription.resumeRequired) {
-      this.postState(subscription, 'live', undefined, subscription.lastCursor)
-      this.flush(subscription)
+    try {
+      const snapshot = source.handle.getSnapshot()
+      if (!created && snapshot.phase === 'error') await this.restartSource(source)
+      await source.handle.ready
+      if (!subscription.resumeRequired) {
+        this.postState(subscription, 'live', undefined, subscription.lastCursor)
+        this.flush(subscription)
+      }
+      this.recordQueueTelemetry()
+    } catch (error) {
+      if (client.subscriptions.get(subscription.id) === subscription) {
+        client.subscriptions.delete(subscription.id)
+        source.subscriptions.delete(subscription)
+        if (source.subscriptions.size === 0) await this.scheduleTeardown(source)
+      }
+      throw error
     }
-    this.recordQueueTelemetry()
   }
 
-  private openSource(
+  private async openSource(
     identity: BrowserBrokerIdentity,
     descriptor: BrowserBrokerSourceDescriptor,
     resumeAfter?: BrowserBrokerCursor
-  ): PhysicalSource {
+  ): Promise<PhysicalSource> {
+    this.resourcesActive = true
     const key = sourceKey(identity, descriptor)
     const credentials = this.credentialStores.get(identityKey(identity))
     if (!credentials) throw new BrowserBrokerError('not-connected', 'Credentials are unavailable')
@@ -942,28 +1139,38 @@ class DefaultBrowserBrokerWorkerHost implements BrowserBrokerWorkerHost {
     const handle = this.options.sessions.acquire(
       defineSession({ key, contract: descriptor.contract, source })
     )
-    let physical!: PhysicalSource
-    const sync = () => this.syncSource(physical)
-    const unsubscribe = handle.subscribe(sync)
-    physical = {
+    let unsubscribe: () => void = () => undefined
+    const physical: PhysicalSource = {
       key,
       identityKey: identityKey(identity),
       identity: cloneIdentity(identity),
       descriptor: Object.freeze({ ...descriptor }),
       handle,
       subscriptions: new Set(),
-      unsubscribe,
+      unsubscribe: () => unsubscribe(),
       log: [],
       logBytes: 0,
+      logTruncated: false,
       lastValueRevision: 0,
       idleTimer: undefined,
       closed: false,
     }
-    this.sources.set(key, physical)
-    this.syncSource(physical)
-    this.telemetryEvent('physical-source-opened')
-    this.telemetryGauge('natsail.browser.broker.sources.active', this.sources.size)
-    return physical
+    try {
+      unsubscribe = handle.subscribe(() => this.syncSource(physical))
+      this.sources.set(key, physical)
+      this.syncSource(physical)
+      this.telemetryEvent('physical-source-opened')
+      this.telemetryGauge('natsail.browser.broker.sources.active', this.sources.size)
+      return physical
+    } catch (error) {
+      physical.closed = true
+      unsubscribe()
+      if (this.sources.get(key) === physical) this.sources.delete(key)
+      await handle.release().catch(() => {
+        this.telemetryEvent('physical-source-release-failed')
+      })
+      throw error
+    }
   }
 
   private syncSource(source: PhysicalSource): void {
@@ -999,6 +1206,7 @@ class DefaultBrowserBrokerWorkerHost implements BrowserBrokerWorkerHost {
       const removed = source.log.shift()
       if (!removed) break
       source.logBytes -= removed.data.byteLength
+      source.logTruncated = true
     }
     for (const subscription of source.subscriptions) this.enqueue(subscription, entry)
     this.recordQueueTelemetry()
@@ -1008,7 +1216,14 @@ class DefaultBrowserBrokerWorkerHost implements BrowserBrokerWorkerHost {
     subscription: HostSubscription,
     resumeAfter: BrowserBrokerCursor | undefined
   ): void {
-    if (resumeAfter === undefined) return
+    if (resumeAfter === undefined) {
+      if (subscription.source.logTruncated) {
+        this.requireResume(subscription)
+        return
+      }
+      for (const entry of subscription.source.log) this.enqueue(subscription, entry)
+      return
+    }
     const index = subscription.source.log.findIndex((entry) =>
       cursorsEqual(entry.cursor, resumeAfter)
     )
@@ -1177,10 +1392,69 @@ class DefaultBrowserBrokerWorkerHost implements BrowserBrokerWorkerHost {
     this.telemetryEvent('physical-source-closed')
     this.telemetryGauge('natsail.browser.broker.sources.active', this.sources.size)
     this.cleanupCredentials(source.identityKey)
+    if (this.sources.size === 0) await this.closeIdleResources()
+  }
+
+  private operationContext(
+    client: HostClient,
+    operation: string,
+    data: ArrayBuffer
+  ): BrowserBrokerOperationContext {
+    return {
+      identity: cloneIdentity(client.identity!),
+      operation,
+      data: new Uint8Array(data),
+      credentials: this.credentialStores.get(client.credentialKey!)!,
+    }
+  }
+
+  private async awaitIdleResources(): Promise<void> {
+    await this.idleResourceClose?.catch(() => undefined)
+  }
+
+  private async withResources<T>(operation: () => T | Promise<T>): Promise<T> {
+    await this.awaitIdleResources()
+    this.resourcesActive = true
+    this.activeOperations += 1
+    try {
+      return await operation()
+    } finally {
+      this.activeOperations -= 1
+      if (this.activeOperations === 0 && this.sources.size === 0) {
+        await this.closeIdleResources().catch(() => {
+          this.telemetryEvent('idle-resource-close-failed')
+        })
+      }
+    }
+  }
+
+  private closeIdleResources(): Promise<void> {
+    if (
+      !this.resourcesActive ||
+      !this.options.closeIdleResources ||
+      this.sources.size > 0 ||
+      this.activeOperations > 0
+    ) {
+      return Promise.resolve()
+    }
+    if (this.idleResourceClose) return this.idleResourceClose
+    const closing = Promise.resolve().then(() => this.options.closeIdleResources!())
+    this.idleResourceClose = closing
+    void closing.then(
+      () => {
+        this.resourcesActive = false
+        if (this.idleResourceClose === closing) this.idleResourceClose = undefined
+      },
+      () => {
+        if (this.idleResourceClose === closing) this.idleResourceClose = undefined
+      }
+    )
+    return closing
   }
 
   private async closeClient(client: HostClient): Promise<void> {
     if (client.closed) return
+    client.closing = true
     client.closed = true
     for (const subscription of [...client.subscriptions.values()]) {
       await this.detach(client, subscription.id).catch(() => undefined)
@@ -1195,6 +1469,41 @@ class DefaultBrowserBrokerWorkerHost implements BrowserBrokerWorkerHost {
     if (client.credentialKey) this.cleanupCredentials(client.credentialKey)
   }
 
+  private async invalidateIdentity(current: HostClient, key: string): Promise<void> {
+    const invalidate = async (client: HostClient) => {
+      if (client.credentialKey !== key) return
+      const subscriptions = [...client.subscriptions.values()]
+      for (const subscription of subscriptions) {
+        this.postState(subscription, 'error', 'source-error', subscription.lastCursor)
+        await this.detach(client, subscription.id).catch(() => undefined)
+      }
+      delete client.identity
+      delete client.credentialKey
+      this.telemetryEvent('identity-closed')
+    }
+    const invalidations = [...this.clients.values()]
+      .filter((client) => client.credentialKey === key)
+      .map((client) => {
+        if (client === current) return invalidate(client)
+        const queued = client.pending.then(() => invalidate(client))
+        client.pending = queued.catch(() => undefined)
+        return queued
+      })
+    await Promise.all(invalidations)
+    this.cleanupCredentials(key)
+    this.telemetryGauge('natsail.browser.broker.tabs.active', this.inspect().tabCount)
+  }
+
+  private enqueueClientClose(client: HostClient): Promise<void> {
+    if (client.closed) return Promise.resolve()
+    client.closing = true
+    const close = client.pending
+      .then(() => Promise.all([...client.activeCommands]))
+      .then(() => this.closeClient(client))
+    client.pending = close.catch(() => undefined)
+    return close
+  }
+
   private cleanupCredentials(key: string): void {
     const usedByClient = [...this.clients.values()].some((client) => client.credentialKey === key)
     const usedBySource = [...this.sources.values()].some((source) => source.identityKey === key)
@@ -1203,7 +1512,12 @@ class DefaultBrowserBrokerWorkerHost implements BrowserBrokerWorkerHost {
     this.credentialStores.delete(key)
   }
 
-  private postResult(client: HostClient, id: number, result?: unknown): void {
+  private postResult(
+    client: HostClient,
+    id: number,
+    result?: unknown,
+    transfers: Transferable[] = []
+  ): void {
     if (client.closed && result !== undefined) return
     const message: BrowserBrokerResult = {
       ...envelope(),
@@ -1212,7 +1526,7 @@ class DefaultBrowserBrokerWorkerHost implements BrowserBrokerWorkerHost {
       ok: true,
       ...(result === undefined ? {} : { result }),
     }
-    this.post(client, message)
+    this.post(client, message, transfers)
   }
 
   private postFailure(client: HostClient, id: number, error: unknown): void {
@@ -1335,6 +1649,10 @@ export interface BrowserBrokerClient {
   readonly mode: 'shared-worker' | 'tab-local'
   connect(): Promise<void>
   createSource(descriptor: BrowserBrokerSourceDescriptor): BrowserBrokerSessionSource
+  /** Publishes through the worker's application-authorized operation mapping. */
+  publish(operation: string, data?: Uint8Array): Promise<void>
+  /** Requests through the worker's application-authorized operation mapping. */
+  request(operation: string, data?: Uint8Array): Promise<Uint8Array>
   refreshCredentials(): Promise<void>
   restart(subscriptionId: string): Promise<void>
   reconnect(): Promise<void>
@@ -1385,6 +1703,7 @@ class ClientSourceLease implements BrowserBrokerSubscriptionLease {
   private acceptChain = Promise.resolve()
   private readySettled = false
   private closedSettled = false
+  private terminal = false
 
   constructor(
     private readonly client: DefaultBrowserBrokerClient,
@@ -1419,24 +1738,26 @@ class ClientSourceLease implements BrowserBrokerSubscriptionLease {
       .then(async () => {
         let cursor: BrowserBrokerCursor | undefined
         for (const item of batch.items) {
+          if (this.terminal || !this.client.isCurrentGeneration(generation)) return
           cursor = copyCursor(item.cursor)
           await this.accept({
             data: new Uint8Array(item.data),
             ...(cursor === undefined ? {} : { cursor }),
           })
+          if (this.terminal || !this.client.isCurrentGeneration(generation)) return
         }
-        if (!this.client.isCurrentGeneration(generation)) return
         this.lastCursor = copyCursor(cursor)
         await this.client.ack(this, batch.batchId, cursor, generation)
       })
       .catch((error) => {
         // A replaced port rejects its pending acknowledgements. That failure
         // belongs to the old worker generation; the reattached lease remains live.
-        if (this.client.isCurrentGeneration(generation)) this.fail(error)
+        if (this.client.isCurrentGeneration(generation)) this.client.failLease(this, error)
       })
   }
 
   fail(error: unknown): void {
+    this.terminal = true
     if (!this.readySettled) {
       this.readySettled = true
       this.readyState.reject(error)
@@ -1448,6 +1769,7 @@ class ClientSourceLease implements BrowserBrokerSubscriptionLease {
   }
 
   finish(): void {
+    this.terminal = true
     if (!this.readySettled) {
       this.readySettled = true
       this.readyState.resolve()
@@ -1459,7 +1781,8 @@ class ClientSourceLease implements BrowserBrokerSubscriptionLease {
   }
 
   async reattach(): Promise<void> {
-    await this.client.attachLease(this)
+    if (this.terminal) return
+    await this.client.attachLease(this, true)
   }
 
   private async attach(): Promise<void> {
@@ -1467,7 +1790,7 @@ class ClientSourceLease implements BrowserBrokerSubscriptionLease {
       await this.client.attachLease(this)
       this.attached()
     } catch (error) {
-      this.fail(error)
+      this.client.failLease(this, error)
     }
   }
 }
@@ -1522,7 +1845,7 @@ class DefaultBrowserBrokerClient implements BrowserBrokerClient {
     this.assertOpen()
     const credentials = parseCredentialSnapshot(await this.options.credentials())
     const buffer = copyBuffer(credentials.bytes)
-    await this.request(
+    await this.sendCommand(
       {
         ...envelope(),
         type: 'refresh-credentials',
@@ -1534,9 +1857,43 @@ class DefaultBrowserBrokerClient implements BrowserBrokerClient {
     )
   }
 
+  async publish(operation: string, data: Uint8Array = new Uint8Array(0)): Promise<void> {
+    this.assertOpen()
+    const buffer = copyBuffer(byteArray(data, 'data'))
+    await this.sendCommand(
+      {
+        ...envelope(),
+        type: 'publish',
+        requestId: this.nextRequestId(),
+        operation: stringField(operation, 'operation'),
+        data: buffer,
+      },
+      [buffer]
+    )
+  }
+
+  async request(operation: string, data: Uint8Array = new Uint8Array(0)): Promise<Uint8Array> {
+    this.assertOpen()
+    const buffer = copyBuffer(byteArray(data, 'data'))
+    const result = await this.sendCommand(
+      {
+        ...envelope(),
+        type: 'request',
+        requestId: this.nextRequestId(),
+        operation: stringField(operation, 'operation'),
+        data: buffer,
+      },
+      [buffer]
+    )
+    if (Object.prototype.toString.call(result) !== '[object ArrayBuffer]') {
+      throw new BrowserBrokerError('invalid-state', 'Brokered request returned invalid bytes')
+    }
+    return new Uint8Array(result as ArrayBuffer)
+  }
+
   restart(subscriptionId: string): Promise<void> {
     this.assertOpen()
-    return this.request({
+    return this.sendCommand({
       ...envelope(),
       type: 'restart',
       requestId: this.nextRequestId(),
@@ -1555,11 +1912,13 @@ class DefaultBrowserBrokerClient implements BrowserBrokerClient {
 
   async stats(): Promise<BrowserBrokerStats> {
     this.assertOpen()
-    return (await this.request({
-      ...envelope(),
-      type: 'stats',
-      requestId: this.nextRequestId(),
-    })) as BrowserBrokerStats
+    return parseStats(
+      await this.sendCommand({
+        ...envelope(),
+        type: 'stats',
+        requestId: this.nextRequestId(),
+      })
+    )
   }
 
   async close(): Promise<void> {
@@ -1567,7 +1926,7 @@ class DefaultBrowserBrokerClient implements BrowserBrokerClient {
     this.closed = true
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
     if (this.port) {
-      await this.request({
+      await this.sendCommand({
         ...envelope(),
         type: 'close',
         requestId: this.nextRequestId(),
@@ -1589,18 +1948,30 @@ class DefaultBrowserBrokerClient implements BrowserBrokerClient {
     return value
   }
 
-  async attachLease(lease: ClientSourceLease): Promise<void> {
+  async attachLease(lease: ClientSourceLease, reattach = false): Promise<void> {
     this.assertOpen()
     if (!this.port) await this.connect()
     this.leases.set(lease.subscriptionId, lease)
-    await this.request({
-      ...envelope(),
-      type: 'attach',
-      requestId: this.nextRequestId(),
-      subscriptionId: lease.subscriptionId,
-      source: lease.descriptor,
-      ...(lease.lastCursor === undefined ? {} : { resumeAfter: copyCursor(lease.lastCursor) }),
-    })
+    try {
+      await this.sendCommand({
+        ...envelope(),
+        type: 'attach',
+        requestId: this.nextRequestId(),
+        subscriptionId: lease.subscriptionId,
+        source: lease.descriptor,
+        reattach,
+        ...(lease.lastCursor === undefined ? {} : { resumeAfter: copyCursor(lease.lastCursor) }),
+      })
+    } catch (error) {
+      if (
+        error instanceof BrowserBrokerError &&
+        error.code !== 'unavailable' &&
+        this.leases.get(lease.subscriptionId) === lease
+      ) {
+        this.leases.delete(lease.subscriptionId)
+      }
+      throw error
+    }
   }
 
   async detachLease(lease: ClientSourceLease): Promise<void> {
@@ -1610,7 +1981,7 @@ class DefaultBrowserBrokerClient implements BrowserBrokerClient {
     }
     this.leases.delete(lease.subscriptionId)
     if (this.port) {
-      await this.request({
+      await this.sendCommand({
         ...envelope(),
         type: 'detach',
         requestId: this.nextRequestId(),
@@ -1627,7 +1998,7 @@ class DefaultBrowserBrokerClient implements BrowserBrokerClient {
     generation: number
   ): Promise<void> {
     if (!this.isCurrentGeneration(generation)) return Promise.resolve()
-    return this.request({
+    return this.sendCommand({
       ...envelope(),
       type: 'ack',
       requestId: this.nextRequestId(),
@@ -1660,12 +2031,27 @@ class DefaultBrowserBrokerClient implements BrowserBrokerClient {
       this.mode = 'shared-worker'
     } catch (error) {
       if (this.options.strict || !this.options.fallback) {
-        throw new BrowserBrokerError(
+        const unavailable = new BrowserBrokerError(
           'unavailable',
           `SharedWorker broker is unavailable: ${error instanceof Error ? error.message : String(error)}`
         )
+        if (reconnect) {
+          for (const lease of [...this.leases.values()]) this.failLease(lease, unavailable)
+        }
+        throw unavailable
       }
-      port = await this.options.fallback()
+      try {
+        port = await this.options.fallback()
+      } catch (fallbackError) {
+        const unavailable = new BrowserBrokerError(
+          'unavailable',
+          `The tab-local broker fallback is unavailable: ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`
+        )
+        if (reconnect) {
+          for (const lease of [...this.leases.values()]) this.failLease(lease, unavailable)
+        }
+        throw unavailable
+      }
       this.mode = 'tab-local'
       this.telemetryEvent('fallback')
     }
@@ -1678,14 +2064,14 @@ class DefaultBrowserBrokerClient implements BrowserBrokerClient {
       port.onmessageerror = () => {
         if (!this.isCurrentGeneration(generation)) return
         void this.reconnect().catch((error) => {
-          for (const lease of this.leases.values()) lease.fail(error)
+          for (const lease of [...this.leases.values()]) this.failLease(lease, error)
         })
       }
       port.start()
 
       const credentials = parseCredentialSnapshot(await this.options.credentials())
       const buffer = copyBuffer(credentials.bytes)
-      await this.request(
+      await this.sendCommand(
         {
           ...envelope(),
           type: 'hello',
@@ -1698,12 +2084,19 @@ class DefaultBrowserBrokerClient implements BrowserBrokerClient {
       )
       if (reconnect) {
         this.telemetryEvent('worker-reconnect')
-        for (const lease of this.leases.values()) await lease.reattach()
+        for (const lease of [...this.leases.values()]) {
+          try {
+            await lease.reattach()
+          } catch (error) {
+            if (error instanceof BrowserBrokerError && error.code === 'unavailable') throw error
+            this.failLease(lease, error)
+          }
+        }
       }
       if (this.heartbeatIntervalMs > 0) {
         this.heartbeatTimer = setInterval(() => {
           if (!this.port) return
-          void this.request({
+          void this.sendCommand({
             ...envelope(),
             type: 'heartbeat',
             requestId: this.nextRequestId(),
@@ -1717,6 +2110,9 @@ class DefaultBrowserBrokerClient implements BrowserBrokerClient {
       port.onmessageerror = null
       port.close()
       await localHost?.close().catch(() => undefined)
+      if (reconnect) {
+        for (const lease of [...this.leases.values()]) this.failLease(lease, error)
+      }
       throw error
     }
   }
@@ -1727,7 +2123,7 @@ class DefaultBrowserBrokerClient implements BrowserBrokerClient {
     try {
       message = parseBrowserBrokerMessage(value)
     } catch (error) {
-      for (const lease of this.leases.values()) lease.fail(error)
+      for (const lease of [...this.leases.values()]) this.failLease(lease, error)
       return
     }
     if (message.type === 'result') {
@@ -1755,18 +2151,29 @@ class DefaultBrowserBrokerClient implements BrowserBrokerClient {
       return
     }
     if (message.state === 'live') {
-      lease.attached()
+      return
     } else if (message.state === 'resume-required') {
       this.telemetryEvent('tab-lagged')
-      lease.fail(new BrowserBrokerResumeRequiredError(message.cursor))
+      this.failLease(lease, new BrowserBrokerResumeRequiredError(message.cursor))
     } else if (message.state === 'error') {
-      lease.fail(new BrowserBrokerError('source-failed', 'The physical broker source failed'))
+      this.failLease(
+        lease,
+        new BrowserBrokerError('source-failed', 'The physical broker source failed')
+      )
     } else if (message.state === 'closed') {
-      lease.finish()
+      void this.detachLease(lease).catch(() => lease.finish())
     }
   }
 
-  private request(command: BrowserBrokerCommand, transfers: Transferable[] = []): Promise<unknown> {
+  failLease(lease: ClientSourceLease, error: unknown): void {
+    lease.fail(error)
+    void this.detachLease(lease).catch(() => undefined)
+  }
+
+  private sendCommand(
+    command: BrowserBrokerCommand,
+    transfers: Transferable[] = []
+  ): Promise<unknown> {
     if (!this.port) {
       return Promise.reject(new BrowserBrokerError('unavailable', 'No browser broker port exists'))
     }
@@ -1777,7 +2184,9 @@ class DefaultBrowserBrokerClient implements BrowserBrokerClient {
         reject(error)
         if (command.type !== 'hello' && !this.closed) {
           void this.reconnect().catch((reconnectError) => {
-            for (const lease of this.leases.values()) lease.fail(reconnectError)
+            for (const lease of [...this.leases.values()]) {
+              this.failLease(lease, reconnectError)
+            }
           })
         }
       }, this.requestTimeoutMs)
@@ -1794,7 +2203,9 @@ class DefaultBrowserBrokerClient implements BrowserBrokerClient {
         reject(unavailable)
         if (command.type !== 'hello' && !this.closed) {
           void this.reconnect().catch((reconnectError) => {
-            for (const lease of this.leases.values()) lease.fail(reconnectError)
+            for (const lease of [...this.leases.values()]) {
+              this.failLease(lease, reconnectError)
+            }
           })
         }
       }

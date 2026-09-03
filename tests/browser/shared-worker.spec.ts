@@ -3,7 +3,7 @@ import { expect, test } from '@playwright/test'
 test('shares one physical SessionSource across two tabs', async ({ context }) => {
   const first = await context.newPage()
   const second = await context.newPage()
-  const subject = `tests.browser-broker.${crypto.randomUUID()}`
+  const source = 'acceptance-events'
 
   await Promise.all([first.goto('/shared-worker.html'), second.goto('/shared-worker.html')])
   await Promise.all(
@@ -13,30 +13,33 @@ test('shares one physical SessionSource across two tabs', async ({ context }) =>
   )
   await Promise.all(
     [first, second].map((page) =>
-      page.evaluate(
-        (activeSubject) => window.natsailBrowserBroker.subscribe(activeSubject),
-        subject
-      )
+      page.evaluate((sourceKey) => window.natsailBrowserBroker.subscribe(sourceKey), source)
     )
   )
 
   const firstDelivery = first.evaluate(
-    (activeSubject) => window.natsailBrowserBroker.nextMessage(activeSubject),
-    subject
+    (sourceKey) => window.natsailBrowserBroker.nextMessage(sourceKey),
+    source
   )
   const secondDelivery = second.evaluate(
-    (activeSubject) => window.natsailBrowserBroker.nextMessage(activeSubject),
-    subject
+    (sourceKey) => window.natsailBrowserBroker.nextMessage(sourceKey),
+    source
   )
   await first.evaluate(
-    ({ activeSubject, value }) => window.natsailBrowserBroker.publish(activeSubject, value),
-    { activeSubject: subject, value: 'one-physical-source' }
+    ({ operation, value }) => window.natsailBrowserBroker.publish(operation, value),
+    { operation: 'publish-acceptance-event', value: 'one-physical-source' }
   )
 
   await expect(Promise.all([firstDelivery, secondDelivery])).resolves.toEqual([
     'one-physical-source',
     'one-physical-source',
   ])
+  await expect(
+    first.evaluate(
+      ({ operation, value }) => window.natsailBrowserBroker.request(operation, value),
+      { operation: 'echo', value: 'brokered-request' }
+    )
+  ).resolves.toBe('brokered-request')
   await expect(first.evaluate(() => window.natsailBrowserBroker.stats())).resolves.toMatchObject({
     tabCount: 2,
     activeConnectionCount: 1,

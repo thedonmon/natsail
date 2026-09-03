@@ -68,6 +68,7 @@ function controlledMessages() {
   const queued: JsMsg[] = []
   let wake = deferred()
   let closed = false
+  let closedError: Error | undefined
   let pulled = 0
   const messages = {
     async *[Symbol.asyncIterator]() {
@@ -85,7 +86,7 @@ function controlledMessages() {
       closed = true
       wake.resolve()
     }),
-    closed: vi.fn(async () => undefined),
+    closed: vi.fn(async () => closedError),
     status: async function* () {},
   } as unknown as ConsumerMessages
   return {
@@ -99,6 +100,11 @@ function controlledMessages() {
       } as JsMsg)
       wake.resolve()
       wake = deferred()
+    },
+    fail(error: Error) {
+      closedError = error
+      closed = true
+      wake.resolve()
     },
     pulled: () => pulled,
   }
@@ -388,6 +394,53 @@ describe('reducing JetStream batch barriers', () => {
     expect(snapshots.at(-1)).toEqual([1])
     expect(lease.inspect().cursor).toBeUndefined()
     expect(mocks.checkpointSave).toHaveBeenCalledOnce()
+    await active.close()
+  })
+
+  it('creates a fresh batcher when an infrastructure failure is recovered', async () => {
+    const first = controlledMessages()
+    const second = controlledMessages()
+    mocks.getConsumer
+      .mockResolvedValueOnce({
+        consume: async () => first.messages,
+        info: async () => ({ num_pending: 0 }),
+        delete: async () => true,
+      } as unknown as Consumer)
+      .mockResolvedValueOnce({
+        consume: async () => second.messages,
+        info: async () => ({ num_pending: 0 }),
+        delete: async () => true,
+      } as unknown as Consumer)
+    const active = runtime()
+    const snapshots: number[][] = []
+    const source = createReducingJetStreamSessionSource(
+      active,
+      {
+        stream: 'EVENTS',
+        filter: 'events.>',
+        start: 'all',
+        codec: natsCodecs.text,
+        recovery: { maxAttempts: 2, delayMs: 0 },
+        batchPolicy: { maxItems: 1 },
+      },
+      {
+        scope: 'numbers:v1',
+        initial: () => [] as number[],
+        reduce: (state, delivery) => [...state, Number(delivery.value)],
+      }
+    )
+    const lease = source(async (snapshot) => snapshots.push([...snapshot.data]))
+    await lease.ready
+
+    first.push(1)
+    await vi.waitFor(() => expect(snapshots.at(-1)).toEqual([1]))
+    first.fail(new Error('consumer transport failed'))
+    await vi.waitFor(() => expect(lease.inspect().restarts).toBe(1))
+    await vi.waitFor(() => expect(mocks.getConsumer).toHaveBeenCalledTimes(2))
+    second.push(2)
+    await vi.waitFor(() => expect(snapshots.at(-1)).toEqual([1, 2]))
+
+    await lease.close()
     await active.close()
   })
 })

@@ -129,6 +129,17 @@ describe('@natsail/browser-broker', () => {
       })
     ).toThrow(expect.objectContaining({ code: 'invalid-command' }))
 
+    expect(() =>
+      parseBrowserBrokerCommand({
+        protocol: NATS_BROWSER_BROKER_PROTOCOL,
+        version: NATS_BROWSER_BROKER_PROTOCOL_VERSION,
+        type: 'attach',
+        requestId: 1,
+        subscriptionId: 'source-1',
+        source: descriptor,
+      })
+    ).toThrow(expect.objectContaining({ code: 'invalid-command' }))
+
     expect(
       parseBrowserBrokerCommand({
         protocol: NATS_BROWSER_BROKER_PROTOCOL,
@@ -246,6 +257,336 @@ describe('@natsail/browser-broker', () => {
     )
 
     await closeAll([first, second], [host], [sessions])
+  })
+
+  it('routes publish and request through application-authorized worker operations', async () => {
+    const source = controlledSource()
+    const sessions = createSessionRegistry()
+    const published: Array<{ operation: string; value: string; revision: number }> = []
+    const closeIdleResources = vi.fn(async () => undefined)
+    const host = createHost(source, {
+      sessions,
+      createSource: source.factory,
+      sweepIntervalMs: 0,
+      closeIdleResources,
+      publish: ({ operation, data, credentials: activeCredentials }) => {
+        published.push({
+          operation,
+          value: decoder.decode(data),
+          revision: activeCredentials.current().revision,
+        })
+      },
+      request: ({ identity: activeIdentity, operation, data }) =>
+        encoder.encode(`${activeIdentity.tenant}:${operation}:${decoder.decode(data)}`),
+    })
+    const client = await createBrowserBrokerClient({
+      identity,
+      credentials,
+      connect: connector(host),
+      heartbeatIntervalMs: 0,
+    })
+
+    await client.publish('send-chat', encoder.encode('hello'))
+    expect(closeIdleResources).toHaveBeenCalledOnce()
+    await expect(client.request('lookup-chat', encoder.encode('42'))).resolves.toEqual(
+      encoder.encode('tenant-a:lookup-chat:42')
+    )
+    expect(closeIdleResources).toHaveBeenCalledTimes(2)
+    expect(published).toEqual([{ operation: 'send-chat', value: 'hello', revision: 1 }])
+    await expect(
+      client.publish('send-chat', new ArrayBuffer(0) as unknown as Uint8Array)
+    ).rejects.toMatchObject<Partial<BrowserBrokerError>>({ code: 'invalid-command' })
+
+    await closeAll([client], [host], [sessions])
+  })
+
+  it('releases worker-owned resources after the final physical source closes', async () => {
+    const source = controlledSource()
+    const sessions = createSessionRegistry()
+    const closeIdleResources = vi.fn(async () => undefined)
+    const host = createHost(source, {
+      sessions,
+      createSource: source.factory,
+      closeIdleResources,
+      sweepIntervalMs: 0,
+    })
+    const client = await createBrowserBrokerClient({
+      identity,
+      credentials,
+      connect: connector(host),
+      heartbeatIntervalMs: 0,
+    })
+    const lease = client.createSource(descriptor)(async () => undefined)
+    await lease.ready
+    await lease.close()
+
+    await vi.waitFor(() => expect(closeIdleResources).toHaveBeenCalledOnce())
+    const replacement = client.createSource(descriptor)(async () => undefined)
+    await replacement.ready
+    expect(source.opens).toBe(2)
+
+    await replacement.close()
+    await vi.waitFor(() => expect(closeIdleResources).toHaveBeenCalledTimes(2))
+    await closeAll([client], [host], [sessions])
+  })
+
+  it('does not close shared resources while a broker operation is in flight', async () => {
+    const source = controlledSource()
+    const sessions = createSessionRegistry()
+    const closeIdleResources = vi.fn(async () => undefined)
+    let publishStarted!: () => void
+    let releasePublish!: () => void
+    const started = new Promise<void>((resolve) => {
+      publishStarted = resolve
+    })
+    const blocked = new Promise<void>((resolve) => {
+      releasePublish = resolve
+    })
+    const host = createHost(source, {
+      sessions,
+      createSource: source.factory,
+      closeIdleResources,
+      sweepIntervalMs: 0,
+      publish: async () => {
+        publishStarted()
+        await blocked
+      },
+    })
+    const sourceClient = await createBrowserBrokerClient({
+      identity,
+      credentials,
+      connect: connector(host),
+      heartbeatIntervalMs: 0,
+    })
+    const operationClient = await createBrowserBrokerClient({
+      identity,
+      credentials,
+      connect: connector(host),
+      heartbeatIntervalMs: 0,
+    })
+    const lease = sourceClient.createSource(descriptor)(async () => undefined)
+    await lease.ready
+
+    const publishing = operationClient.publish('send-chat')
+    await started
+    await lease.close()
+    expect(closeIdleResources).not.toHaveBeenCalled()
+
+    releasePublish()
+    await publishing
+    expect(closeIdleResources).toHaveBeenCalledOnce()
+
+    await closeAll([sourceClient, operationClient], [host], [sessions])
+  })
+
+  it('keeps acknowledgements and liveness moving during a slow broker operation', async () => {
+    const source = controlledSource()
+    const sessions = createSessionRegistry()
+    let now = 0
+    let publishStarted!: () => void
+    let releasePublish!: () => void
+    const started = new Promise<void>((resolve) => {
+      publishStarted = resolve
+    })
+    const blocked = new Promise<void>((resolve) => {
+      releasePublish = resolve
+    })
+    const host = createHost(source, {
+      sessions,
+      createSource: source.factory,
+      maxTabQueueItems: 1,
+      maxBatchItems: 1,
+      clientTimeoutMs: 10,
+      sweepIntervalMs: 0,
+      telemetryClock: { now: () => now },
+      publish: async () => {
+        publishStarted()
+        await blocked
+      },
+    })
+    const client = await createBrowserBrokerClient({
+      identity,
+      credentials,
+      connect: connector(host),
+      heartbeatIntervalMs: 0,
+    })
+    const values: string[] = []
+    const lease = client.createSource(descriptor)(async (delivery) => {
+      values.push(decoder.decode(delivery.data))
+    })
+    await lease.ready
+
+    const publishing = client.publish('slow-operation')
+    await started
+    await source.emit(0, 'first', cursor(1))
+    await vi.waitFor(async () => expect((await client.stats()).queuedItems).toBe(0))
+    await source.emit(0, 'second', cursor(2))
+    await vi.waitFor(() => expect(values).toEqual(['first', 'second']))
+
+    now = 100
+    await host.sweepIdleClients()
+    expect(host.inspect()).toMatchObject({ tabCount: 1, subscriptionCount: 1 })
+
+    releasePublish()
+    await publishing
+    await lease.close()
+    await closeAll([client], [host], [sessions])
+  })
+
+  it('preserves same-tab publish order without blocking subscription control', async () => {
+    const source = controlledSource()
+    const sessions = createSessionRegistry()
+    const started: string[] = []
+    let releaseFirst!: () => void
+    const firstBlocked = new Promise<void>((resolve) => {
+      releaseFirst = resolve
+    })
+    const host = createHost(source, {
+      sessions,
+      createSource: source.factory,
+      sweepIntervalMs: 0,
+      publish: async (context) => {
+        started.push(context.operation)
+        if (context.operation === 'first') await firstBlocked
+      },
+    })
+    const client = await createBrowserBrokerClient({
+      identity,
+      credentials,
+      connect: connector(host),
+      heartbeatIntervalMs: 0,
+    })
+    const first = client.publish('first')
+    const second = client.publish('second')
+
+    await vi.waitFor(() => expect(started).toEqual(['first']))
+    await expect(client.stats()).resolves.toMatchObject({ tabCount: 1 })
+    releaseFirst()
+    await Promise.all([first, second])
+    expect(started).toEqual(['first', 'second'])
+
+    await closeAll([client], [host], [sessions])
+  })
+
+  it('removes failed source attachments instead of retaining dead host references', async () => {
+    const sessions = createSessionRegistry()
+    let closes = 0
+    const host = createBrowserBrokerWorker({
+      sessions,
+      sweepIntervalMs: 0,
+      createSource: () => () => ({
+        ready: Promise.reject(new Error('source did not open')),
+        closed: new Promise<void>(() => undefined),
+        close: async () => {
+          closes += 1
+        },
+      }),
+    })
+    const client = await createBrowserBrokerClient({
+      identity,
+      credentials,
+      connect: connector(host),
+      heartbeatIntervalMs: 0,
+    })
+    const lease = client.createSource(descriptor)(async () => undefined)
+
+    await expect(lease.ready).rejects.toMatchObject<Partial<BrowserBrokerError>>({
+      code: 'source-failed',
+    })
+    await vi.waitFor(() =>
+      expect(host.inspect()).toMatchObject({ subscriptionCount: 0, physicalSourceCount: 0 })
+    )
+    expect(closes).toBe(1)
+
+    await closeAll([client], [host], [sessions])
+  })
+
+  it('releases a source whose initial broker snapshot is invalid', async () => {
+    const sessions = createSessionRegistry()
+    let closes = 0
+    const host = createBrowserBrokerWorker({
+      sessions,
+      sweepIntervalMs: 0,
+      createSource: () => (accept) => {
+        void accept({ data: 'not-bytes' } as unknown as BrowserBrokerDelivery)
+        return {
+          ready: Promise.resolve(),
+          closed: new Promise<void>(() => undefined),
+          close: async () => {
+            closes += 1
+          },
+        }
+      },
+    })
+    const client = await createBrowserBrokerClient({
+      identity,
+      credentials,
+      connect: connector(host),
+      heartbeatIntervalMs: 0,
+    })
+    const lease = client.createSource(descriptor)(async () => undefined)
+
+    await expect(lease.ready).rejects.toMatchObject<Partial<BrowserBrokerError>>({
+      code: 'source-failed',
+    })
+    await vi.waitFor(() =>
+      expect(host.inspect()).toMatchObject({ subscriptionCount: 0, physicalSourceCount: 0 })
+    )
+    expect(closes).toBe(1)
+
+    await closeAll([client], [host], [sessions])
+  })
+
+  it('releases worker resources when a source factory throws before attachment', async () => {
+    const sessions = createSessionRegistry()
+    const closeIdleResources = vi.fn(async () => undefined)
+    const host = createBrowserBrokerWorker({
+      sessions,
+      sweepIntervalMs: 0,
+      closeIdleResources,
+      createSource: () => {
+        throw new Error('source factory failed')
+      },
+    })
+    const client = await createBrowserBrokerClient({
+      identity,
+      credentials,
+      connect: connector(host),
+      heartbeatIntervalMs: 0,
+    })
+    const lease = client.createSource(descriptor)(async () => undefined)
+
+    await expect(lease.ready).rejects.toMatchObject<Partial<BrowserBrokerError>>({
+      code: 'source-failed',
+    })
+    await vi.waitFor(() => expect(closeIdleResources).toHaveBeenCalledOnce())
+    expect(host.inspect()).toMatchObject({ subscriptionCount: 0, physicalSourceCount: 0 })
+
+    await closeAll([client], [host], [sessions])
+  })
+
+  it('detaches a subscription when its downstream accept handler fails', async () => {
+    const source = controlledSource()
+    const sessions = createSessionRegistry()
+    const host = createHost(source, { sessions, createSource: source.factory, sweepIntervalMs: 0 })
+    const client = await createBrowserBrokerClient({
+      identity,
+      credentials,
+      connect: connector(host),
+      heartbeatIntervalMs: 0,
+    })
+    const lease = client.createSource(descriptor)(async () => {
+      throw new Error('downstream failed')
+    })
+    await lease.ready
+    await source.emit(0, 'failure', cursor(1))
+
+    await expect(lease.closed).rejects.toThrow('downstream failed')
+    await vi.waitFor(() =>
+      expect(host.inspect()).toMatchObject({ subscriptionCount: 0, physicalSourceCount: 0 })
+    )
+
+    await closeAll([client], [host], [sessions])
   })
 
   it('rejects a conflicting contract without opening another physical source', async () => {
@@ -537,6 +878,149 @@ describe('@natsail/browser-broker', () => {
     await closeAll([client], [firstHost, secondHost], [firstSessions, secondSessions])
   })
 
+  it('fails and removes active leases when worker replacement cannot connect', async () => {
+    const source = controlledSource()
+    const sessions = createSessionRegistry()
+    const host = createHost(source, { sessions, createSource: source.factory, sweepIntervalMs: 0 })
+    let replacementFails = false
+    const client = await createBrowserBrokerClient({
+      identity,
+      credentials,
+      connect: () => {
+        if (replacementFails) throw new Error('replacement unavailable')
+        return connector(host)()
+      },
+      heartbeatIntervalMs: 0,
+    })
+    const lease = client.createSource(descriptor)(async () => undefined)
+    await lease.ready
+
+    replacementFails = true
+    await expect(client.reconnect()).rejects.toMatchObject<Partial<BrowserBrokerError>>({
+      code: 'unavailable',
+    })
+    await expect(lease.closed).rejects.toMatchObject<Partial<BrowserBrokerError>>({
+      code: 'unavailable',
+    })
+    await expect(lease.close()).resolves.toBeUndefined()
+
+    await closeAll([client], [host], [sessions])
+  })
+
+  it('isolates one source-specific reattach failure during worker replacement', async () => {
+    const firstSource = controlledSource()
+    const firstSessions = createSessionRegistry()
+    const firstHost = createHost(firstSource, {
+      sessions: firstSessions,
+      createSource: firstSource.factory,
+      sweepIntervalMs: 0,
+    })
+    const replacementSource = controlledSource()
+    const replacementSessions = createSessionRegistry()
+    const replacementHost = createHost(replacementSource, {
+      sessions: replacementSessions,
+      createSource: (context) => {
+        if (context.descriptor.key === 'rejected') {
+          return () => ({
+            ready: Promise.reject(new Error('source is not authorized')),
+            closed: new Promise<void>(() => undefined),
+            close: async () => undefined,
+          })
+        }
+        return replacementSource.factory(context)
+      },
+      sweepIntervalMs: 0,
+    })
+    let activeHost = firstHost
+    const client = await createBrowserBrokerClient({
+      identity,
+      credentials,
+      connect: () => connector(activeHost)(),
+      heartbeatIntervalMs: 0,
+    })
+    const rejected = client.createSource({ key: 'rejected', contract: 'events:v1' })(
+      async () => undefined
+    )
+    const received: string[] = []
+    const healthy = client.createSource({ key: 'healthy', contract: 'events:v1' })(async (event) =>
+      received.push(decoder.decode(event.data))
+    )
+    await Promise.all([rejected.ready, healthy.ready])
+
+    activeHost = replacementHost
+    await expect(client.reconnect()).resolves.toBeUndefined()
+    await expect(rejected.closed).rejects.toMatchObject<Partial<BrowserBrokerError>>({
+      code: 'source-failed',
+    })
+    expect(replacementHost.inspect()).toMatchObject({
+      tabCount: 1,
+      physicalSourceCount: 1,
+      subscriptionCount: 1,
+    })
+    await replacementSource.emit(0, 'still-live', cursor(1))
+    await vi.waitFor(() => expect(received).toEqual(['still-live']))
+
+    await Promise.all([rejected.close(), healthy.close()])
+    await closeAll([client], [firstHost, replacementHost], [firstSessions, replacementSessions])
+  })
+
+  it('notifies every credential subscriber and closes only the rejected identity', async () => {
+    const source = controlledSource()
+    const sessions = createSessionRegistry()
+    const host = createHost(source, { sessions, createSource: source.factory, sweepIntervalMs: 0 })
+    let revision = 1
+    const client = await createBrowserBrokerClient({
+      identity,
+      credentials: () => credentials(revision),
+      connect: connector(host),
+      heartbeatIntervalMs: 0,
+    })
+    const otherClient = await createBrowserBrokerClient({
+      identity: { tenant: 'tenant-b', authenticationContext: 'browser-user-v1' },
+      credentials,
+      connect: connector(host),
+      heartbeatIntervalMs: 0,
+    })
+    const first = client.createSource({ key: 'first', contract: 'events:v1' })(
+      async () => undefined
+    )
+    const second = client.createSource({ key: 'second', contract: 'events:v1' })(
+      async () => undefined
+    )
+    const other = otherClient.createSource({ key: 'other', contract: 'events:v1' })(
+      async () => undefined
+    )
+    await Promise.all([first.ready, second.ready, other.ready])
+    const observed: string[] = []
+    source.contexts[0]!.credentials.subscribe((snapshot) => {
+      snapshot.bytes.fill(0)
+      throw new Error('listener failed')
+    })
+    source.contexts[1]!.credentials.subscribe((snapshot) =>
+      observed.push(`${snapshot.revision}:${decoder.decode(snapshot.bytes)}`)
+    )
+
+    revision = 2
+    await expect(client.refreshCredentials()).rejects.toMatchObject<Partial<BrowserBrokerError>>({
+      code: 'source-failed',
+    })
+    expect(observed).toEqual(['2:credential-2'])
+    await expect(first.closed).rejects.toMatchObject<Partial<BrowserBrokerError>>({
+      code: 'source-failed',
+    })
+    await expect(second.closed).rejects.toMatchObject<Partial<BrowserBrokerError>>({
+      code: 'source-failed',
+    })
+    expect(host.inspect()).toMatchObject({
+      tabCount: 1,
+      physicalSourceCount: 1,
+      subscriptionCount: 1,
+    })
+
+    await Promise.all([first.close(), second.close(), other.close()])
+    await closeAll([client, otherClient], [host], [sessions])
+  })
+
   it('never acknowledges an accepted batch into a replacement worker generation', async () => {
     const firstSource = controlledSource()
     const firstSessions = createSessionRegistry()
@@ -605,6 +1089,87 @@ describe('@natsail/browser-broker', () => {
 
     await lease.close()
     await closeAll([client], [firstHost, secondHost], [firstSessions, secondSessions])
+  })
+
+  it('replays retained unacknowledged history when a tab reconnects to the same worker', async () => {
+    const source = controlledSource()
+    const sessions = createSessionRegistry()
+    const host = createHost(source, { sessions, createSource: source.factory, sweepIntervalMs: 0 })
+    const client = await createBrowserBrokerClient({
+      identity,
+      credentials,
+      connect: connector(host),
+      heartbeatIntervalMs: 0,
+    })
+    let releaseFirst!: () => void
+    let firstStarted!: () => void
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve
+    })
+    const started = new Promise<void>((resolve) => {
+      firstStarted = resolve
+    })
+    let calls = 0
+    const values: string[] = []
+    const lease = client.createSource(descriptor)(async (delivery) => {
+      calls += 1
+      if (calls === 1) {
+        firstStarted()
+        await firstGate
+      }
+      values.push(decoder.decode(delivery.data))
+    })
+    await lease.ready
+    await source.emit(0, 'unacknowledged', cursor(1))
+    await started
+
+    await client.reconnect()
+    releaseFirst()
+    await vi.waitFor(() => expect(values).toEqual(['unacknowledged', 'unacknowledged']))
+
+    await lease.close()
+    await closeAll([client], [host], [sessions])
+  })
+
+  it('requires explicit resume when reconnect history was truncated before an acknowledgement', async () => {
+    const source = controlledSource()
+    const sessions = createSessionRegistry()
+    const host = createHost(source, {
+      sessions,
+      createSource: source.factory,
+      maxRetainedItems: 1,
+      maxBatchItems: 1,
+      sweepIntervalMs: 0,
+    })
+    const client = await createBrowserBrokerClient({
+      identity,
+      credentials,
+      connect: connector(host),
+      heartbeatIntervalMs: 0,
+    })
+    let releaseFirst!: () => void
+    let firstStarted!: () => void
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve
+    })
+    const started = new Promise<void>((resolve) => {
+      firstStarted = resolve
+    })
+    const lease = client.createSource(descriptor)(async () => {
+      firstStarted()
+      await firstGate
+    })
+    await lease.ready
+    await source.emit(0, 'first', cursor(1))
+    await started
+    await source.emit(0, 'second', cursor(2))
+
+    await client.reconnect()
+    await expect(lease.closed).rejects.toBeInstanceOf(BrowserBrokerResumeRequiredError)
+    releaseFirst()
+
+    await lease.close()
+    await closeAll([client], [host], [sessions])
   })
 
   it('uses an explicit tab-local fallback unless strict SharedWorker mode is requested', async () => {

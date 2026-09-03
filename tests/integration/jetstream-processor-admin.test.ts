@@ -193,9 +193,13 @@ describe('durable JetStream processor administration', () => {
     })
     await ensure.reconcile()
     await expect(ensure.pause(new Date(Date.now() + 60_000))).resolves.toMatchObject({
-      state: { paused: true },
+      status: 'paused',
+      inspection: { state: { paused: true } },
     })
-    await expect(ensure.resume()).resolves.toMatchObject({ state: { paused: false } })
+    await expect(ensure.resume()).resolves.toMatchObject({
+      status: 'resumed',
+      inspection: { state: { paused: false } },
+    })
     await expect(ensure.delete()).rejects.toBeInstanceOf(JetStreamProcessorConfigurationError)
     await expect(manager.consumers.info(stream, consumer)).resolves.toBeDefined()
 
@@ -217,7 +221,7 @@ describe('durable JetStream processor administration', () => {
       start: 'all',
     })
     await owned.reconcile()
-    await expect(owned.delete()).resolves.toBe(true)
+    await expect(owned.delete()).resolves.toEqual({ status: 'deleted' })
     await expect(manager.consumers.info(stream, consumer)).rejects.toThrow()
   })
 })

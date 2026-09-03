@@ -75,8 +75,11 @@ export {
   type JetStreamProcessorEditableField,
   type JetStreamProcessorImmutableField,
   type JetStreamProcessorNormalizedConfig,
+  type JetStreamProcessorDeleteResult,
+  type JetStreamProcessorPauseResult,
   type JetStreamProcessorReconciliationInspection,
   type JetStreamProcessorReconciliationResult,
+  type JetStreamProcessorResumeResult,
   type JetStreamProcessorSequenceInspection,
   type JetStreamProcessorStart,
 } from './processor-admin.js'
@@ -518,6 +521,12 @@ function markApplicationDeliveryFailure(error: unknown): never {
   throw wrapped
 }
 
+function combineOperationFailures(primary: unknown, cleanup: unknown): unknown {
+  return primary === undefined
+    ? cleanup
+    : new AggregateError([primary, cleanup], 'JetStream operation and cleanup both failed')
+}
+
 function recordCounter(
   telemetry: NatsailTelemetryReporter,
   name: NatsailTelemetryCounterName,
@@ -924,6 +933,8 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
       this.closedState.resolve()
     } catch (error) {
       this.batchControl?.cancel()
+      await this.batchControl?.settled()
+      await this.batchSettlement
       this.error = error
       this.setPhase('error')
       if (!this.readySettled) {
@@ -1040,6 +1051,7 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
   private error?: unknown
   private statusFailure?: Error
   private handlerFailure?: unknown
+  private recoveryBoundary: number | undefined
   private consumerState: JetStreamProcessorConsumerStateInspection = {
     pendingAcknowledgements: 0,
     pendingMessages: 0,
@@ -1059,6 +1071,7 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
     private readonly deleteOwnedOnClose = true,
     resumeAfter?: number
   ) {
+    this.recoveryBoundary = resumeAfter
     this.telemetry = runtime[NATS_RUNTIME_ADAPTER].telemetry
     this.controller = createJetStreamProcessorControllerForRecovery(runtime, options, resumeAfter)
     this.ready = this.readyState.promise
@@ -1120,6 +1133,22 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
       this.consumer = await client.consumers.get(this.options.stream, this.options.consumer.name)
       const consumerInfo = await this.consumer.info()
       this.consumerState = inspectJetStreamProcessorConsumerState(consumerInfo)
+      if (this.recoveryBoundary === undefined) {
+        const active = managed.active
+        if (
+          active?.deliverPolicy === DeliverPolicy.StartSequence &&
+          active.startSequence !== undefined &&
+          active.startSequence > 0
+        ) {
+          this.setRecoveryBoundary(active.startSequence - 1)
+        } else if (
+          this.options.start === 'new' &&
+          this.consumerState.delivered.consumer === 0 &&
+          this.consumerState.pendingAcknowledgements === 0
+        ) {
+          this.setRecoveryBoundary(this.consumerState.delivered.stream)
+        }
+      }
 
       if (this.closeRequested || this.options.signal?.aborted) {
         this.resolveReady()
@@ -1194,6 +1223,7 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
               stream: message.info.streamSequence,
             },
           }
+          this.setRecoveryBoundary(message.info.streamSequence)
           this.notify()
           recordCounter(this.telemetry, 'natsail.jetstream.acknowledgements', 1, {
             outcome: 'success',
@@ -1225,7 +1255,13 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
       if (abort) this.options.signal?.removeEventListener('abort', abort)
       if (this.messages) await this.messages.close().catch(() => undefined)
       if (this.deleteOwnedOnClose) {
-        await this.deleteOwnedConsumer()
+        try {
+          await this.deleteOwnedConsumer()
+        } catch (cleanupError) {
+          failure = combineOperationFailures(failure, cleanupError)
+          this.error = failure
+          this.setPhase('error')
+        }
       }
       if (failure === undefined) {
         this.setPhase('closed')
@@ -1257,10 +1293,24 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
     if (this.options.consumer.mode !== 'owned' || this.ownedConsumerDeleted) {
       return
     }
-    this.ownedConsumerDeleted = true
     // Re-read the metadata ownership marker immediately before deletion. A consumer
     // can be externally replaced under the same durable name while a lease is open.
-    await this.controller.delete().catch(() => undefined)
+    await this.controller.delete()
+    this.ownedConsumerDeleted = true
+  }
+
+  recoveryResumeAfter(): number | undefined {
+    return this.recoveryBoundary
+  }
+
+  private setRecoveryBoundary(boundary: number): void {
+    if (!Number.isSafeInteger(boundary) || boundary < 0) {
+      throw new JetStreamProcessorConfigurationError(
+        'reconciliation-rejected',
+        'The JetStream processor recovery boundary cannot be represented safely'
+      )
+    }
+    this.recoveryBoundary = boundary
   }
 
   private async observeDiagnostics(
@@ -1382,7 +1432,7 @@ class RecoveringJetStreamProcessor<T> implements JetStreamProcessorLease {
 
       while (!this.closeRequested && !this.options.signal?.aborted) {
         attempt += 1
-        const resumeAfter = this.retained?.inspect().acknowledged.stream
+        const resumeAfter = this.retained?.recoveryResumeAfter()
         const lease = new JetStreamProcessor(
           this.runtime,
           this.options,
@@ -1460,7 +1510,13 @@ class RecoveringJetStreamProcessor<T> implements JetStreamProcessorLease {
     } finally {
       if (abort) this.options.signal?.removeEventListener('abort', abort)
       if (this.options.consumer.mode === 'owned') {
-        await this.retained?.deleteOwnedConsumer()
+        try {
+          await this.retained?.deleteOwnedConsumer()
+        } catch (cleanupError) {
+          failure = combineOperationFailures(failure, cleanupError)
+          this.error = failure
+          this.phase = 'error'
+        }
       }
       if (failure === undefined) {
         this.closedState.resolve()
@@ -1604,8 +1660,15 @@ function validateProcessorOptions<T>(options: JetStreamProcessorOptions<T>): voi
 }
 
 function validateStart(start: JetStreamStart): void {
-  if (typeof start === 'object' && (!Number.isSafeInteger(start.after) || start.after < 0)) {
-    throw new RangeError('JetStream start.after must be a non-negative integer')
+  if (
+    typeof start === 'object' &&
+    (!Number.isSafeInteger(start.after) ||
+      start.after < 0 ||
+      start.after === Number.MAX_SAFE_INTEGER)
+  ) {
+    throw new RangeError(
+      'JetStream start.after must be a non-negative safe integer with room for the next sequence'
+    )
   }
 }
 
@@ -2026,49 +2089,59 @@ export function createReducingJetStreamSessionSource<Value, State>(
     }
 
     void publish('replaying')
-    const batcher: NatsailBatcher<JetStreamDelivery<Value>> = createNatsailBatcher(
-      batchPolicy,
-      async (deliveries) => {
-        work?.reset()
-        let nextState = state
-        let nextCursor = cursor
-        let nextReplayDelivered = replayDelivered
-        for (const delivery of deliveries) {
-          nextState = await reducer.reduce(nextState, delivery)
-          await work?.checkpoint()
-          nextCursor = delivery.cursor
-          if (!hydrated) nextReplayDelivered += 1
+    let activeBatcher: NatsailBatcher<JetStreamDelivery<Value>> | undefined
+    const open = () => {
+      const batcher: NatsailBatcher<JetStreamDelivery<Value>> = createNatsailBatcher(
+        batchPolicy,
+        async (deliveries) => {
+          work?.reset()
+          let nextState = state
+          let nextCursor = cursor
+          let nextReplayDelivered = replayDelivered
+          for (const delivery of deliveries) {
+            nextState = await reducer.reduce(nextState, delivery)
+            await work?.checkpoint()
+            nextCursor = delivery.cursor
+            if (!hydrated) nextReplayDelivered += 1
+          }
+          state = nextState
+          cursor = nextCursor
+          replayDelivered = nextReplayDelivered
+          if (hydrated) {
+            const leasePhase = lease.inspect().phase
+            await publish(
+              leasePhase === 'connecting' ||
+                leasePhase === 'replaying' ||
+                leasePhase === 'reconnecting'
+                ? 'reconnecting'
+                : 'live'
+            )
+          }
+        },
+        {
+          scheduler: options.scheduler ?? natsailDefaultScheduler,
+          telemetry: runtime[NATS_RUNTIME_ADAPTER].telemetry,
+          source: 'jetstream',
         }
-        state = nextState
-        cursor = nextCursor
-        replayDelivered = nextReplayDelivered
-        if (hydrated) {
-          const leasePhase = lease.inspect().phase
-          await publish(
-            leasePhase === 'connecting' ||
-              leasePhase === 'replaying' ||
-              leasePhase === 'reconnecting'
-              ? 'reconnecting'
-              : 'live'
-          )
-        }
-      },
-      {
-        scheduler: options.scheduler ?? natsailDefaultScheduler,
-        telemetry: runtime[NATS_RUNTIME_ADAPTER].telemetry,
-        source: 'jetstream',
+      )
+      activeBatcher = batcher
+      const handle = (delivery: JetStreamDelivery<Value>) => batcher.add(delivery)
+      const control: JetStreamBatchHandlerControl = {
+        flush: () => batcher.flush(),
+        backpressure: () => batcher.backpressure(),
+        pendingItems: () => batcher.pendingItems(),
+        barrier: (commit) => batcher.barrier(commit),
+        settled: () => batcher.settled(),
+        cancel: () => batcher.cancel(),
       }
-    )
-    const handle = (delivery: JetStreamDelivery<Value>) => batcher.add(delivery)
-    const control: JetStreamBatchHandlerControl = {
-      flush: () => batcher.flush(),
-      backpressure: () => batcher.backpressure(),
-      pendingItems: () => batcher.pendingItems(),
-      barrier: (commit) => batcher.barrier(commit),
-      settled: () => batcher.settled(),
-      cancel: () => batcher.cancel(),
+      return consumeJetStreamBatched(runtime, effectiveOptions, handle, control)
     }
-    const open = () => consumeJetStreamBatched(runtime, effectiveOptions, handle, control)
+    const handle = (delivery: JetStreamDelivery<Value>) => {
+      const batcher = activeBatcher
+      return batcher === undefined
+        ? Promise.reject(new Error('The reducing JetStream batcher is not active'))
+        : batcher.add(delivery)
+    }
     const lease = new RecoveringJetStreamLease(
       runtime,
       effectiveOptions,
@@ -2109,7 +2182,7 @@ export function createReducingJetStreamSessionSource<Value, State>(
       caughtUp,
       closed: lease.closed,
       close: () => {
-        batcher.cancel()
+        activeBatcher?.cancel()
         return lease.close()
       },
       inspect: () => lease.inspect(),

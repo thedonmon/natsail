@@ -42,7 +42,9 @@ Consumer ownership has three modes:
 - `ensure` creates or reuses a retained consumer and may update editable settings.
 - `owned` creates a durable consumer that the lease deletes when it closes and may safely recreate it.
 
-`createJetStreamProcessorController()` exposes cached inspection plus authoritative refresh, reconciliation, pause, resume, and ownership-guarded delete. Operations are serialized. Reconciliation results distinguish unchanged, created, updated, recreated, and rejected outcomes and report normalized desired/active configuration plus editable and immutable drift. `error`, `update-editable`, and `recreate-owned` policies cannot grant ownership that the consumer mode does not have.
+`createJetStreamProcessorController()` exposes cached inspection plus authoritative refresh, reconciliation, pause, resume, and ownership-guarded delete. Operations are serialized. Reconciliation results distinguish unchanged, created, updated, recreated, and rejected outcomes and report normalized desired/active configuration plus editable and immutable drift. Pause, resume, and delete return explicit `paused`, `resumed`, or `deleted` status objects. `error`, `update-editable`, and `recreate-owned` policies cannot grant ownership that the consumer mode does not have.
+
+Owned immutable-drift recreation preserves a safe stream boundary: the acknowledgement floor, an existing start sequence, or an undelivered `start: 'new'` consumer's creation tail. NATSail refuses deletion if a delivered `start: 'new'` consumer has no safe boundary. A failed replacement is rolled back at the same boundary, and controller inspection is updated to the rollback consumer before the original error is returned.
 
 Set `recovery` to reopen the named consumer after an infrastructure failure. When that consumer is retained, recovery uses its server-side acknowledgement floor: acknowledged messages remain complete, and an interrupted unacknowledged message remains eligible for redelivery. A deleted owned `start: 'new'` consumer is recreated from the last safe acknowledgement boundary, so messages published during the deletion gap are not skipped. Handler, decoder, and consumer-contract failures stay terminal.
 
@@ -123,6 +125,10 @@ The browser broker runs caller-supplied `SessionSource` definitions inside a `Sh
 Each tab has independent item and encoded-byte bounds and at most one transferred batch in flight. It acknowledges the batch cursor only after its local SessionSource handler accepts every item. A tab that exceeds its bound receives `resume-required` with reason `lagged`; no reliable item is silently discarded. A bounded physical-source log supports catch-up from retained per-tab JetStream cursors.
 
 Worker replacement reconnects active tab sources after their last acknowledged cursor. Heartbeats release references for abandoned ports, and final-reference teardown honors the configured idle delay. Applications may configure an explicit tab-local fallback, but strict mode rejects environments without SharedWorker when duplicate connections would violate policy.
+
+Applications can also route publish and request/reply through the worker with named logical operations. The worker owns the operation-to-subject mapping and authorization; tabs do not send arbitrary NATS subjects. Configure `closeIdleResources` to close and reset the worker-owned runtime after its final physical source is released, so the next attach or operation creates a fresh runtime instead of retaining an idle connection.
+
+Broker publish/request rejection after a timeout or worker replacement is ambiguous: the worker may already have started the operation. The client does not replay it. Use an application idempotency key or deduplication before retrying work that must run at most once.
 
 The protocol is versioned and same-origin. It does not replace authorization: worker source factories must map authenticated identities to allowed application sources instead of accepting arbitrary subjects, streams, or consumer names.
 

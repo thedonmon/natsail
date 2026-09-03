@@ -19,7 +19,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v6
@@ -34,10 +34,12 @@ jobs:
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chromium
       - run: pnpm nats:up
       - run: pnpm format:check
       - run: pnpm build
       - run: pnpm test
+      - run: pnpm test:browser-broker
 
       - if: always()
         run: pnpm nats:down
