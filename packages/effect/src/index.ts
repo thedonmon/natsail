@@ -1,5 +1,17 @@
-import { Cause, Context, Data, Effect, Exit, Layer, Option, Queue, Stream } from 'effect'
-import type { Duration } from 'effect'
+import {
+  Cause,
+  Clock,
+  Context,
+  Data,
+  Duration,
+  Effect,
+  Exit,
+  Layer,
+  Option,
+  Queue,
+  Stream,
+} from 'effect'
+import type { Pull } from 'effect'
 
 import type {
   CoreRequestOptions,
@@ -20,6 +32,7 @@ import {
   type JetStreamProcessorOptions,
   type ReducingJetStreamSessionOptions,
   type JetStreamSessionSourceOptions,
+  type JetStreamStateSnapshot,
   type StreamCursor,
 } from '@natsail/jetstream'
 import type {
@@ -147,6 +160,15 @@ export interface NatsailJetStreamMaterializedState<State> {
   }
 }
 
+export interface NatsailJetStreamStateOptions extends NatsailSessionStreamOptions {
+  /**
+   * Maximum time that subsequent cumulative live states are coalesced. Replay,
+   * reconnect, and the first hydrated live state remain immediate. Defaults to
+   * 16ms; use zero to observe every reduced state.
+   */
+  readonly liveBatchWithin?: Duration.Input
+}
+
 export interface NatsailSessionStreamOptions {
   /** Maximum queued snapshots. Defaults to 32. Use `unbounded` only deliberately. */
   readonly bufferSize?: number | 'unbounded'
@@ -200,6 +222,11 @@ export interface NatsailService {
     materializer: NatsailJetStreamMaterializer<Value, State, E, R>,
     streamOptions?: NatsailJetStreamMaterializeOptions
   ): Stream.Stream<NatsailJetStreamMaterializedState<State>, NatsailJetStreamStreamError | E, R>
+  /** Observes one registry-shared reducing JetStream definition. */
+  jetStreamStates<State>(
+    definition: SessionDefinition<JetStreamStateSnapshot<State>>,
+    options?: NatsailJetStreamStateOptions
+  ): Stream.Stream<JetStreamStateSnapshot<State>, NatsailSessionStreamError>
   /** Runs an explicit-ack processor and acknowledges only after the Effect succeeds. */
   runJetStreamProcessor<T, E, R>(
     options: JetStreamProcessorOptions<T>,
@@ -765,6 +792,153 @@ function createSessionSnapshotStream<T>(
   )
 }
 
+function createSessionValueStream<T>(
+  sessions: SessionRegistry,
+  definition: SessionDefinition<T>,
+  options?: NatsailSessionStreamOptions
+): Stream.Stream<T, NatsailSessionStreamError> {
+  return createSessionSnapshotStream(sessions, definition, options).pipe(
+    Stream.mapAccum(
+      () => -1,
+      (valueRevision, snapshot): readonly [number, ReadonlyArray<T>] => {
+        if (
+          snapshot.valueRevision !== valueRevision &&
+          Object.prototype.hasOwnProperty.call(snapshot, 'value')
+        ) {
+          return [snapshot.valueRevision, [snapshot.value as T]]
+        }
+        return [valueRevision, []]
+      }
+    )
+  )
+}
+
+function resolveLiveBatchMs(input: Duration.Input): number {
+  try {
+    if (typeof input === 'number' && !Number.isFinite(input)) throw new TypeError()
+    const duration = Duration.fromInputUnsafe(input)
+    const milliseconds = Duration.toMillis(duration)
+    if (!Duration.isFinite(duration) || !Number.isFinite(milliseconds) || milliseconds < 0) {
+      throw new TypeError()
+    }
+    return milliseconds
+  } catch {
+    throw new TypeError('NATSail Effect liveBatchWithin must be a finite non-negative duration')
+  }
+}
+
+function coalesceJetStreamStates<State, E, R>(
+  source: Stream.Stream<JetStreamStateSnapshot<State>, E, R>,
+  liveBatchMs: number
+): Stream.Stream<JetStreamStateSnapshot<State>, E, R> {
+  if (liveBatchMs === 0) return source
+
+  return Stream.transformPull(source, (pull) =>
+    Effect.sync(() => {
+      type Snapshot = JetStreamStateSnapshot<State>
+
+      let buffered: Snapshot[] = []
+      let bufferedIndex = 0
+      let seenLive = false
+      let pendingLive: Snapshot | undefined
+      let flushAt: number | undefined
+      let terminal: Cause.Cause<E | Cause.Done<void>> | undefined
+
+      const flushPending = (output: Snapshot[]): void => {
+        if (pendingLive === undefined) return
+        output.push(pendingLive)
+        pendingLive = undefined
+        flushAt = undefined
+      }
+
+      const next: Pull.Pull<readonly [Snapshot, ...Snapshot[]], E, void, R> =
+        Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const output: Snapshot[] = []
+
+            while (true) {
+              while (bufferedIndex < buffered.length) {
+                const value = buffered[bufferedIndex++]!
+                if (value.phase !== 'live') {
+                  flushPending(output)
+                  seenLive = false
+                  output.push(value)
+                  continue
+                }
+
+                if (!seenLive) {
+                  seenLive = true
+                  output.push(value)
+                  continue
+                }
+
+                pendingLive = value
+                flushAt ??= (yield* Clock.currentTimeMillis) + liveBatchMs
+              }
+              buffered = []
+              bufferedIndex = 0
+
+              if (output.length > 0) {
+                return output as [Snapshot, ...Snapshot[]]
+              }
+
+              if (terminal !== undefined) {
+                if (pendingLive !== undefined) {
+                  flushPending(output)
+                  return output as [Snapshot, ...Snapshot[]]
+                }
+                return yield* Effect.failCause(terminal)
+              }
+
+              if (pendingLive === undefined) {
+                const result = yield* restore(Effect.exit(pull))
+                if (Exit.isFailure(result)) terminal = result.cause
+                else buffered.push(...result.value)
+                continue
+              }
+
+              const now = yield* Clock.currentTimeMillis
+              const remaining = Math.max(0, (flushAt ?? now) - now)
+              if (remaining === 0) {
+                flushPending(output)
+                return output as [Snapshot, ...Snapshot[]]
+              }
+
+              const result = yield* restore(
+                Effect.raceFirst(
+                  Effect.exit(pull).pipe(Effect.map((exit) => ({ _tag: 'Pulled' as const, exit }))),
+                  Effect.sleep(remaining).pipe(Effect.as({ _tag: 'Elapsed' as const }))
+                )
+              )
+
+              if (result._tag === 'Elapsed') {
+                flushPending(output)
+                return output as [Snapshot, ...Snapshot[]]
+              }
+              if (Exit.isFailure(result.exit)) terminal = result.exit.cause
+              else buffered.push(...result.exit.value)
+            }
+          })
+        )
+
+      return next
+    })
+  )
+}
+
+function createJetStreamStateStream<State>(
+  sessions: SessionRegistry,
+  definition: SessionDefinition<JetStreamStateSnapshot<State>>,
+  options: NatsailJetStreamStateOptions = {}
+): Stream.Stream<JetStreamStateSnapshot<State>, NatsailSessionStreamError> {
+  const { liveBatchWithin = '16 millis', ...sessionOptions } = options
+  const liveBatchMs = resolveLiveBatchMs(liveBatchWithin)
+  return coalesceJetStreamStates(
+    createSessionValueStream(sessions, definition, sessionOptions),
+    liveBatchMs
+  )
+}
+
 /** Creates a service over application-owned runtime and registry objects. */
 export function makeNatsail(resource: NatsailResource): NatsailService {
   const { runtime, sessions } = resource
@@ -803,26 +977,15 @@ export function makeNatsail(resource: NatsailResource): NatsailService {
       createJetStreamDeliveryStream(runtime, options, streamOptions),
     materializeJetStream: (options, materializer, streamOptions) =>
       createJetStreamMaterializedStream(runtime, options, materializer, streamOptions),
+    jetStreamStates: (definition, options) =>
+      createJetStreamStateStream(sessions, definition, options),
     runJetStreamProcessor: (options, handler) =>
       runJetStreamProcessorEffect(runtime, options, handler),
     restartSession: (key) => tryRuntimePromise('restart-session', () => sessions.restart(key)),
     sessionSnapshots: (definition, options) =>
       createSessionSnapshotStream(sessions, definition, options),
     sessionValues: <T>(definition: SessionDefinition<T>, options?: NatsailSessionStreamOptions) =>
-      createSessionSnapshotStream(sessions, definition, options).pipe(
-        Stream.mapAccum(
-          () => -1,
-          (valueRevision, snapshot): readonly [number, ReadonlyArray<T>] => {
-            if (
-              snapshot.valueRevision !== valueRevision &&
-              Object.prototype.hasOwnProperty.call(snapshot, 'value')
-            ) {
-              return [snapshot.valueRevision, [snapshot.value as T]]
-            }
-            return [valueRevision, []]
-          }
-        )
-      ),
+      createSessionValueStream(sessions, definition, options),
   }
 }
 
@@ -876,6 +1039,18 @@ export function materializeJetStream<Value, State, E, R>(
   return Stream.unwrap(
     Natsail.useSync((service) => service.materializeJetStream(options, materializer, streamOptions))
   )
+}
+
+/**
+ * Observes cumulative state from one registry-shared reducing JetStream
+ * definition. Every source update is retained by the registry; only downstream
+ * live presentation notifications are coalesced.
+ */
+export function jetStreamStates<State>(
+  definition: SessionDefinition<JetStreamStateSnapshot<State>>,
+  options?: NatsailJetStreamStateOptions
+): Stream.Stream<JetStreamStateSnapshot<State>, NatsailSessionStreamError, Natsail> {
+  return Stream.unwrap(Natsail.useSync((service) => service.jetStreamStates(definition, options)))
 }
 
 /**

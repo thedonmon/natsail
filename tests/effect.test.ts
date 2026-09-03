@@ -9,6 +9,7 @@ import type {
   SubscriptionLease,
 } from '@natsail/core'
 import {
+  jetStreamStates as jetStreamStatesEffect,
   makeNatsail,
   makeNatsailLayer,
   makeNatsailScopedLayer,
@@ -19,6 +20,7 @@ import {
   NatsailSubjectError,
   subscribe as subscribeEffect,
 } from '@natsail/effect'
+import type { JetStreamStateSnapshot } from '@natsail/jetstream'
 import {
   createSessionRegistry,
   defineSession,
@@ -51,7 +53,9 @@ function runtimeStub(overrides: Partial<NatsRuntime> = {}): NatsRuntime {
 function controllableSource<T>(): {
   readonly source: SessionSource<T>
   readonly starts: ReturnType<typeof vi.fn<SessionSource<T>>>
+  readonly closeLease: ReturnType<typeof vi.fn>
   deliver(value: T): Promise<void>
+  finish(): void
   fail(error: unknown): void
 } {
   let accept!: (value: T) => Promise<void>
@@ -61,10 +65,11 @@ function controllableSource<T>(): {
     closeSession = resolve
     failSession = reject
   })
+  const closeLease = vi.fn(async () => closeSession())
   const lease: SubscriptionLease = {
     ready: Promise.resolve(),
     closed,
-    close: async () => closeSession(),
+    close: closeLease,
   }
   const starts = vi.fn<SessionSource<T>>((next) => {
     accept = next
@@ -74,7 +79,9 @@ function controllableSource<T>(): {
   return {
     source: starts,
     starts,
+    closeLease,
     deliver: (value) => accept(value),
+    finish: closeSession,
     fail: failSession,
   }
 }
@@ -377,6 +384,175 @@ describe('Effect adapter', () => {
     expect(result).toEqual([['hello'], ['hello']])
     expect(controlled.starts).toHaveBeenCalledOnce()
     expect(sessions.inspect().activeSessions).toBe(0)
+  })
+
+  it('shares reduced JetStream state and coalesces cumulative live updates', async () => {
+    const controlled = controllableSource<JetStreamStateSnapshot<number>>()
+    const sessions = createSessionRegistry()
+    const definition = defineSession({
+      key: 'conversation:effect-jetstream-state',
+      contract: 'conversation:v1',
+      source: controlled.source,
+    })
+    const resource = { runtime: runtimeStub(), sessions }
+    const service = makeNatsail(resource)
+    const first = Effect.runFork(
+      service
+        .jetStreamStates(definition, { bufferSize: 256, liveBatchWithin: '20 millis' })
+        .pipe(Stream.take(3), Stream.runCollect)
+    )
+    const second = Effect.runFork(
+      jetStreamStatesEffect(definition, {
+        bufferSize: 256,
+        liveBatchWithin: '20 millis',
+      }).pipe(Stream.take(2), Stream.runCollect, Effect.provide(makeNatsailLayer(resource)))
+    )
+
+    await vi.waitFor(() => expect(sessions.inspect().sessions[0]?.references).toBe(2))
+    await controlled.deliver({
+      phase: 'replaying',
+      data: 0,
+      restarts: 0,
+      replay: { delivered: 0, remaining: 3 },
+    })
+    await controlled.deliver({
+      phase: 'live',
+      data: 3,
+      restarts: 0,
+      replay: { delivered: 3, remaining: 0 },
+    })
+    for (let data = 4; data <= 220; data += 1) {
+      await controlled.deliver({
+        phase: 'live',
+        data,
+        restarts: 0,
+        replay: { delivered: 3, remaining: 0 },
+      })
+    }
+
+    const [firstStates, secondStates] = await Promise.all([
+      Effect.runPromise(Fiber.join(first)),
+      Effect.runPromise(Fiber.join(second)),
+    ])
+
+    expect(firstStates.map(({ phase, data }) => ({ phase, data }))).toEqual([
+      { phase: 'replaying', data: 0 },
+      { phase: 'live', data: 3 },
+      { phase: 'live', data: 220 },
+    ])
+    expect(secondStates.map(({ phase, data }) => ({ phase, data }))).toEqual([
+      { phase: 'replaying', data: 0 },
+      { phase: 'live', data: 3 },
+    ])
+    expect(controlled.starts).toHaveBeenCalledOnce()
+    expect(controlled.closeLease).toHaveBeenCalledOnce()
+    expect(sessions.inspect().activeSessions).toBe(0)
+  })
+
+  it('flushes pending live state before an immediate reconnect boundary', async () => {
+    const controlled = controllableSource<JetStreamStateSnapshot<number>>()
+    const sessions = createSessionRegistry()
+    const definition = defineSession({
+      key: 'conversation:effect-jetstream-reconnect',
+      contract: 'conversation:v1',
+      source: controlled.source,
+    })
+    const service = makeNatsail({ runtime: runtimeStub(), sessions })
+    const fiber = Effect.runFork(
+      service
+        .jetStreamStates(definition, { liveBatchWithin: '1 minute' })
+        .pipe(Stream.take(4), Stream.runCollect)
+    )
+
+    await vi.waitFor(() => expect(sessions.inspect().activeSessions).toBe(1))
+    await controlled.deliver({
+      phase: 'live',
+      data: 1,
+      restarts: 0,
+      replay: { delivered: 1, remaining: 0 },
+    })
+    await controlled.deliver({
+      phase: 'live',
+      data: 2,
+      restarts: 0,
+      replay: { delivered: 1, remaining: 0 },
+    })
+    await controlled.deliver({
+      phase: 'reconnecting',
+      data: 2,
+      restarts: 1,
+      replay: { delivered: 1 },
+    })
+    await controlled.deliver({
+      phase: 'live',
+      data: 3,
+      restarts: 1,
+      replay: { delivered: 1, remaining: 0 },
+    })
+
+    expect(
+      (await Effect.runPromise(Fiber.join(fiber))).map(({ phase, data }) => ({ phase, data }))
+    ).toEqual([
+      { phase: 'live', data: 1 },
+      { phase: 'live', data: 2 },
+      { phase: 'reconnecting', data: 2 },
+      { phase: 'live', data: 3 },
+    ])
+    expect(controlled.closeLease).toHaveBeenCalledOnce()
+  })
+
+  it('flushes the latest cumulative live state when the shared session completes', async () => {
+    const controlled = controllableSource<JetStreamStateSnapshot<number>>()
+    const sessions = createSessionRegistry()
+    const definition = defineSession({
+      key: 'conversation:effect-jetstream-complete',
+      contract: 'conversation:v1',
+      source: controlled.source,
+    })
+    const service = makeNatsail({ runtime: runtimeStub(), sessions })
+    const fiber = Effect.runFork(
+      service.jetStreamStates(definition, { liveBatchWithin: '1 minute' }).pipe(Stream.runCollect)
+    )
+
+    await vi.waitFor(() => expect(sessions.inspect().activeSessions).toBe(1))
+    await controlled.deliver({
+      phase: 'live',
+      data: 1,
+      restarts: 0,
+      replay: { delivered: 1, remaining: 0 },
+    })
+    await controlled.deliver({
+      phase: 'live',
+      data: 2,
+      restarts: 0,
+      replay: { delivered: 1, remaining: 0 },
+    })
+    controlled.finish()
+
+    expect(
+      (await Effect.runPromise(Fiber.join(fiber))).map(({ phase, data }) => ({ phase, data }))
+    ).toEqual([
+      { phase: 'live', data: 1 },
+      { phase: 'live', data: 2 },
+    ])
+    expect(controlled.closeLease).toHaveBeenCalledOnce()
+  })
+
+  it('rejects invalid shared JetStream live batch windows', () => {
+    const controlled = controllableSource<JetStreamStateSnapshot<number>>()
+    const service = makeNatsail({ runtime: runtimeStub(), sessions: createSessionRegistry() })
+    const definition = defineSession({
+      key: 'conversation:effect-jetstream-invalid-window',
+      contract: 'conversation:v1',
+      source: controlled.source,
+    })
+
+    expect(() => service.jetStreamStates(definition, { liveBatchWithin: -1 })).toThrow(
+      'liveBatchWithin'
+    )
+    expect(() => service.jetStreamStates(definition, { liveBatchWithin: Number.NaN })).toThrow(
+      'liveBatchWithin'
+    )
   })
 
   it('fails a value Stream with a source-tagged session error', async () => {

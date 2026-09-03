@@ -99,7 +99,52 @@ Delivery into the bounded Stream is the ordered-consumer acceptance boundary. If
 
 ## Atomic replay materialization
 
-`materializeJetStream()` avoids rendering every intermediate historical state. It emits an initial `replaying` state, silently reduces bounded replay batches, emits one complete `live` state at catch-up, and then emits microbatched live updates:
+Use `jetStreamStates()` with a reducing session when Effect, React, or RxJS
+should share one keyed JetStream consumer. Replay, reconnect, and the first
+hydrated live state are immediate. Later cumulative live states are coalesced
+to the latest value in one bounded presentation window:
+
+```ts
+import { Stream } from 'effect'
+
+import { jetStreamStates } from '@natsail/effect'
+import { defineReducingJetStreamSession } from '@natsail/jetstream'
+
+const conversationDefinition = defineReducingJetStreamSession(
+  runtime,
+  `conversation:${conversationId}`,
+  {
+    stream: 'CHAT',
+    filter: `chat.room.${conversationId}`,
+    start: 'all',
+    codec: chatEventCodec,
+    recovery: {},
+  },
+  {
+    scope: 'conversation:v1',
+    initial: () => emptyConversation(),
+    reduce: (state, delivery) => reduceConversation(state, delivery.value),
+  }
+)
+
+const render = jetStreamStates(conversationDefinition, {
+  liveBatchWithin: '16 millis',
+}).pipe(
+  Stream.filter((snapshot) => snapshot.phase === 'live'),
+  Stream.runForEach((snapshot) => updateConversation(snapshot.data))
+)
+```
+
+Every delivery still reaches the shared reducer serially. Coalescing only
+limits downstream state notifications. Concurrent Effect consumers retain
+separate registry handles but share the same source and latest cumulative
+state. Set `liveBatchWithin` to zero to observe every reduced state.
+
+Use `materializeJetStream()` instead when each Effect consumer should own a
+cold JetStream source and the batch reducer itself needs typed Effect failures
+or services. It avoids rendering every intermediate historical state, emits an
+initial `replaying` state, silently reduces bounded replay batches, emits one
+complete `live` state at catch-up, and then emits microbatched live updates:
 
 ```ts
 import { Effect, Stream } from 'effect'
@@ -177,7 +222,7 @@ An interrupted request aborts the underlying NATS request. `makeNatsailScopedLay
 
 ## Shared sessions
 
-`sessionSnapshots()` and `sessionValues()` remain available for application state that should share one validated `SessionRegistry` source. Each Effect consumer retains one registry handle, and the handle is released whenever the Stream completes, fails, or is interrupted.
+`jetStreamStates()` is the replay-aware presentation adapter for shared reducing JetStream definitions. `sessionSnapshots()` and `sessionValues()` remain available for other application state that should share one validated `SessionRegistry` source. Each Effect consumer retains one registry handle, and the handle is released whenever the Stream completes, fails, or is interrupted.
 
 Session Streams queue at most 32 snapshots by default. Overflow fails with `NatsailStreamBufferOverflowError`; applications may explicitly choose `dropping`, `sliding`, a different bound, or `unbounded`.
 
