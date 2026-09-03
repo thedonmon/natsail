@@ -154,8 +154,9 @@ export interface NatsailJetStreamMaterializer<Value, State, E = never, R = never
 /** A fresh materializer must rebuild state and therefore cannot resume only an event cursor. */
 export type NatsailJetStreamMaterializeSourceOptions<T> = ReducingJetStreamSessionOptions<T>
 
-export interface NatsailJetStreamMaterializeOptions<Value = unknown>
-  extends NatsailJetStreamStreamOptions {
+export interface NatsailJetStreamMaterializeOptions<
+  Value = unknown,
+> extends NatsailJetStreamStreamOptions {
   /** Maximum deliveries reduced in one application call. Defaults to 256. */
   readonly batchSize?: number
   /** Maximum wait before a partial live batch is reduced. Defaults to 16ms. */

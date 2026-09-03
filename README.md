@@ -371,8 +371,14 @@ The runtime accepts any official NATS connection factory. Browser applications c
 
 The workspace requires Node.js 22.14 or newer, pnpm, Docker, and Chrome for local browser tests.
 
+`pnpm format` and `pnpm lint` use Oxfmt and Oxlint on `packages/*/src` only. Tests, examples, documentation, tooling, and generated files are outside both checks, including when the tools run from the repository root. Formatting keeps the existing single quotes, no semicolons, and 100-column width; import sorting stays off.
+
+CI rejects lint errors. Cyclomatic complexity above 20 and existing React lifecycle findings produce warnings while they await a separate behavior-tested cleanup. Run `pnpm lint:strict` to fail on those warnings too. The broker keeps collection snapshots around callbacks and awaits, so its client and worker disable `no-useless-spread`.
+
 ```sh
 pnpm install
+pnpm format:check
+pnpm lint
 pnpm nats:up
 pnpm test
 pnpm test:browser

@@ -156,7 +156,7 @@ export function observeNatsJetStreamState<State>(
     options.liveBatchMs === 0
       ? { maxItems: 1 }
       : {
-          ...(options.batchPolicy ?? {}),
+          ...options.batchPolicy,
           ...(options.liveBatchMs === undefined ? {} : { maxWaitMs: options.liveBatchMs }),
           ...(options.batchPolicy === undefined && options.liveBatchMs === undefined
             ? { maxWaitMs: 16 }

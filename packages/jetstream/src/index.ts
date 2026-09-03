@@ -1,9 +1,7 @@
 import {
-  AckPolicy,
   DeliverPolicy,
   jetstream,
   jetstreamManager,
-  ReplayPolicy,
   type Consumer,
   type ConsumerMessages,
   type ConsumerNotification,
@@ -124,7 +122,7 @@ export interface JetStreamLeaseInspection {
 }
 
 /** Ordered-consumer lease with an explicit initial replay completion signal. */
-export interface JetStreamLease<T = unknown> extends SubscriptionLease {
+export interface JetStreamLease<_T = unknown> extends SubscriptionLease {
   readonly caughtUp: Promise<JetStreamCatchUp>
   inspect(): JetStreamLeaseInspection
   subscribe(listener: () => void): () => void
