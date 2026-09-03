@@ -1,5 +1,13 @@
 # @natsail/effect
 
+## 0.2.1
+
+### Patch Changes
+
+- 478ae86: Add package-owned recovery for named explicit-ack JetStream processors. Processor leases now expose lifecycle inspection and restart counts, React reports reconnecting processors without a remount and serializes lease replacement, and Effect processors can use the same recovery policy while preserving terminal application failures.
+- Updated dependencies [478ae86]
+  - @natsail/jetstream@0.4.0
+
 ## 0.2.0
 
 ### Minor Changes
