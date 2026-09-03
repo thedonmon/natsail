@@ -20,6 +20,11 @@ import {
 import {
   NATS_RUNTIME_ADAPTER,
   type NatsPayloadCodec,
+  type NatsailTelemetryAttributes,
+  type NatsailTelemetryCounterName,
+  type NatsailTelemetryDurationName,
+  type NatsailTelemetryGaugeName,
+  type NatsailTelemetryReporter,
   type NatsRuntime,
   type NatsRuntimeDiagnostic,
   type SubscriptionLease,
@@ -483,6 +488,90 @@ function markApplicationDeliveryFailure(error: unknown): never {
   throw wrapped
 }
 
+function recordCounter(
+  telemetry: NatsailTelemetryReporter,
+  name: NatsailTelemetryCounterName,
+  value: number,
+  attributes?: NatsailTelemetryAttributes
+): void {
+  if (!telemetry.enabled) return
+  telemetry.record({
+    type: 'counter',
+    name,
+    value,
+    at: telemetry.now(),
+    ...(attributes === undefined ? {} : { attributes }),
+  })
+}
+
+function recordGauge(
+  telemetry: NatsailTelemetryReporter,
+  name: NatsailTelemetryGaugeName,
+  value: number,
+  attributes?: NatsailTelemetryAttributes
+): void {
+  if (!telemetry.enabled) return
+  telemetry.record({
+    type: 'gauge',
+    name,
+    value,
+    at: telemetry.now(),
+    ...(attributes === undefined ? {} : { attributes }),
+  })
+}
+
+function recordDuration(
+  telemetry: NatsailTelemetryReporter,
+  name: NatsailTelemetryDurationName,
+  startedAt: number,
+  attributes?: NatsailTelemetryAttributes
+): void {
+  if (!telemetry.enabled) return
+  const at = telemetry.now()
+  telemetry.record({
+    type: 'duration',
+    name,
+    durationMs: Math.max(0, at - startedAt),
+    at,
+    ...(attributes === undefined ? {} : { attributes }),
+  })
+}
+
+async function measureCheckpoint<T>(
+  telemetry: NatsailTelemetryReporter,
+  operation: 'load' | 'save',
+  run: () => Promise<T>
+): Promise<T> {
+  const startedAt = telemetry.enabled ? telemetry.now() : 0
+  try {
+    const result = await run()
+    recordDuration(telemetry, 'natsail.checkpoint.operation.duration', startedAt, {
+      operation,
+      outcome: 'success',
+      source: 'jetstream',
+    })
+    return result
+  } catch (error) {
+    recordDuration(telemetry, 'natsail.checkpoint.operation.duration', startedAt, {
+      operation,
+      outcome: 'failure',
+      source: 'jetstream',
+    })
+    throw error
+  }
+}
+
+function reportConsumerBufferSignal(
+  telemetry: NatsailTelemetryReporter,
+  notification: ConsumerNotification
+): void {
+  if (notification.type !== 'discard' && notification.type !== 'exceeded_limits') return
+  recordCounter(telemetry, 'natsail.buffer.signals', 1, {
+    source: 'jetstream',
+    signal: notification.type === 'discard' ? 'discard' : 'limits-exceeded',
+  })
+}
+
 class JetStreamSubscription<T> implements JetStreamLease<T> {
   readonly ready: Promise<void>
   readonly closed: Promise<void>
@@ -503,12 +592,16 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
   private remaining = 0
   private cursor?: StreamCursor
   private error?: unknown
+  private readonly telemetry: NatsailTelemetryReporter
+  private readonly replayStartedAt: number
 
   constructor(
     runtime: NatsRuntime,
     private readonly options: JetStreamSubscriptionOptions<T>,
     private readonly handler: JetStreamHandler<T>
   ) {
+    this.telemetry = runtime[NATS_RUNTIME_ADAPTER].telemetry
+    this.replayStartedAt = this.telemetry.enabled ? this.telemetry.now() : 0
     this.ready = this.readyState.promise
     this.closed = this.closedState.promise
     this.caughtUp = this.caughtUpState.promise
@@ -558,7 +651,9 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
       if (this.options.resume) {
         const manager = await jetstreamManager(connection)
         const [storedCheckpoint, streamInfo] = await Promise.all([
-          this.options.resume.store.load(this.options.resume.key),
+          measureCheckpoint(this.telemetry, 'load', () =>
+            this.options.resume!.store.load(this.options.resume!.key)
+          ),
           manager.streams.info(this.options.stream),
         ])
         checkpoint = storedCheckpoint
@@ -613,6 +708,9 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
       const consumerInfo = await this.consumer.info()
       this.initialPending = consumerInfo.num_pending
       this.remaining = consumerInfo.num_pending
+      recordGauge(this.telemetry, 'natsail.jetstream.replay.remaining', this.remaining, {
+        source: 'jetstream',
+      })
       this.setPhase(this.initialPending === 0 ? 'live' : 'replaying')
       const startingCursor =
         committedSequence === undefined
@@ -647,6 +745,11 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
       for await (const message of this.messages) {
         const sequence = message.info.streamSequence
         const replay = this.remaining > 0 ? 'initial' : 'live'
+        recordCounter(this.telemetry, 'natsail.jetstream.deliveries', 1, {
+          delivery: replay,
+          redelivered: message.redelivered,
+          source: 'jetstream',
+        })
         const duplicate = committedSequence !== undefined && sequence <= committedSequence
         if (duplicate && committedSequence !== undefined) {
           const policy = this.options.duplicateDeliveryPolicy ?? 'drop'
@@ -664,6 +767,7 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
           ...(streamEpoch === undefined ? {} : { epoch: streamEpoch }),
           sequence,
         }
+        const handlerStartedAt = this.telemetry.enabled ? this.telemetry.now() : 0
         try {
           await this.handler({
             value: decodeJetStreamPayload(this.options, message),
@@ -675,8 +779,20 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
             replay,
           })
         } catch (error) {
+          recordDuration(this.telemetry, 'natsail.jetstream.handler.duration', handlerStartedAt, {
+            delivery: replay,
+            operation: 'ordered-handler',
+            outcome: 'failure',
+            source: 'jetstream',
+          })
           markApplicationDeliveryFailure(error)
         }
+        recordDuration(this.telemetry, 'natsail.jetstream.handler.duration', handlerStartedAt, {
+          delivery: replay,
+          operation: 'ordered-handler',
+          outcome: 'success',
+          source: 'jetstream',
+        })
 
         this.cursor = cursor
         this.advanceInitialReplay(cursor)
@@ -691,7 +807,9 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
             sequence: cursor.sequence,
             ...(streamScope === undefined ? {} : { scope: streamScope }),
           }
-          await this.options.resume.store.save(this.options.resume.key, checkpoint)
+          await measureCheckpoint(this.telemetry, 'save', () =>
+            this.options.resume!.store.save(this.options.resume!.key, checkpoint!)
+          )
         }
       }
 
@@ -736,6 +854,9 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
     if (this.remaining === 0) return
     this.initialDelivered += 1
     this.remaining -= 1
+    recordGauge(this.telemetry, 'natsail.jetstream.replay.remaining', this.remaining, {
+      source: 'jetstream',
+    })
     this.notify()
     if (this.remaining === 0) {
       this.setPhase('live')
@@ -746,6 +867,10 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
   private resolveCaughtUp(cursor?: StreamCursor): void {
     if (this.caughtUpSettled) return
     this.caughtUpSettled = true
+    recordDuration(this.telemetry, 'natsail.jetstream.replay.duration', this.replayStartedAt, {
+      outcome: 'success',
+      source: 'jetstream',
+    })
     this.caughtUpState.resolve({
       ...(cursor === undefined ? {} : { cursor }),
       delivered: this.initialDelivered,
@@ -755,6 +880,10 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
   private rejectCaughtUp(error: unknown): void {
     if (this.caughtUpSettled) return
     this.caughtUpSettled = true
+    recordDuration(this.telemetry, 'natsail.jetstream.replay.duration', this.replayStartedAt, {
+      outcome: 'failure',
+      source: 'jetstream',
+    })
     this.caughtUpState.reject(error)
   }
 
@@ -774,6 +903,7 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
   ): Promise<void> {
     try {
       for await (const notification of messages.status()) {
+        reportConsumerBufferSignal(this.telemetry, notification)
         const diagnostic = consumerDiagnostic(notification, this.options)
         if (diagnostic) {
           runtime[NATS_RUNTIME_ADAPTER].reportDiagnostic(diagnostic)
@@ -841,6 +971,7 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
   private error?: unknown
   private statusFailure?: Error
   private readonly listeners = new Set<() => void>()
+  private readonly telemetry: NatsailTelemetryReporter
 
   constructor(
     runtime: NatsRuntime,
@@ -848,6 +979,7 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
     private readonly handler: JetStreamProcessorHandler<T>,
     private readonly deleteOwnedOnClose = true
   ) {
+    this.telemetry = runtime[NATS_RUNTIME_ADAPTER].telemetry
     this.ready = this.readyState.promise
     this.closed = this.closedState.promise
     void this.closed.catch(() => undefined)
@@ -927,6 +1059,11 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
       this.resolveReady()
 
       for await (const message of this.messages) {
+        recordCounter(this.telemetry, 'natsail.jetstream.deliveries', 1, {
+          redelivered: message.redelivered,
+          source: 'jetstream',
+        })
+        const handlerStartedAt = this.telemetry.enabled ? this.telemetry.now() : 0
         try {
           await this.handler({
             value: decodeJetStreamPayload(this.options, message),
@@ -939,9 +1076,35 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
             deliveryAttempt: message.info.deliveryCount,
           })
         } catch (error) {
+          recordDuration(this.telemetry, 'natsail.jetstream.handler.duration', handlerStartedAt, {
+            operation: 'processor-handler',
+            outcome: 'failure',
+            redelivered: message.redelivered,
+            source: 'jetstream',
+          })
           markApplicationDeliveryFailure(error)
         }
-        message.ack()
+        recordDuration(this.telemetry, 'natsail.jetstream.handler.duration', handlerStartedAt, {
+          operation: 'processor-handler',
+          outcome: 'success',
+          redelivered: message.redelivered,
+          source: 'jetstream',
+        })
+        try {
+          message.ack()
+          recordCounter(this.telemetry, 'natsail.jetstream.acknowledgements', 1, {
+            outcome: 'success',
+            redelivered: message.redelivered,
+            source: 'jetstream',
+          })
+        } catch (error) {
+          recordCounter(this.telemetry, 'natsail.jetstream.acknowledgements', 1, {
+            outcome: 'failure',
+            redelivered: message.redelivered,
+            source: 'jetstream',
+          })
+          throw error
+        }
       }
 
       const messageError = await this.messages.closed()
@@ -997,6 +1160,7 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
   ): Promise<void> {
     try {
       for await (const notification of messages.status()) {
+        reportConsumerBufferSignal(this.telemetry, notification)
         const diagnostic = consumerDiagnostic(notification, this.options)
         if (diagnostic) runtime[NATS_RUNTIME_ADAPTER].reportDiagnostic(diagnostic)
 
@@ -1207,6 +1371,12 @@ class RecoveringJetStreamProcessor<T> implements JetStreamProcessorLease {
           if (attempt >= maxAttempts || !this.shouldRetry(context)) throw error
 
           this.restarts += 1
+          recordCounter(
+            this.runtime[NATS_RUNTIME_ADAPTER].telemetry,
+            'natsail.jetstream.recoveries',
+            1,
+            { source: 'jetstream' }
+          )
           this.error = error
           this.phase = 'reconnecting'
           this.notify()
@@ -1535,6 +1705,12 @@ class RecoveringJetStreamLease<T> implements JetStreamLease<T> {
           if (attempt >= maxAttempts || !this.shouldRetry(context)) throw error
 
           this.restarts += 1
+          recordCounter(
+            this.runtime[NATS_RUNTIME_ADAPTER].telemetry,
+            'natsail.jetstream.recoveries',
+            1,
+            { source: 'jetstream' }
+          )
           this.phase = 'reconnecting'
           this.notify()
           const delayMs = this.retryDelay(context)

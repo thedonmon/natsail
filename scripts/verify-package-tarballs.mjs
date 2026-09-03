@@ -10,6 +10,7 @@ const packages = [
   { directory: 'checkpoints', name: '@natsail/checkpoints' },
   { directory: 'core', name: '@natsail/core' },
   { directory: 'jetstream', name: '@natsail/jetstream' },
+  { directory: 'opentelemetry', name: '@natsail/opentelemetry' },
   { directory: 'session', name: '@natsail/session' },
   { directory: 'effect', name: '@natsail/effect' },
   { directory: 'react', name: '@natsail/react' },
@@ -101,6 +102,7 @@ try {
         type: 'module',
         dependencies: {
           ...localPackages,
+          '@opentelemetry/api': '^1.9.0',
           effect: '4.0.0-rc.112',
           react: '^19.0.0',
           rxjs: '^7.8.0',

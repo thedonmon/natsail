@@ -13,6 +13,7 @@ export const releasePackages = [
   { directory: 'checkpoints', name: '@natsail/checkpoints' },
   { directory: 'core', name: '@natsail/core' },
   { directory: 'jetstream', name: '@natsail/jetstream' },
+  { directory: 'opentelemetry', name: '@natsail/opentelemetry' },
   { directory: 'session', name: '@natsail/session' },
   { directory: 'effect', name: '@natsail/effect' },
   { directory: 'react', name: '@natsail/react' },

@@ -69,6 +69,8 @@ Configure `ackWaitMs`, `maxDeliver` (`-1` means unlimited), `maxAckPending`, rep
 
 Use `maxBufferedMessages` or `maxBufferedBytes` to bound the nats.js pull loop. These modes are mutually exclusive. The runtime reserves the selected capacity before it opens the consumer.
 
+When the runtime has a telemetry sink, this package reports replay duration and remaining work, initial/live delivery counts, handler duration/outcome, redelivery and acknowledgement counts, checkpoint load/save duration/outcome, recovery attempts, and consumer discard/limit signals. Measurements use the Core reporter and never contain stream, filter, subject, checkpoint key, or consumer names. The existing runtime diagnostic stream retains detailed operator-facing context.
+
 The checkpoint scope includes normalized filters. Set `resume.scope` when a codec, decoder, or domain-model change must invalidate an old checkpoint.
 
 See the [NATSail README](https://github.com/thedonmon/natsail#explicit-ack-processing-example) for the explicit-ack example and the separate ordered-consumer acknowledgement boundary.

@@ -1,6 +1,6 @@
 # Project status and roadmap
 
-NATSail is a public `0.x` package family. The repository publishes seven packages under the `@natsail` npm scope.
+NATSail is a public `0.x` package family. The repository publishes eight packages under the `@natsail` npm scope.
 
 The test suite uses NATS 2.14.4. Separate fixtures cover anonymous, token, user/password, NKey, operator JWT, and TLS connections.
 
@@ -16,6 +16,8 @@ The test suite uses NATS 2.14.4. Separate fixtures cover anonymous, token, user/
 - Structured status, diagnostics, and resource inspection
 - Browser WebSocket transport in Node.js and Chromium
 - Connection-wide limits for consumers, buffered messages, and buffered bytes
+- Dependency-free counters, gauges, and deterministic duration telemetry isolated from runtime operations
+- Optional OpenTelemetry metrics adapter with no Core OpenTelemetry dependency
 
 ### JetStream
 
@@ -30,6 +32,7 @@ The test suite uses NATS 2.14.4. Separate fixtures cover anonymous, token, user/
 - Package-owned infrastructure recovery for named explicit-ack processors
 - Bound, retained, and lease-owned processor lifecycles
 - Message-count and byte-capacity pull limits
+- Replay/remaining, handler, redelivery, acknowledgement, checkpoint, recovery, and buffer-signal measurements
 
 ### Sessions and framework adapters
 
@@ -54,6 +57,7 @@ The test suite uses NATS 2.14.4. Separate fixtures cover anonymous, token, user/
 - Local Durable Object fan-out and restart replay
 - SharedWorker cross-tab connection proof
 - Changesets, package checks, provenance, and trusted publishing
+- Machine-readable local 1,000/5,000 replay and configurable live-burst benchmark foundation
 
 ## Current limits
 
@@ -87,6 +91,8 @@ The `SharedWorker` harness proves that two tabs can share one connection. It doe
 
 The Effect adapter provides bounded Core and JetStream Streams. Sustained slow-consumer and recovery tests still need published measurements and tuning guidance.
 
+The local benchmark and browser labs now expose stable measurement fields, but the repository does not yet publish representative hardware baselines or NATS server throughput claims.
+
 ### Processor policy
 
 Named processors support explicit acknowledgements and redelivery. Progress heartbeats, confirmed acknowledgements, and higher-level `nak` or terminal-message policy are not packaged yet.
@@ -104,6 +110,6 @@ Named processors support explicit acknowledgements and redelivery. Progress hear
 
 ## Publication status
 
-All seven package tarballs pass repository checks. Routine releases use Changesets and GitHub trusted publishing.
+All eight package tarballs pass repository checks. Routine releases use Changesets and GitHub trusted publishing.
 
 A new npm package still needs its first publication and trusted-publisher configuration before routine OIDC releases can publish it.

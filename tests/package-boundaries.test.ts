@@ -59,6 +59,23 @@ describe('package boundaries', () => {
     expect(Object.keys(rxjsManifest.peerDependencies)).toEqual(['rxjs'])
   })
 
+  it('keeps OpenTelemetry optional and outside Core', async () => {
+    const coreSource = await readFile(
+      new URL('../packages/core/src/index.ts', import.meta.url),
+      'utf8'
+    )
+    const manifest = JSON.parse(
+      await readFile(new URL('../packages/opentelemetry/package.json', import.meta.url), 'utf8')
+    ) as {
+      dependencies: Record<string, string>
+      peerDependencies: Record<string, string>
+    }
+
+    expect(coreSource).not.toContain('@opentelemetry')
+    expect(Object.keys(manifest.dependencies)).toEqual(['@natsail/core'])
+    expect(manifest.peerDependencies).toEqual({ '@opentelemetry/api': '>=1.9.0 <2' })
+  })
+
   it('keeps checkpoint storage independent from NATS and frameworks', async () => {
     const packageText = await readFile(
       new URL('../packages/checkpoints/package.json', import.meta.url),

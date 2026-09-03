@@ -6,8 +6,11 @@ import type {
   MessageHandler,
   NatsRuntime,
   NatsRuntimeEvent,
+  NatsailTelemetryEvent,
+  RuntimeResource,
   SubscriptionLease,
 } from '@natsail/core'
+import { createNatsailTelemetryReporter, NATS_RUNTIME_ADAPTER } from '@natsail/core'
 import {
   jetStreamStates as jetStreamStatesEffect,
   makeNatsail,
@@ -36,6 +39,11 @@ function emptyEvents<T>(): AsyncIterable<T> {
 
 function runtimeStub(overrides: Partial<NatsRuntime> = {}): NatsRuntime {
   return {
+    [NATS_RUNTIME_ADAPTER]: {
+      manage: <T extends RuntimeResource>(create: () => T) => create(),
+      reportDiagnostic: () => undefined,
+      telemetry: createNatsailTelemetryReporter(),
+    },
     events: emptyEvents<NatsRuntimeEvent>(),
     connection: vi.fn(async () => ({}) as never),
     reconnect: vi.fn(async () => ({}) as never),
@@ -86,7 +94,7 @@ function controllableSource<T>(): {
   }
 }
 
-function controllableSubscription<T>(): {
+function controllableSubscription<T>(telemetryEvents?: NatsailTelemetryEvent[]): {
   readonly runtime: NatsRuntime
   readonly subscribe: ReturnType<typeof vi.fn>
   readonly close: ReturnType<typeof vi.fn>
@@ -112,7 +120,21 @@ function controllableSubscription<T>(): {
   })
 
   return {
-    runtime: runtimeStub({ subscribe: subscribe as NatsRuntime['subscribe'] }),
+    runtime: runtimeStub({
+      subscribe: subscribe as NatsRuntime['subscribe'],
+      ...(telemetryEvents === undefined
+        ? {}
+        : {
+            [NATS_RUNTIME_ADAPTER]: {
+              manage: <Resource extends RuntimeResource>(create: () => Resource) => create(),
+              reportDiagnostic: () => undefined,
+              telemetry: createNatsailTelemetryReporter({
+                sink: { record: (event) => telemetryEvents.push(event) },
+                clock: { now: () => 0 },
+              }),
+            },
+          }),
+    }),
     subscribe,
     close,
     deliver: async (value) => handler(value, {} as never),
@@ -279,7 +301,8 @@ describe('Effect adapter', () => {
   })
 
   it('can fail a Core subject Stream instead of silently dropping a message', async () => {
-    const controlled = controllableSubscription<number>()
+    const telemetryEvents: NatsailTelemetryEvent[] = []
+    const controlled = controllableSubscription<number>(telemetryEvents)
     const service = makeNatsail({
       runtime: controlled.runtime,
       sessions: createSessionRegistry(),
@@ -324,6 +347,13 @@ describe('Effect adapter', () => {
       capacity: 1,
     })
     expect(controlled.close).toHaveBeenCalledOnce()
+    expect(telemetryEvents).toContainEqual(
+      expect.objectContaining({
+        type: 'counter',
+        name: 'natsail.buffer.signals',
+        attributes: { signal: 'overflow', source: 'effect' },
+      })
+    )
   })
 
   it('maps Core subscription and decoding failures to the subject and source stage', async () => {

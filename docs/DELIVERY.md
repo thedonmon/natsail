@@ -94,6 +94,16 @@ Effect Streams have a second decoded queue. Reliable JetStream Streams support `
 
 Core NATS Effect Streams can also use dropping or sliding policies. These policies do not add server retention to Core NATS.
 
+## Telemetry and diagnostics
+
+`runtime.events` is the low-frequency lifecycle and diagnostic stream. High-frequency measurements never enter it.
+
+Pass a `NatsailTelemetrySink` to `createNatsRuntime()` to observe connection attempts and recovery, publish/request durations and outcomes, resource reservations and configured limits, JetStream replay and remaining work, handler/redelivery/acknowledgement outcomes, checkpoint load/save durations, recovery attempts, and slow-consumer or overflow signals. Pass the same sink to `createSessionRegistry()` for active-session, reference-count, and lifecycle measurements.
+
+Telemetry events contain fixed NATSail dimensions plus optional caller-supplied low-cardinality primitive attributes. NATSail does not copy diagnostic details into telemetry, so subjects, payloads, credentials, session/checkpoint keys, stream names, and consumer names are absent by default. NATSail's reserved per-event dimensions take precedence over colliding caller attributes.
+
+The sink is synchronous and runs inline around the observed operation. It should enqueue measurements and avoid network or filesystem I/O. NATSail catches sink exceptions, but it cannot preempt a callback that blocks the JavaScript thread. Duration tests can inject `telemetryClock`; production defaults to the host monotonic performance clock.
+
 ## Browser connection model
 
 Many conversations in one browser tab can share one runtime connection. Each active JetStream conversation still has its own consumer and bounded pull loop.

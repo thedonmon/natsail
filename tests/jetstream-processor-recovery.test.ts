@@ -9,7 +9,7 @@ import {
 import type { NatsConnection } from '@nats-io/nats-core'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { createNatsRuntime, natsCodecs } from '@natsail/core'
+import { createNatsRuntime, natsCodecs, type NatsailTelemetryEvent } from '@natsail/core'
 import { processJetStream } from '@natsail/jetstream'
 
 const jetStreamMocks = vi.hoisted(() => ({
@@ -97,7 +97,7 @@ function consumer(deliveries: readonly JsMsg[], closedError?: Error, stayOpen = 
   } as unknown as Consumer
 }
 
-function runtime() {
+function runtime(telemetryEvents?: NatsailTelemetryEvent[]) {
   let closeConnection!: () => void
   const closed = new Promise<void>((resolve) => {
     closeConnection = resolve
@@ -109,7 +109,12 @@ function runtime() {
     isClosed: vi.fn(() => false),
     status: async function* () {},
   } as unknown as NatsConnection
-  return createNatsRuntime({ connect: async () => connection })
+  return createNatsRuntime({
+    connect: async () => connection,
+    ...(telemetryEvents === undefined
+      ? {}
+      : { telemetry: { record: (event) => telemetryEvents.push(event) } }),
+  })
 }
 
 describe('recovering explicit-ack JetStream processor', () => {
@@ -120,11 +125,12 @@ describe('recovering explicit-ack JetStream processor', () => {
   })
 
   it('reopens the owned consumer after an infrastructure failure and deletes it only on close', async () => {
+    const telemetryEvents: NatsailTelemetryEvent[] = []
     const activeConsumer = consumer([message(2, 'two')], undefined, true)
     jetStreamMocks.getConsumer
       .mockResolvedValueOnce(consumer([message(1, 'one')], new Error('consumer failed')))
       .mockResolvedValueOnce(activeConsumer)
-    const nats = runtime()
+    const nats = runtime(telemetryEvents)
     const received: string[] = []
     const lease = processJetStream(
       nats,
@@ -150,6 +156,13 @@ describe('recovering explicit-ack JetStream processor', () => {
       expect.objectContaining({ durable_name: 'processor' })
     )
     expect(lease.inspect()).toMatchObject({ phase: 'live', restarts: 1 })
+    expect(telemetryEvents).toContainEqual(
+      expect.objectContaining({
+        type: 'counter',
+        name: 'natsail.jetstream.recoveries',
+        value: 1,
+      })
+    )
     expect(jetStreamMocks.deleteConsumer).not.toHaveBeenCalled()
 
     await lease.close()

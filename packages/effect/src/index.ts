@@ -22,6 +22,7 @@ import type {
   NatsRuntimeReconnectOptions,
   NatsRuntimeStatusEvent,
 } from '@natsail/core'
+import { NATS_RUNTIME_ADAPTER } from '@natsail/core'
 import {
   createJetStreamSessionSource,
   processJetStream,
@@ -405,6 +406,18 @@ function jetStreamError(
   })
 }
 
+function reportBufferOverflow(runtime: NatsRuntime, source: 'effect' | 'session'): void {
+  const telemetry = runtime[NATS_RUNTIME_ADAPTER]?.telemetry
+  if (!telemetry?.enabled) return
+  telemetry.record({
+    type: 'counter',
+    name: 'natsail.buffer.signals',
+    value: 1,
+    at: telemetry.now(),
+    attributes: { signal: 'overflow', source },
+  })
+}
+
 function createSubjectStream<T>(
   runtime: NatsRuntime,
   options: CoreSubscriptionOptions<T>,
@@ -426,6 +439,7 @@ function createSubjectStream<T>(
             try: () =>
               runtime.subscribe(subscriptionOptions, async (value) => {
                 const accepted = await Effect.runPromise(Queue.offer(queue, value))
+                if (!accepted) reportBufferOverflow(runtime, 'effect')
 
                 if (
                   !accepted &&
@@ -494,6 +508,7 @@ function createJetStreamEventStream<T>(
         void catchUpMarkerEnqueued.catch(() => undefined)
         const offerEvent = async (event: NatsailJetStreamEvent<T>): Promise<void> => {
           const accepted = await Effect.runPromise(Queue.offer(queue, event))
+          if (!accepted) reportBufferOverflow(runtime, 'effect')
 
           if (!accepted && resolved.overflowStrategy === 'error' && queue.state._tag === 'Open') {
             const overflow = new NatsailStreamBufferOverflowError({
@@ -717,6 +732,7 @@ function runJetStreamProcessorEffect<T, E, R>(
 }
 
 function createSessionSnapshotStream<T>(
+  runtime: NatsRuntime,
   sessions: SessionRegistry,
   definition: SessionDefinition<T>,
   options?: NatsailSessionStreamOptions
@@ -739,6 +755,7 @@ function createSessionSnapshotStream<T>(
           if (terminal) return
           const snapshot = handle.getSnapshot()
           const accepted = Queue.offerUnsafe(queue, snapshot)
+          if (!accepted) reportBufferOverflow(runtime, 'session')
 
           if (
             !accepted &&
@@ -793,11 +810,12 @@ function createSessionSnapshotStream<T>(
 }
 
 function createSessionValueStream<T>(
+  runtime: NatsRuntime,
   sessions: SessionRegistry,
   definition: SessionDefinition<T>,
   options?: NatsailSessionStreamOptions
 ): Stream.Stream<T, NatsailSessionStreamError> {
-  return createSessionSnapshotStream(sessions, definition, options).pipe(
+  return createSessionSnapshotStream(runtime, sessions, definition, options).pipe(
     Stream.mapAccum(
       () => -1,
       (valueRevision, snapshot): readonly [number, ReadonlyArray<T>] => {
@@ -927,6 +945,7 @@ function coalesceJetStreamStates<State, E, R>(
 }
 
 function createJetStreamStateStream<State>(
+  runtime: NatsRuntime,
   sessions: SessionRegistry,
   definition: SessionDefinition<JetStreamStateSnapshot<State>>,
   options: NatsailJetStreamStateOptions = {}
@@ -934,7 +953,7 @@ function createJetStreamStateStream<State>(
   const { liveBatchWithin = '16 millis', ...sessionOptions } = options
   const liveBatchMs = resolveLiveBatchMs(liveBatchWithin)
   return coalesceJetStreamStates(
-    createSessionValueStream(sessions, definition, sessionOptions),
+    createSessionValueStream(runtime, sessions, definition, sessionOptions),
     liveBatchMs
   )
 }
@@ -978,14 +997,14 @@ export function makeNatsail(resource: NatsailResource): NatsailService {
     materializeJetStream: (options, materializer, streamOptions) =>
       createJetStreamMaterializedStream(runtime, options, materializer, streamOptions),
     jetStreamStates: (definition, options) =>
-      createJetStreamStateStream(sessions, definition, options),
+      createJetStreamStateStream(runtime, sessions, definition, options),
     runJetStreamProcessor: (options, handler) =>
       runJetStreamProcessorEffect(runtime, options, handler),
     restartSession: (key) => tryRuntimePromise('restart-session', () => sessions.restart(key)),
     sessionSnapshots: (definition, options) =>
-      createSessionSnapshotStream(sessions, definition, options),
+      createSessionSnapshotStream(runtime, sessions, definition, options),
     sessionValues: <T>(definition: SessionDefinition<T>, options?: NatsailSessionStreamOptions) =>
-      createSessionValueStream(sessions, definition, options),
+      createSessionValueStream(runtime, sessions, definition, options),
   }
 }
 

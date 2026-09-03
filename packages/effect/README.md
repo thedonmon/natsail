@@ -226,6 +226,8 @@ An interrupted request aborts the underlying NATS request. `makeNatsailScopedLay
 
 Session Streams queue at most 32 snapshots by default. Overflow fails with `NatsailStreamBufferOverflowError`; applications may explicitly choose `dropping`, `sliding`, a different bound, or `unbounded`.
 
+When Core telemetry is enabled, `error` overflow paths report `natsail.buffer.signals` before the typed stream failure. The measurement contains only the stable source and overflow signal; it does not contain the subject, stream, or session key.
+
 Session snapshot buffering happens after the registry updates. Use direct subject Streams when downstream Effect demand must reach the NATSail delivery handler.
 
 NATSail continues to own connection, authentication, ordered-consumer recovery, and checkpoints. The Effect adapter does not create a second connection or retry loop. The service exposes `runtime` and `sessions` for JetStream manager calls and other advanced nats.js or custom session operations without leaving the Layer-owned lifecycle.

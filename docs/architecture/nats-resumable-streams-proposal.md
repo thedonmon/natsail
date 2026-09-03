@@ -2,6 +2,8 @@
 
 Status: historical proposal. See the [README](../../README.md) for the implemented interface and current limits.
 
+Implemented operability note: the runtime now keeps low-frequency lifecycle diagnostics in `runtime.events` and sends counters, gauges, and durations through one optional dependency-free synchronous telemetry sink. Core and adapter packages share the reporter through the existing runtime-adapter seam. Default measurement dimensions deliberately omit application identifiers and NATS routing/configuration names; an optional package maps the events to OpenTelemetry without making OpenTelemetry a Core dependency. A local JSON benchmark establishes comparable 1,000/5,000 replay and configurable live-burst scenarios; it is not a server-throughput claim.
+
 ## Decision in one paragraph
 
 Build a small, NATS-first and framework-neutral resumable-consumption layer, then add WebSocket, React, and TanStack adapters only after the direct nats.js path is proven. Do not replace nats.js reconnection or ordered consumers. Use them as the in-session recovery engine, while the new layer owns the contract nats.js intentionally does not own: opaque cursors, replay strictly after a cursor, checkpoint timing, duplicate and retention-gap behavior, bounded retries, and status/telemetry. Keep RxJS and Caspian event transformation in application adapters. A later TanStack AI `StreamDurability` adapter backed by JetStream would be an externally legible integration, not part of the version 0.1 core.

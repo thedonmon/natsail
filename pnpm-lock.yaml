@@ -22,6 +22,9 @@ importers:
       '@nats-io/transport-node':
         specifier: 3.4.0
         version: 3.4.0
+      '@opentelemetry/api':
+        specifier: 1.9.0
+        version: 1.9.0
       '@playwright/test':
         specifier: 1.62.1
         version: 1.62.1
@@ -66,7 +69,7 @@ importers:
         version: 7.3.6(@types/node@24.13.3)(jiti@2.7.0)(lightningcss@1.32.0)(yaml@2.9.0)
       vitest:
         specifier: 4.0.18
-        version: 4.0.18(@types/node@24.13.3)(jiti@2.7.0)(jsdom@26.1.0)(lightningcss@1.32.0)(yaml@2.9.0)
+        version: 4.0.18(@opentelemetry/api@1.9.0)(@types/node@24.13.3)(jiti@2.7.0)(jsdom@26.1.0)(lightningcss@1.32.0)(yaml@2.9.0)
       wrangler:
         specifier: 4.125.0
         version: 4.125.0
@@ -108,16 +111,16 @@ importers:
         version: link:../../packages/session
       '@shadcn/helpers':
         specifier: 0.2.0
-        version: 0.2.0(@tanstack/ai-client@0.20.0)(@tanstack/ai@0.40.0)(ai@7.0.74(zod@3.25.76))
+        version: 0.2.0(@tanstack/ai-client@0.20.0(@opentelemetry/api@1.9.0))(@tanstack/ai@0.40.0(@opentelemetry/api@1.9.0))(ai@7.0.74(zod@3.25.76))
       '@tanstack/ai':
         specifier: 0.40.0
-        version: 0.40.0
+        version: 0.40.0(@opentelemetry/api@1.9.0)
       '@tanstack/ai-client':
         specifier: 0.20.0
-        version: 0.20.0
+        version: 0.20.0(@opentelemetry/api@1.9.0)
       '@tanstack/ai-react':
         specifier: 0.16.4
-        version: 0.16.4(@mcp-ui/client@7.1.1(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@tanstack/ai@0.40.0)(@types/react@19.2.18)(react@19.2.8)
+        version: 0.16.4(@mcp-ui/client@7.1.1(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@opentelemetry/api@1.9.0)(@tanstack/ai@0.40.0(@opentelemetry/api@1.9.0))(@types/react@19.2.18)(react@19.2.8)
       ai:
         specifier: 7.0.74
         version: 7.0.74(zod@3.25.76)
@@ -429,6 +432,15 @@ importers:
       '@natsail/session':
         specifier: workspace:^
         version: link:../session
+
+  packages/opentelemetry:
+    dependencies:
+      '@natsail/core':
+        specifier: workspace:^
+        version: link:../core
+      '@opentelemetry/api':
+        specifier: '>=1.9.0 <2'
+        version: 1.9.0
 
   packages/react:
     dependencies:
@@ -2001,6 +2013,13 @@ packages:
         integrity: sha512-oGB+UxlgWcgQkgwo8GcEGwemoTFt3FIO9ababBmaGwXIoBKZ+GTy0pP185beGg7Llih/NSHSV2XAs1lnznocSg==,
       }
     engines: { node: '>= 8' }
+
+  '@opentelemetry/api@1.9.0':
+    resolution:
+      {
+        integrity: sha512-3giAOQvZiH5F9bMlMiv8+GSPMeqg0dbaeo58/0SlA9sxSqZhnUtxzX9/2FzyhS9sWQf5S0GJE0AKBrFqjpeYcg==,
+      }
+    engines: { node: '>=8.0.0' }
 
   '@playwright/test@1.62.1':
     resolution:
@@ -6464,6 +6483,8 @@ snapshots:
       '@nodelib/fs.scandir': 2.1.5
       fastq: 1.20.1
 
+  '@opentelemetry/api@1.9.0': {}
+
   '@playwright/test@1.62.1':
     dependencies:
       playwright: 1.62.1
@@ -6561,10 +6582,10 @@ snapshots:
 
   '@sec-ant/readable-stream@0.4.1': {}
 
-  '@shadcn/helpers@0.2.0(@tanstack/ai-client@0.20.0)(@tanstack/ai@0.40.0)(ai@7.0.74(zod@3.25.76))':
+  '@shadcn/helpers@0.2.0(@tanstack/ai-client@0.20.0(@opentelemetry/api@1.9.0))(@tanstack/ai@0.40.0(@opentelemetry/api@1.9.0))(ai@7.0.74(zod@3.25.76))':
     optionalDependencies:
-      '@tanstack/ai': 0.40.0
-      '@tanstack/ai-client': 0.20.0
+      '@tanstack/ai': 0.40.0(@opentelemetry/api@1.9.0)
+      '@tanstack/ai-client': 0.20.0(@opentelemetry/api@1.9.0)
       ai: 7.0.74(zod@3.25.76)
 
   '@shadcn/react@0.3.0(@types/react@19.2.18)(react@19.2.8)':
@@ -6648,9 +6669,9 @@ snapshots:
       tailwindcss: 4.3.3
       vite: 7.3.6(@types/node@24.13.3)(jiti@2.7.0)(lightningcss@1.32.0)(yaml@2.9.0)
 
-  '@tanstack/ai-client@0.20.0':
+  '@tanstack/ai-client@0.20.0(@opentelemetry/api@1.9.0)':
     dependencies:
-      '@tanstack/ai': 0.40.0
+      '@tanstack/ai': 0.40.0(@opentelemetry/api@1.9.0)
       '@tanstack/ai-event-client': 0.6.8
       '@tanstack/ai-utils': 0.3.1
     transitivePeerDependencies:
@@ -6660,10 +6681,10 @@ snapshots:
     dependencies:
       '@tanstack/devtools-event-client': 0.4.4
 
-  '@tanstack/ai-react@0.16.4(@mcp-ui/client@7.1.1(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@tanstack/ai@0.40.0)(@types/react@19.2.18)(react@19.2.8)':
+  '@tanstack/ai-react@0.16.4(@mcp-ui/client@7.1.1(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@opentelemetry/api@1.9.0)(@tanstack/ai@0.40.0(@opentelemetry/api@1.9.0))(@types/react@19.2.18)(react@19.2.8)':
     dependencies:
-      '@tanstack/ai': 0.40.0
-      '@tanstack/ai-client': 0.20.0
+      '@tanstack/ai': 0.40.0(@opentelemetry/api@1.9.0)
+      '@tanstack/ai-client': 0.20.0(@opentelemetry/api@1.9.0)
       '@types/react': 19.2.18
       react: 19.2.8
     optionalDependencies:
@@ -6673,13 +6694,15 @@ snapshots:
 
   '@tanstack/ai-utils@0.3.1': {}
 
-  '@tanstack/ai@0.40.0':
+  '@tanstack/ai@0.40.0(@opentelemetry/api@1.9.0)':
     dependencies:
       '@ag-ui/core': 0.0.52
       '@standard-schema/spec': 1.1.0
       '@tanstack/ai-event-client': 0.6.8
       '@tanstack/ai-utils': 0.3.1
       partial-json: 0.1.7
+    optionalDependencies:
+      '@opentelemetry/api': 1.9.0
 
   '@tanstack/devtools-event-client@0.4.4': {}
 
@@ -8304,7 +8327,7 @@ snapshots:
       lightningcss: 1.32.0
       yaml: 2.9.0
 
-  vitest@4.0.18(@types/node@24.13.3)(jiti@2.7.0)(jsdom@26.1.0)(lightningcss@1.32.0)(yaml@2.9.0):
+  vitest@4.0.18(@opentelemetry/api@1.9.0)(@types/node@24.13.3)(jiti@2.7.0)(jsdom@26.1.0)(lightningcss@1.32.0)(yaml@2.9.0):
     dependencies:
       '@vitest/expect': 4.0.18
       '@vitest/mocker': 4.0.18(vite@7.3.6(@types/node@24.13.3)(jiti@2.7.0)(lightningcss@1.32.0)(yaml@2.9.0))
@@ -8327,6 +8350,7 @@ snapshots:
       vite: 7.3.6(@types/node@24.13.3)(jiti@2.7.0)(lightningcss@1.32.0)(yaml@2.9.0)
       why-is-node-running: 2.3.0
     optionalDependencies:
+      '@opentelemetry/api': 1.9.0
       '@types/node': 24.13.3
       jsdom: 26.1.0
     transitivePeerDependencies:

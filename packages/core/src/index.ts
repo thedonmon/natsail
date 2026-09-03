@@ -109,6 +109,8 @@ export interface NatsRuntimeAdapter {
   manage<T extends RuntimeResource>(create: () => T, allocation?: RuntimeResourceAllocation): T
   /** Reports structured diagnostics from optional runtime adapters. */
   reportDiagnostic(diagnostic: NatsRuntimeDiagnostic): void
+  /** Shared, failure-isolated measurement path for runtime adapter packages. */
+  readonly telemetry: NatsailTelemetryReporter
 }
 
 /** Adapter packages use this symbol to join the runtime lifecycle. */
@@ -145,6 +147,130 @@ export interface NatsRuntimeDiagnosticEvent {
 
 export type NatsRuntimeDiagnostic = Omit<NatsRuntimeDiagnosticEvent, 'at' | 'type'>
 export type NatsRuntimeEvent = NatsRuntimeStatusEvent | NatsRuntimeDiagnosticEvent
+
+export type NatsailTelemetryOutcome = 'success' | 'failure'
+
+/**
+ * Deliberately small, low-cardinality dimensions emitted by NATSail itself.
+ * Application identifiers, subjects, payloads, credentials, session keys,
+ * stream names, and consumer names are never included.
+ */
+export type NatsailTelemetryAttributeValue = string | number | boolean
+export type NatsailTelemetryAttributes = Readonly<Record<string, NatsailTelemetryAttributeValue>>
+
+export type NatsailTelemetryCounterName =
+  | 'natsail.buffer.signals'
+  | 'natsail.connection.attempts'
+  | 'natsail.connection.transitions'
+  | 'natsail.jetstream.acknowledgements'
+  | 'natsail.jetstream.deliveries'
+  | 'natsail.jetstream.recoveries'
+  | 'natsail.runtime.resource.operations'
+  | 'natsail.session.lifecycle'
+  | 'natsail.session.references'
+
+export type NatsailTelemetryGaugeName =
+  | 'natsail.jetstream.replay.remaining'
+  | 'natsail.runtime.capacity.limit'
+  | 'natsail.runtime.capacity.used'
+  | 'natsail.runtime.resources.active'
+  | 'natsail.session.active'
+  | 'natsail.session.references.active'
+
+export type NatsailTelemetryDurationName =
+  | 'natsail.checkpoint.operation.duration'
+  | 'natsail.connection.attempt.duration'
+  | 'natsail.connection.recovery.duration'
+  | 'natsail.core.publish.duration'
+  | 'natsail.core.request.duration'
+  | 'natsail.jetstream.handler.duration'
+  | 'natsail.jetstream.replay.duration'
+
+interface NatsailTelemetryEventBase {
+  /** Monotonic clock value supplied by the runtime host. */
+  readonly at: number
+  readonly attributes?: NatsailTelemetryAttributes
+}
+
+export type NatsailTelemetryEvent =
+  | (NatsailTelemetryEventBase & {
+      readonly type: 'counter'
+      readonly name: NatsailTelemetryCounterName
+      readonly value: number
+    })
+  | (NatsailTelemetryEventBase & {
+      readonly type: 'gauge'
+      readonly name: NatsailTelemetryGaugeName
+      readonly value: number
+    })
+  | (NatsailTelemetryEventBase & {
+      readonly type: 'duration'
+      readonly name: NatsailTelemetryDurationName
+      readonly durationMs: number
+    })
+
+/** Synchronous, dependency-free destination for NATSail measurements. */
+export interface NatsailTelemetrySink {
+  /**
+   * Called inline with the observed operation. Implementations should enqueue
+   * measurements and avoid blocking I/O; NATSail cannot preempt a blocking sink.
+   */
+  record(event: NatsailTelemetryEvent): void
+}
+
+/** Injectable monotonic clock used by telemetry duration measurements. */
+export interface NatsailTelemetryClock {
+  now(): number
+}
+
+/** Adapter-facing reporter. It is always safe to call, even when the sink throws. */
+export interface NatsailTelemetryReporter {
+  readonly enabled: boolean
+  now(): number
+  record(event: NatsailTelemetryEvent): void
+}
+
+export interface NatsailTelemetryReporterOptions {
+  readonly sink?: NatsailTelemetrySink
+  readonly clock?: NatsailTelemetryClock
+  /** Low-cardinality primitive attributes added to every event. */
+  readonly attributes?: NatsailTelemetryAttributes
+}
+
+const defaultTelemetryClock: NatsailTelemetryClock = {
+  now: () => globalThis.performance?.now() ?? Date.now(),
+}
+
+/** Creates the failure-isolated reporter shared by Core, sessions, and adapter packages. */
+export function createNatsailTelemetryReporter(
+  options: NatsailTelemetryReporterOptions = {}
+): NatsailTelemetryReporter {
+  const clock = options.clock ?? defaultTelemetryClock
+  const now = () => {
+    try {
+      const value = clock.now()
+      return Number.isFinite(value) ? value : 0
+    } catch {
+      return 0
+    }
+  }
+  return Object.freeze({
+    enabled: options.sink !== undefined,
+    now,
+    record: (event: NatsailTelemetryEvent) => {
+      try {
+        options.sink?.record({
+          ...event,
+          ...(options.attributes === undefined && event.attributes === undefined
+            ? {}
+            : { attributes: { ...options.attributes, ...event.attributes } }),
+        })
+      } catch {
+        // Telemetry is observational. A sink can never change runtime behavior.
+      }
+    },
+  })
+}
 
 export type NatsRuntimeLimitCode = 'jetstream-consumers' | 'buffered-messages' | 'buffered-bytes'
 
@@ -207,6 +333,15 @@ export interface NatsRuntimeOptions {
   connectionRecovery?: NatsRuntimeConnectionRecoveryOptions
   /** Optional connection-wide limits shared by every runtime adapter. */
   limits?: NatsRuntimeLimits
+  /** Optional synchronous measurement sink. Sink failures are ignored. */
+  telemetry?: NatsailTelemetrySink
+  /**
+   * Low-cardinality primitive attributes added to every measurement. NATSail's
+   * reserved per-event keys take precedence over colliding caller keys.
+   */
+  telemetryAttributes?: NatsailTelemetryAttributes
+  /** Monotonic telemetry clock override, primarily for deterministic hosts and tests. */
+  telemetryClock?: NatsailTelemetryClock
 }
 
 export interface NatsRuntimeConnectionRecoveryOptions {
@@ -480,16 +615,11 @@ class CoreSubscription<T> implements SubscriptionLease {
 }
 
 class DefaultNatsRuntime implements NatsRuntime {
-  readonly [NATS_RUNTIME_ADAPTER]: NatsRuntimeAdapter = {
-    manage: <T extends RuntimeResource>(
-      create: () => T,
-      allocation?: RuntimeResourceAllocation
-    ): T => this.manage(create, allocation),
-    reportDiagnostic: (diagnostic) => this.eventStream.diagnostic(diagnostic),
-  }
+  readonly [NATS_RUNTIME_ADAPTER]: NatsRuntimeAdapter
   readonly events: AsyncIterable<NatsRuntimeEvent>
 
   private readonly eventStream = new RuntimeEventStream()
+  private readonly telemetry: NatsailTelemetryReporter
   private connectionPromise: Promise<NatsConnection> | undefined
   private activeConnection: NatsConnection | undefined
   private connectionGeneration = 0
@@ -500,9 +630,26 @@ class DefaultNatsRuntime implements NatsRuntime {
   private closePromise?: Promise<void>
   private closeRequested = false
   private readonly retryAbortController = new AbortController()
+  private disconnectedAt: number | undefined
 
   constructor(private readonly options: NatsRuntimeOptions) {
+    this.telemetry = createNatsailTelemetryReporter({
+      ...(options.telemetry === undefined ? {} : { sink: options.telemetry }),
+      ...(options.telemetryClock === undefined ? {} : { clock: options.telemetryClock }),
+      ...(options.telemetryAttributes === undefined
+        ? {}
+        : { attributes: options.telemetryAttributes }),
+    })
+    this[NATS_RUNTIME_ADAPTER] = {
+      manage: <T extends RuntimeResource>(
+        create: () => T,
+        allocation?: RuntimeResourceAllocation
+      ): T => this.manage(create, allocation),
+      reportDiagnostic: (diagnostic) => this.eventStream.diagnostic(diagnostic),
+      telemetry: this.telemetry,
+    }
     this.events = this.eventStream
+    this.recordConfiguredLimits()
   }
 
   connection(): Promise<NatsConnection> {
@@ -598,8 +745,21 @@ class DefaultNatsRuntime implements NatsRuntime {
     data: Payload = new Uint8Array(0),
     options?: PublishOptions
   ): Promise<void> {
-    const connection = await this.connection()
-    connection.publish(subject, data, options)
+    const startedAt = this.telemetry.enabled ? this.telemetry.now() : 0
+    try {
+      const connection = await this.connection()
+      connection.publish(subject, data, options)
+      this.recordDuration('natsail.core.publish.duration', startedAt, {
+        outcome: 'success',
+        source: 'core',
+      })
+    } catch (error) {
+      this.recordDuration('natsail.core.publish.duration', startedAt, {
+        outcome: 'failure',
+        source: 'core',
+      })
+      throw error
+    }
   }
 
   async request<T>(options: CoreRequestOptions<T>): Promise<T> {
@@ -616,24 +776,40 @@ class DefaultNatsRuntime implements NatsRuntime {
       throw new NatsRuntimeRequestAbortedError()
     }
     validatePayloadDecoder(options, 'NATS request')
-    const operation = (async () => {
-      const connection = await this.connection()
-      if (options.signal?.aborted) {
-        throw new NatsRuntimeRequestAbortedError()
-      }
-      const response = await connection.request(
-        options.subject,
-        options.data ?? new Uint8Array(0),
-        {
-          timeout: options.timeoutMs ?? 5_000,
-          ...(options.headers === undefined ? {} : { headers: options.headers }),
+    const startedAt = this.telemetry.enabled ? this.telemetry.now() : 0
+    try {
+      const operation = (async () => {
+        const connection = await this.connection()
+        if (options.signal?.aborted) {
+          throw new NatsRuntimeRequestAbortedError()
         }
-      )
-      return decodePayload(options, response)
-    })()
+        const response = await connection.request(
+          options.subject,
+          options.data ?? new Uint8Array(0),
+          {
+            timeout: options.timeoutMs ?? 5_000,
+            ...(options.headers === undefined ? {} : { headers: options.headers }),
+          }
+        )
+        return decodePayload(options, response)
+      })()
 
-    const runtimeBound = rejectWhenAborted(operation, this.retryAbortController.signal)
-    return options.signal ? rejectWhenAborted(runtimeBound, options.signal) : runtimeBound
+      const runtimeBound = rejectWhenAborted(operation, this.retryAbortController.signal)
+      const result = await (options.signal
+        ? rejectWhenAborted(runtimeBound, options.signal)
+        : runtimeBound)
+      this.recordDuration('natsail.core.request.duration', startedAt, {
+        outcome: 'success',
+        source: 'core',
+      })
+      return result
+    } catch (error) {
+      this.recordDuration('natsail.core.request.duration', startedAt, {
+        outcome: 'failure',
+        source: 'core',
+      })
+      throw error
+    }
   }
 
   subscribe<T>(options: CoreSubscriptionOptions<T>, handler: MessageHandler<T>): SubscriptionLease {
@@ -686,6 +862,8 @@ class DefaultNatsRuntime implements NatsRuntime {
         throw new Error('The NATS runtime is closed')
       }
 
+      const startedAt = this.telemetry.enabled ? this.telemetry.now() : 0
+      this.recordCounter('natsail.connection.attempts', 1, { source: 'runtime' })
       this.eventStream.setStatus('connecting')
       try {
         const connection = await this.options.connect()
@@ -701,11 +879,20 @@ class DefaultNatsRuntime implements NatsRuntime {
 
         this.activeConnection = connection
         this.connectionGeneration += 1
+        this.recordDuration('natsail.connection.attempt.duration', startedAt, {
+          outcome: 'success',
+          source: 'runtime',
+        })
         this.eventStream.setStatus('connected', connection.getServer())
+        this.markRecovered()
         void this.observeConnection(connection, this.connectionGeneration)
         void this.observePermanentClose(connection)
         return connection
       } catch (error) {
+        this.recordDuration('natsail.connection.attempt.duration', startedAt, {
+          outcome: 'failure',
+          source: 'runtime',
+        })
         if (this.closeRequested) {
           throw error
         }
@@ -725,6 +912,7 @@ class DefaultNatsRuntime implements NatsRuntime {
             details: { attempt, maxAttempts, retryAllowed },
           })
           this.eventStream.setStatus('disconnected')
+          this.markDisconnected()
           throw error
         }
 
@@ -739,6 +927,7 @@ class DefaultNatsRuntime implements NatsRuntime {
           details: { attempt, nextAttempt: attempt + 1, maxAttempts, delayMs },
         })
         this.eventStream.setStatus('disconnected')
+        this.markDisconnected()
         await this.waitForRetry(delayMs)
       }
     }
@@ -799,12 +988,14 @@ class DefaultNatsRuntime implements NatsRuntime {
     switch (status.type) {
       case 'disconnect':
         this.eventStream.setStatus('disconnected', status.server)
+        this.markDisconnected()
         break
       case 'reconnecting':
         this.eventStream.setStatus('reconnecting')
         break
       case 'reconnect':
         this.eventStream.setStatus('connected', status.server)
+        this.markRecovered()
         break
       case 'close':
         this.handlePermanentClose(connection)
@@ -841,6 +1032,10 @@ class DefaultNatsRuntime implements NatsRuntime {
           level: 'warning',
           message: 'A Core NATS subscription is consuming too slowly',
           details: { pending: status.pending },
+        })
+        this.recordCounter('natsail.buffer.signals', 1, {
+          source: 'core',
+          signal: 'slow-consumer',
         })
         break
       case 'ldm':
@@ -893,6 +1088,7 @@ class DefaultNatsRuntime implements NatsRuntime {
       details: { generation: this.connectionGeneration },
     })
     this.eventStream.setStatus('disconnected')
+    this.markDisconnected()
 
     if ((this.options.connectionRecovery?.onPermanentClose ?? 'restart') === 'restart') {
       void this.connection().catch(() => undefined)
@@ -923,10 +1119,12 @@ class DefaultNatsRuntime implements NatsRuntime {
     }
 
     this.resources.add(resource)
+    this.recordResourceTelemetry('allocated')
     void resource.closed
       .finally(() => {
         this.resources.delete(resource)
         this.release(allocation)
+        this.recordResourceTelemetry('released')
       })
       .catch(() => undefined)
     return resource
@@ -988,7 +1186,120 @@ class DefaultNatsRuntime implements NatsRuntime {
       error,
       details: { resource: code, limit, used, requested },
     })
+    this.recordCounter('natsail.runtime.resource.operations', 1, {
+      action: 'rejected',
+      resource: code,
+      source: 'runtime',
+    })
     throw error
+  }
+
+  private markDisconnected(): void {
+    if (!this.telemetry.enabled || this.disconnectedAt !== undefined) return
+    this.disconnectedAt = this.telemetry.now()
+    this.recordCounter('natsail.connection.transitions', 1, {
+      source: 'runtime',
+      state: 'disconnected',
+    })
+  }
+
+  private markRecovered(): void {
+    if (this.disconnectedAt === undefined) return
+    const startedAt = this.disconnectedAt
+    this.disconnectedAt = undefined
+    this.recordCounter('natsail.connection.transitions', 1, {
+      source: 'runtime',
+      state: 'recovered',
+    })
+    this.recordDuration('natsail.connection.recovery.duration', startedAt, {
+      outcome: 'success',
+      source: 'runtime',
+    })
+  }
+
+  private recordResourceTelemetry(action: 'allocated' | 'released'): void {
+    this.recordCounter('natsail.runtime.resource.operations', 1, {
+      action,
+      resource: 'managed',
+      source: 'runtime',
+    })
+    this.recordGauge('natsail.runtime.resources.active', this.resources.size, {
+      resource: 'managed',
+      source: 'runtime',
+    })
+    this.recordGauge('natsail.runtime.capacity.used', this.usedJetStreamConsumers, {
+      resource: 'jetstream-consumers',
+      source: 'runtime',
+    })
+    this.recordGauge('natsail.runtime.capacity.used', this.usedBufferedMessages, {
+      resource: 'buffered-messages',
+      source: 'runtime',
+    })
+    this.recordGauge('natsail.runtime.capacity.used', this.usedBufferedBytes, {
+      resource: 'buffered-bytes',
+      source: 'runtime',
+    })
+  }
+
+  private recordConfiguredLimits(): void {
+    const limits = [
+      ['jetstream-consumers', this.options.limits?.maxJetStreamConsumers],
+      ['buffered-messages', this.options.limits?.maxBufferedMessages],
+      ['buffered-bytes', this.options.limits?.maxBufferedBytes],
+    ] as const
+    for (const [resource, value] of limits) {
+      if (value === undefined) continue
+      this.recordGauge('natsail.runtime.capacity.limit', value, {
+        resource,
+        source: 'runtime',
+      })
+    }
+  }
+
+  private recordCounter(
+    name: NatsailTelemetryCounterName,
+    value: number,
+    attributes?: NatsailTelemetryAttributes
+  ): void {
+    if (!this.telemetry.enabled) return
+    this.telemetry.record({
+      type: 'counter',
+      name,
+      value,
+      at: this.telemetry.now(),
+      ...(attributes === undefined ? {} : { attributes }),
+    })
+  }
+
+  private recordGauge(
+    name: NatsailTelemetryGaugeName,
+    value: number,
+    attributes?: NatsailTelemetryAttributes
+  ): void {
+    if (!this.telemetry.enabled) return
+    this.telemetry.record({
+      type: 'gauge',
+      name,
+      value,
+      at: this.telemetry.now(),
+      ...(attributes === undefined ? {} : { attributes }),
+    })
+  }
+
+  private recordDuration(
+    name: NatsailTelemetryDurationName,
+    startedAt: number,
+    attributes?: NatsailTelemetryAttributes
+  ): void {
+    if (!this.telemetry.enabled) return
+    const at = this.telemetry.now()
+    this.telemetry.record({
+      type: 'duration',
+      name,
+      durationMs: Math.max(0, at - startedAt),
+      at,
+      ...(attributes === undefined ? {} : { attributes }),
+    })
   }
 
   private validateAllocation(name: string, value: number): void {

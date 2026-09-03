@@ -44,6 +44,11 @@ export interface DemoPerformanceMetrics {
   readonly largestBatchSize: number
   readonly lastCommitMs?: number
   readonly largestCommitMs?: number
+  readonly telemetryMeasurements: number
+  readonly replayTelemetryMs?: number
+  readonly lastHandlerTelemetryMs?: number
+  readonly averagePublishTelemetryMs?: number
+  readonly bufferSignals: number
 }
 
 export interface DemoUpdateNotice {

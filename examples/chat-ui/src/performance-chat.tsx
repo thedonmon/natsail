@@ -446,6 +446,31 @@ function PerformancePanel({
       ],
     },
     {
+      label: 'NATSail telemetry',
+      values: [
+        ['Measurements', metrics.telemetryMeasurements],
+        [
+          'Replay duration',
+          metrics.replayTelemetryMs === undefined
+            ? '—'
+            : `${metrics.replayTelemetryMs.toFixed(1)} ms`,
+        ],
+        [
+          'Last handler',
+          metrics.lastHandlerTelemetryMs === undefined
+            ? '—'
+            : `${metrics.lastHandlerTelemetryMs.toFixed(2)} ms`,
+        ],
+        [
+          'Average publish',
+          metrics.averagePublishTelemetryMs === undefined
+            ? '—'
+            : `${metrics.averagePublishTelemetryMs.toFixed(2)} ms`,
+        ],
+        ['Buffer signals', metrics.bufferSignals],
+      ],
+    },
+    {
       label: 'Presentation',
       values: [
         ['State updates', metrics.stateUpdates],
