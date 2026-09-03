@@ -12,7 +12,7 @@ import {
   type DemoPerformanceMetrics,
   type DemoUpdateNotice,
 } from '@natsail/example-chat-ui'
-import type { JetStreamDelivery } from '@natsail/jetstream'
+import { defineReducingJetStreamSession, type JetStreamDelivery } from '@natsail/jetstream'
 
 export const chatStream = 'NATSAIL_EFFECT_CHAT'
 export const chatSubjectPrefix = 'natsail.examples.effect.chat'
@@ -68,17 +68,13 @@ const selectedFromUrl = (): string => {
     : demoConversations[0]!.id
 }
 
-const reduceConversationBatch = (
+const reduceConversation = (
   state: ConversationModel,
-  deliveries: readonly JetStreamDelivery<DemoChatMessage>[]
+  delivery: JetStreamDelivery<DemoChatMessage>
 ): ConversationModel => ({
-  entries: [
-    ...state.entries,
-    ...deliveries.map((delivery) => ({
-      message: delivery.value,
-      cursor: delivery.cursor.sequence,
-    })),
-  ].slice(-10_000),
+  entries: [...state.entries, { message: delivery.value, cursor: delivery.cursor.sequence }].slice(
+    -10_000
+  ),
 })
 
 export class EffectChatController {
@@ -138,7 +134,9 @@ export class EffectChatController {
       window.history.replaceState(null, '', url)
     }
 
-    const snapshots = this.natsail.materializeJetStream(
+    const definition = defineReducingJetStreamSession(
+      this.natsail.runtime,
+      `effect-performance-chat:${conversationId}`,
       {
         stream: chatStream,
         filter: `${chatSubjectPrefix}.${conversationId}`,
@@ -149,16 +147,15 @@ export class EffectChatController {
         codec: chatCodec,
       },
       {
+        scope: 'performance-chat:v1',
         initial: (): ConversationModel => ({ entries: [] }),
-        reduceBatch: (state, deliveries) =>
-          Effect.sync(() => reduceConversationBatch(state, deliveries)),
-      },
-      {
-        bufferSize: 256,
-        batchSize: 256,
-        batchWithin: '16 millis',
+        reduce: reduceConversation,
       }
     )
+    const snapshots = this.natsail.jetStreamStates(definition, {
+      bufferSize: 256,
+      liveBatchWithin: '16 millis',
+    })
 
     void Effect.runPromise(
       snapshots.pipe(

@@ -39,6 +39,7 @@ const NatsLive = makeNatsailScopedLayer(
 - `subscribe()` creates a cold scoped Core subject Stream.
 - `jetStreamEvents()` includes deliveries plus the explicit caught-up event.
 - `jetStreamDeliveries()` emits ordered replay/live deliveries only.
+- `jetStreamStates()` observes a registry-shared reducing definition and coalesces cumulative live presentation state.
 - `materializeJetStream()` folds replay, emits one hydrated live state at catch-up, then microbatches live updates.
 - `sessionSnapshots()` and `sessionValues()` share validated registry definitions.
 - `runJetStreamProcessor()` runs named explicit-ack work and waits for the handler Effect before acknowledgement.
@@ -64,6 +65,8 @@ const program = messages.pipe(
 Core subject Streams may use `suspend`, `error`, `dropping`, or `sliding`. Reliable JetStream Streams allow only `suspend` or `error`; dropping after checkpoint acceptance would violate durable delivery. Keep the nats.js pull buffer (`maxBufferedMessages` or `maxBufferedBytes`) separate from the decoded Effect queue (`bufferSize`).
 
 Queue admission completes an ordered-consumer handler. If business completion must control acknowledgement, use `runJetStreamProcessor()` instead. Application Effect errors remain typed and defects remain causes. Processor infrastructure failures surface as `NatsailJetStreamError` with stage `processor`; service operations use `NatsailOperationError` with their operation tag. Interruption propagates to the underlying NATS operation; do not add another retry loop around package-owned recovery.
+
+Use `jetStreamStates()` when Effect should share one reducing JetStream definition with React or RxJS. Replay, reconnect, and the first live state are immediate; `liveBatchWithin` limits later cumulative state notifications without skipping reducer work. Use `materializeJetStream()` when the batch reducer itself needs typed Effect errors or services and each consumer should own a cold source.
 
 Avoid collecting an unbounded subject Stream. Use Effect chunking or bounded processing for sustained sources. `materializeJetStream()` rejects cursor-only resume because materialized state and its cursor must be restored atomically.
 

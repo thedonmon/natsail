@@ -193,29 +193,23 @@ const conversation$ = observeNatsJetStreamState(sessions, conversationState, {
 
 ### Effect
 
-Effect can own cold Core NATS or JetStream Streams with bounded queues. It also supports native replay materialization and explicit-ack processors.
+Effect can observe the same reducing definition through a scoped Stream. Like the RxJS adapter, it emits replay and reconnect boundaries immediately and coalesces later cumulative live state without skipping reducer work.
 
 ```ts
 import { Effect, Stream } from 'effect'
-import { makeNatsailScopedLayer, subscribe } from '@natsail/effect'
-import { natsCodecs } from '@natsail/core'
+import { jetStreamStates, makeNatsailScopedLayer } from '@natsail/effect'
 
 const NatsLive = makeNatsailScopedLayer(Effect.sync(() => ({ runtime, sessions })))
 
-const program = subscribe(
-  {
-    subject: 'chat.room.*',
-    codec: natsCodecs.json<ChatMessage>(),
-  },
-  {
-    bufferSize: 256,
-    overflowStrategy: 'suspend',
-  }
-).pipe(
-  Stream.runForEach((message) => Effect.log(message)),
+const program = jetStreamStates(conversationState, {
+  liveBatchWithin: '16 millis',
+}).pipe(
+  Stream.runForEach((snapshot) => Effect.log(snapshot.data)),
   Effect.provide(NatsLive)
 )
 ```
+
+The adapter also provides cold Core and JetStream Streams with bounded queues, a native Effect replay materializer with typed reducer requirements, and explicit-ack processors.
 
 The current Effect adapter targets the version in its [package guide](packages/effect/README.md) and uses the npm `next` tag.
 
