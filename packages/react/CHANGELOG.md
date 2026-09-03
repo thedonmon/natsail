@@ -1,5 +1,21 @@
 # @natsail/react
 
+## 0.5.0
+
+### Minor Changes
+
+- 8273c15: Add shared count/byte/time batching and cooperative work budgets, atomic bounded JetStream reducer hydration with fresh retry batches, 16ms cumulative live coalescing, a public Effect event-stream materializer, and deterministic adapter scheduling while preserving legacy adapter batch options.
+
+### Patch Changes
+
+- Updated dependencies [8273c15]
+- Updated dependencies [8273c15]
+- Updated dependencies [8273c15]
+- Updated dependencies [8273c15]
+  - @natsail/jetstream@0.5.0
+  - @natsail/core@0.3.0
+  - @natsail/session@0.4.0
+
 ## 0.4.0
 
 ### Minor Changes

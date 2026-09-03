@@ -1,6 +1,6 @@
 {
   "name": "@natsail/rxjs",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "RxJS Observables for NATSail runtimes and shared sessions.",
   "keywords": [
     "nats",
