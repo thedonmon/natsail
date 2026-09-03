@@ -207,7 +207,9 @@ describe('reducing JetStream batch barriers', () => {
         reduce: (state, delivery) => [...state, Number(delivery.value)],
       }
     )
-    const lease = source(async (snapshot) => snapshots.push([...snapshot.data]))
+    const lease = source(async (snapshot) => {
+      snapshots.push([...snapshot.data])
+    })
     await lease.ready
     controlled.push(1)
     controlled.push(2)
@@ -346,7 +348,9 @@ describe('reducing JetStream batch barriers', () => {
         },
       }
     )
-    const lease = source(async (snapshot) => snapshots.push([...snapshot.data]))
+    const lease = source(async (snapshot) => {
+      snapshots.push([...snapshot.data])
+    })
 
     await expect(lease.ready).rejects.toThrow('cannot reduce two')
     await expect(lease.closed).rejects.toThrow('cannot reduce two')
@@ -384,7 +388,9 @@ describe('reducing JetStream batch barriers', () => {
         },
       }
     )
-    const lease = source(async (snapshot) => snapshots.push([...snapshot.data]))
+    const lease = source(async (snapshot) => {
+      snapshots.push([...snapshot.data])
+    })
     await lease.ready
     controlled.push(1)
     controlled.push(2)
@@ -429,7 +435,9 @@ describe('reducing JetStream batch barriers', () => {
         reduce: (state, delivery) => [...state, Number(delivery.value)],
       }
     )
-    const lease = source(async (snapshot) => snapshots.push([...snapshot.data]))
+    const lease = source(async (snapshot) => {
+      snapshots.push([...snapshot.data])
+    })
     await lease.ready
 
     first.push(1)

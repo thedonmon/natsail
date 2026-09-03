@@ -41,7 +41,7 @@ class ManualScheduler implements NatsailScheduler {
 describe('shared batching and cooperative work', () => {
   it('flushes by count and preserves serial application order', async () => {
     const applied: number[][] = []
-    const batcher = createNatsailBatcher({ maxItems: 2 }, async (values) => {
+    const batcher = createNatsailBatcher<number>({ maxItems: 2 }, async (values) => {
       applied.push([...values])
     })
     const first = batcher.add(1)
@@ -57,7 +57,9 @@ describe('shared batching and cooperative work', () => {
     const applied: string[][] = []
     const batcher = createNatsailBatcher(
       { maxBytes: 4, sizeOf: (value: string) => value.length },
-      (values) => applied.push([...values])
+      (values) => {
+        applied.push([...values])
+      }
     )
     const first = batcher.add('aa')
     const second = batcher.add('bb')
@@ -84,9 +86,11 @@ describe('shared batching and cooperative work', () => {
   it('flushes by time and completion without racing the cancelled timer', async () => {
     const scheduler = new ManualScheduler()
     const applied: number[][] = []
-    const batcher = createNatsailBatcher(
+    const batcher = createNatsailBatcher<number>(
       { maxItems: 10, maxWaitMs: 5 },
-      (values) => applied.push([...values]),
+      (values) => {
+        applied.push([...values])
+      },
       { scheduler }
     )
     const first = batcher.add(1)

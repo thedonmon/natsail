@@ -237,7 +237,7 @@ describe('JetStream duplicate-delivery policy', () => {
           filter: 'events.>',
           start: 'all',
           codec: natsCodecs.text,
-          resume: { key: 'unsafe-reducer', store: createMemoryCheckpointStore() },
+          resume: { key: 'unsafe-reducer', store: createMemoryCheckpointStore() } as never,
         },
         {
           scope: 'messages:v1',

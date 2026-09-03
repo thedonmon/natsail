@@ -313,7 +313,9 @@ describe('recovering explicit-ack JetStream processor', () => {
         recovery: { maxAttempts: 2, delayMs: 0 },
         codec: natsCodecs.text,
       },
-      ({ value }) => received.push(value)
+      ({ value }) => {
+        received.push(value)
+      }
     )
 
     await lease.ready

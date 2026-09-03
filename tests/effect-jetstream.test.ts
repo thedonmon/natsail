@@ -117,14 +117,14 @@ function controlledJetStreamSource<T>() {
   }
 }
 
-const sourceOptions: JetStreamSessionSourceOptions<number> = {
+const sourceOptions = {
   stream: 'ORDERS',
   filter: 'events.orders',
   start: 'all',
   maxBufferedMessages: 4,
   decode: () => 0,
   recovery: { delayMs: 10 },
-}
+} satisfies JetStreamSessionSourceOptions<number>
 
 describe('Effect JetStream adapter', () => {
   beforeEach(() => {
@@ -456,7 +456,7 @@ describe('Effect JetStream adapter', () => {
 
     await vi.waitFor(() => expect(jetStreamMocks.processJetStream).toHaveBeenCalledOnce())
     let accepted = false
-    const processing = processorHandler(processingDelivery(42, 1)).then(() => {
+    const processing = Promise.resolve(processorHandler(processingDelivery(42, 1))).then(() => {
       accepted = true
     })
     await new Promise((resolve) => setTimeout(resolve, 10))

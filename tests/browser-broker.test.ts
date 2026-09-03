@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import {
-  BrowserBrokerError,
   BrowserBrokerResumeRequiredError,
   createBrowserBrokerClient,
   createBrowserBrokerWorker,
@@ -295,7 +294,7 @@ describe('@natsail/browser-broker', () => {
     expect(published).toEqual([{ operation: 'send-chat', value: 'hello', revision: 1 }])
     await expect(
       client.publish('send-chat', new ArrayBuffer(0) as unknown as Uint8Array)
-    ).rejects.toMatchObject<Partial<BrowserBrokerError>>({ code: 'invalid-command' })
+    ).rejects.toMatchObject({ code: 'invalid-command' })
 
     await closeAll([client], [host], [sessions])
   })
@@ -490,7 +489,7 @@ describe('@natsail/browser-broker', () => {
     })
     const lease = client.createSource(descriptor)(async () => undefined)
 
-    await expect(lease.ready).rejects.toMatchObject<Partial<BrowserBrokerError>>({
+    await expect(lease.ready).rejects.toMatchObject({
       code: 'source-failed',
     })
     await vi.waitFor(() =>
@@ -526,7 +525,7 @@ describe('@natsail/browser-broker', () => {
     })
     const lease = client.createSource(descriptor)(async () => undefined)
 
-    await expect(lease.ready).rejects.toMatchObject<Partial<BrowserBrokerError>>({
+    await expect(lease.ready).rejects.toMatchObject({
       code: 'source-failed',
     })
     await vi.waitFor(() =>
@@ -556,7 +555,7 @@ describe('@natsail/browser-broker', () => {
     })
     const lease = client.createSource(descriptor)(async () => undefined)
 
-    await expect(lease.ready).rejects.toMatchObject<Partial<BrowserBrokerError>>({
+    await expect(lease.ready).rejects.toMatchObject({
       code: 'source-failed',
     })
     await vi.waitFor(() => expect(closeIdleResources).toHaveBeenCalledOnce())
@@ -611,7 +610,7 @@ describe('@natsail/browser-broker', () => {
       async () => undefined
     )
 
-    await expect(conflicting.ready).rejects.toMatchObject<Partial<BrowserBrokerError>>({
+    await expect(conflicting.ready).rejects.toMatchObject({
       code: 'contract-mismatch',
     })
     expect(source.opens).toBe(1)
@@ -896,10 +895,10 @@ describe('@natsail/browser-broker', () => {
     await lease.ready
 
     replacementFails = true
-    await expect(client.reconnect()).rejects.toMatchObject<Partial<BrowserBrokerError>>({
+    await expect(client.reconnect()).rejects.toMatchObject({
       code: 'unavailable',
     })
-    await expect(lease.closed).rejects.toMatchObject<Partial<BrowserBrokerError>>({
+    await expect(lease.closed).rejects.toMatchObject({
       code: 'unavailable',
     })
     await expect(lease.close()).resolves.toBeUndefined()
@@ -942,14 +941,16 @@ describe('@natsail/browser-broker', () => {
       async () => undefined
     )
     const received: string[] = []
-    const healthy = client.createSource({ key: 'healthy', contract: 'events:v1' })(async (event) =>
+    const healthy = client.createSource({ key: 'healthy', contract: 'events:v1' })(async (
+      event
+    ) => {
       received.push(decoder.decode(event.data))
-    )
+    })
     await Promise.all([rejected.ready, healthy.ready])
 
     activeHost = replacementHost
     await expect(client.reconnect()).resolves.toBeUndefined()
-    await expect(rejected.closed).rejects.toMatchObject<Partial<BrowserBrokerError>>({
+    await expect(rejected.closed).rejects.toMatchObject({
       code: 'source-failed',
     })
     expect(replacementHost.inspect()).toMatchObject({
@@ -1001,14 +1002,14 @@ describe('@natsail/browser-broker', () => {
     )
 
     revision = 2
-    await expect(client.refreshCredentials()).rejects.toMatchObject<Partial<BrowserBrokerError>>({
+    await expect(client.refreshCredentials()).rejects.toMatchObject({
       code: 'source-failed',
     })
     expect(observed).toEqual(['2:credential-2'])
-    await expect(first.closed).rejects.toMatchObject<Partial<BrowserBrokerError>>({
+    await expect(first.closed).rejects.toMatchObject({
       code: 'source-failed',
     })
-    await expect(second.closed).rejects.toMatchObject<Partial<BrowserBrokerError>>({
+    await expect(second.closed).rejects.toMatchObject({
       code: 'source-failed',
     })
     expect(host.inspect()).toMatchObject({
@@ -1208,7 +1209,7 @@ describe('@natsail/browser-broker', () => {
         strict: true,
         heartbeatIntervalMs: 0,
       })
-    ).rejects.toMatchObject<Partial<BrowserBrokerError>>({ code: 'unavailable' })
+    ).rejects.toMatchObject({ code: 'unavailable' })
     await client.close()
     expect(closeHost).toHaveBeenCalledTimes(1)
     await sessions.close()
@@ -1234,7 +1235,7 @@ describe('@natsail/browser-broker', () => {
         fallback: createTabLocalBrokerConnector(() => host),
         heartbeatIntervalMs: 0,
       })
-    ).rejects.toMatchObject<Partial<BrowserBrokerError>>({ code: 'invalid-command' })
+    ).rejects.toMatchObject({ code: 'invalid-command' })
     expect(closeHost).toHaveBeenCalledTimes(1)
     await sessions.close()
   })
@@ -1255,7 +1256,7 @@ describe('@natsail/browser-broker', () => {
         connect: connector(host),
         heartbeatIntervalMs: 0,
       })
-    ).rejects.toMatchObject<Partial<BrowserBrokerError>>({ code: 'invalid-command' })
+    ).rejects.toMatchObject({ code: 'invalid-command' })
     await closeAll([], [host], [sessions])
   })
 
@@ -1277,7 +1278,7 @@ describe('@natsail/browser-broker', () => {
         connect: connector(host),
         heartbeatIntervalMs: 0,
       })
-    ).rejects.toMatchObject<Partial<BrowserBrokerError>>({ code: 'credentials-stale' })
+    ).rejects.toMatchObject({ code: 'credentials-stale' })
     await closeAll([first], [host], [sessions])
   })
 
@@ -1294,20 +1295,20 @@ describe('@natsail/browser-broker', () => {
     const sourceBeforeClose = client.createSource(descriptor)
     await client.close()
 
-    await expect(client.connect()).rejects.toMatchObject<Partial<BrowserBrokerError>>({
+    await expect(client.connect()).rejects.toMatchObject({
       code: 'invalid-state',
     })
-    await expect(client.reconnect()).rejects.toMatchObject<Partial<BrowserBrokerError>>({
+    await expect(client.reconnect()).rejects.toMatchObject({
       code: 'invalid-state',
     })
     expect(() => client.createSource(descriptor)).toThrow(
       expect.objectContaining({ code: 'invalid-state' })
     )
     const lease = sourceBeforeClose(async () => undefined)
-    await expect(lease.ready).rejects.toMatchObject<Partial<BrowserBrokerError>>({
+    await expect(lease.ready).rejects.toMatchObject({
       code: 'invalid-state',
     })
-    await expect(lease.closed).rejects.toMatchObject<Partial<BrowserBrokerError>>({
+    await expect(lease.closed).rejects.toMatchObject({
       code: 'invalid-state',
     })
     await closeAll([], [host], [sessions])

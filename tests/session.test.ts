@@ -89,7 +89,7 @@ describe('session registry', () => {
       deliver = accept
       return sourceLease.lease
     }
-    const reduced = createReducingSessionSource(
+    const reduced = createReducingSessionSource<string, string[]>(
       source,
       () => [] as string[],
       async (values, value) => {
@@ -122,8 +122,8 @@ describe('session registry', () => {
       },
     }
     const published: number[] = []
-    const reduced = createReducingSessionSource(
-      (accept) => {
+    const reduced = createReducingSessionSource<number, number>(
+      (accept: (value: number) => Promise<void>) => {
         deliver = accept
         return sourceLease.lease
       },

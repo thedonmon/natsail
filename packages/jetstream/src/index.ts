@@ -36,12 +36,7 @@ import {
   type NatsRuntimeDiagnostic,
   type SubscriptionLease,
 } from '@natsail/core'
-import {
-  defineSession,
-  type SessionDefinition,
-  type SessionReducer,
-  type SessionSource,
-} from '@natsail/session'
+import { defineSession, type SessionDefinition, type SessionReducer } from '@natsail/session'
 
 import {
   createJetStreamProcessorController,
@@ -1959,7 +1954,7 @@ function sessionContract<T>(options: JetStreamSessionSourceOptions<T>): string {
 export function createJetStreamSessionSource<T>(
   runtime: NatsRuntime,
   options: JetStreamSessionSourceOptions<T>
-): SessionSource<JetStreamDelivery<T>> {
+): (accept: (value: JetStreamDelivery<T>) => Promise<void>) => JetStreamLease<T> {
   const { recovery, ...subscriptionOptions } = options
   const effectiveOptions: JetStreamSubscriptionOptions<T> =
     subscriptionOptions.resume || !recovery
@@ -2027,7 +2022,7 @@ export function createReducingJetStreamSessionSource<Value, State>(
   runtime: NatsRuntime,
   options: ReducingJetStreamSessionOptions<Value>,
   reducer: JetStreamStateReducer<Value, State>
-): SessionSource<JetStreamStateSnapshot<State>> {
+): (accept: (value: JetStreamStateSnapshot<State>) => Promise<void>) => JetStreamLease<Value> {
   if (reducer.scope.length === 0) throw new TypeError('JetStream reducer scope must not be empty')
   if (options.resume) {
     throw new TypeError(

@@ -2,6 +2,7 @@ import { Effect, Fiber, Stream } from 'effect'
 import { describe, expect, it, vi } from 'vitest'
 
 import type {
+  CoreRequestOptions,
   CoreSubscriptionOptions,
   MessageHandler,
   NatsRuntime,
@@ -163,15 +164,13 @@ describe('Effect adapter', () => {
   it('aborts an in-flight NATS request when its Effect fiber is interrupted', async () => {
     let requestSignal: AbortSignal | undefined
     const runtime = runtimeStub({
-      request: vi.fn(
-        (options) =>
-          new Promise((_resolve, reject) => {
-            requestSignal = options.signal
-            options.signal?.addEventListener('abort', () => reject(new Error('request aborted')), {
-              once: true,
-            })
+      request: <T>(options: CoreRequestOptions<T>) =>
+        new Promise<T>((_resolve, reject) => {
+          requestSignal = options.signal
+          options.signal?.addEventListener('abort', () => reject(new Error('request aborted')), {
+            once: true,
           })
-      ),
+        }),
     })
     const service = makeNatsail({ runtime, sessions: createSessionRegistry() })
     const fiber = Effect.runFork(
@@ -725,7 +724,11 @@ function controllableEvents(): {
   return {
     iterable: {
       [Symbol.asyncIterator]() {
-        const subscriber = { queue: [] as NatsRuntimeEvent[], closed: false }
+        const subscriber: {
+          queue: NatsRuntimeEvent[]
+          resume?: () => void
+          closed: boolean
+        } = { queue: [], closed: false }
         subscribers.add(subscriber)
 
         return {
@@ -751,7 +754,7 @@ function controllableEvents(): {
       for (const subscriber of subscribers) {
         subscriber.queue.push(event)
         subscriber.resume?.()
-        subscriber.resume = undefined
+        delete subscriber.resume
       }
     },
     activeIterators: () => subscribers.size,

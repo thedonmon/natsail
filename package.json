@@ -12,7 +12,7 @@
     "benchmark": "pnpm --silent --filter @natsail/rxjs... --filter @natsail/effect... build && node benchmarks/replay-burst.mjs",
     "build": "pnpm --recursive --stream build",
     "changeset": "changeset",
-    "check": "pnpm format:check && pnpm build && pnpm test && pnpm test:browser",
+    "check": "pnpm format:check && pnpm build && pnpm typecheck:tests && pnpm test && pnpm test:browser",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "nats:down": "docker compose down --volumes",
@@ -39,6 +39,7 @@
     "release:publish": "node scripts/publish-packages.mjs",
     "release:version": "changeset version",
     "test": "vitest run",
+    "typecheck:tests": "tsc -p tsconfig.tests.json",
     "test:browser": "playwright test",
     "test:browser-broker": "playwright test --config playwright.browser-broker.config.ts",
     "test:watch": "vitest"

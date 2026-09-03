@@ -540,7 +540,11 @@ function controllableEvents(): {
   return {
     iterable: {
       [Symbol.asyncIterator]() {
-        const subscriber = { queue: [] as NatsRuntimeEvent[], closed: false }
+        const subscriber: {
+          queue: NatsRuntimeEvent[]
+          resume?: () => void
+          closed: boolean
+        } = { queue: [], closed: false }
         subscribers.add(subscriber)
 
         return {
@@ -568,7 +572,7 @@ function controllableEvents(): {
       for (const subscriber of subscribers) {
         subscriber.queue.push(event)
         subscriber.resume?.()
-        subscriber.resume = undefined
+        delete subscriber.resume
       }
     },
     activeIterators: () => subscribers.size,

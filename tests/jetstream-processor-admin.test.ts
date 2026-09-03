@@ -142,15 +142,14 @@ describe('JetStream processor administration', () => {
   })
 
   it('compares only explicitly requested optional fields and canonicalizes maps and filters', () => {
-    const current = normalizeJetStreamProcessorActive(
-      info({
-        replay_policy: ReplayPolicy.Original,
-        filter_subject: undefined,
-        filter_subjects: ['events.b', 'events.a'],
-        metadata: { z: 'last', _nats_level: 'server-owned', a: 'first' },
-        ack_wait: 9_000_000_000,
-      })
-    )
+    const activeInfo = info({
+      replay_policy: ReplayPolicy.Original,
+      filter_subjects: ['events.b', 'events.a'],
+      metadata: { z: 'last', _nats_level: 'server-owned', a: 'first' },
+      ack_wait: 9_000_000_000,
+    })
+    delete activeInfo.config.filter_subject
+    const current = normalizeJetStreamProcessorActive(activeInfo)
 
     expect(
       classifyJetStreamProcessorDrift(
@@ -177,7 +176,7 @@ describe('JetStream processor administration', () => {
   })
 
   it('clears the mutually exclusive filter field when filter cardinality changes', async () => {
-    active = info({ filter_subject: 'events.>', filter_subjects: undefined })
+    active = info({ filter_subject: 'events.>' })
     const controller = createJetStreamProcessorController(runtime(), {
       ...baseOptions,
       filter: ['events.a', 'events.b'],

@@ -38,6 +38,7 @@ jobs:
       - run: pnpm nats:up
       - run: pnpm format:check
       - run: pnpm build
+      - run: pnpm typecheck:tests
       - run: pnpm test
       - run: pnpm test:browser-broker
 

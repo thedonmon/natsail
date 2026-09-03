@@ -1,4 +1,4 @@
-import type { Msg, NatsConnection, Status } from '@nats-io/nats-core'
+import type { Msg, NatsConnection, Status, Subscription } from '@nats-io/nats-core'
 import { describe, expect, it, vi } from 'vitest'
 
 import {
@@ -123,7 +123,7 @@ describe('NATSail telemetry', () => {
     )
     clock.value += 7
     controlled.emit({ type: 'reconnect', server: 'nats://private.example' })
-    controlled.emit({ type: 'slowConsumer', pending: 12 })
+    controlled.emit({ type: 'slowConsumer', pending: 12, sub: {} as Subscription })
     await vi.waitFor(() =>
       expect(events).toContainEqual(
         expect.objectContaining({
