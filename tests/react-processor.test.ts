@@ -131,6 +131,7 @@ describe('React explicit-ack processor adapter', () => {
     await act(async () => {
       await deliver({
         value: 'processed',
+        subject: 'events.processed',
         cursor: { stream: 'EVENTS', sequence: 1 },
         redelivered: false,
         deliveryAttempt: 1,
@@ -216,7 +217,7 @@ describe('React explicit-ack processor adapter', () => {
 
   it('reports processor recovery without remounting the hook', async () => {
     Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
-    let inspection: JetStreamProcessorInspection = { phase: 'live', restarts: 0 }
+    let inspection = processorInspection()
     const listeners = new Set<() => void>()
     const close = vi.fn(async () => undefined)
     mocks.processJetStream.mockReturnValue({
@@ -224,7 +225,7 @@ describe('React explicit-ack processor adapter', () => {
       closed: new Promise(() => undefined),
       close,
       inspect: () => inspection,
-      subscribe: (listener) => {
+      subscribe: (listener: () => void) => {
         listeners.add(listener)
         return () => listeners.delete(listener)
       },
@@ -258,7 +259,11 @@ describe('React explicit-ack processor adapter', () => {
     expect(container.textContent).toBe('live:0')
 
     await act(async () => {
-      inspection = { phase: 'reconnecting', restarts: 1, error: new Error('connection lost') }
+      inspection = processorInspection({
+        phase: 'reconnecting',
+        restarts: 1,
+        error: new Error('connection lost'),
+      })
       for (const listener of listeners) listener()
     })
     expect(container.textContent).toBe('reconnecting:1')
@@ -277,8 +282,34 @@ function processorLease(
     ready: Promise.resolve(),
     closed,
     close,
-    inspect: () => ({ phase: 'live', restarts: 0 }),
+    inspect: () => processorInspection(),
     subscribe: () => () => undefined,
+  }
+}
+
+function processorInspection(
+  patch: Partial<JetStreamProcessorInspection> = {}
+): JetStreamProcessorInspection {
+  return {
+    phase: 'live',
+    restarts: 0,
+    stream: 'EVENTS',
+    consumer: { name: 'processor', mode: 'owned', owned: true },
+    pendingAcknowledgements: 0,
+    pendingMessages: 0,
+    delivered: { consumer: 0, stream: 0 },
+    acknowledged: { consumer: 0, stream: 0 },
+    redeliveries: 0,
+    paused: false,
+    desired: {
+      durableName: 'processor',
+      deliveryKind: 'pull',
+      ackPolicy: 'explicit',
+      deliverPolicy: 'all',
+      replayPolicy: 'instant',
+      filters: ['events.>'],
+    },
+    ...patch,
   }
 }
 
