@@ -73,3 +73,19 @@ The publisher skips versions that already exist in the registry. npm never permi
 A new package needs one manual bootstrap publication before npm exposes package settings. After that publication, configure the same `release.yml` trusted publisher used by the existing package set, require two-factor authentication, and disallow tokens. Later versions use the routine OIDC workflow.
 
 Keep a new package at `0.0.0` in its implementation pull request and add a minor Changeset. After merging the implementation, manually publish that `0.0.0` bootstrap from `main`, configure its trusted publisher, and then merge the version pull request. The version pull request produces `0.1.0`, which the routine OIDC workflow publishes with provenance.
+
+For the current `@natsail/browser-broker` and `@natsail/opentelemetry` additions, check out the merged `main` commit with a clean worktree, authenticate the npm CLI as an `@natsail` owner with two-factor authentication, and run:
+
+```sh
+pnpm install --frozen-lockfile
+pnpm release:check
+
+bootstrap_dir=$(mktemp -d "${TMPDIR:-/tmp}/natsail-bootstrap.XXXXXX")
+pnpm --filter @natsail/browser-broker pack --pack-destination "$bootstrap_dir"
+pnpm --filter @natsail/opentelemetry pack --pack-destination "$bootstrap_dir"
+
+npm publish "$bootstrap_dir/natsail-browser-broker-0.0.0.tgz" --access public
+npm publish "$bootstrap_dir/natsail-opentelemetry-0.0.0.tgz" --access public
+```
+
+Do not run `pnpm release:publish` locally. That command intentionally accepts only the trusted GitHub Actions environment on `main`. After both bootstrap publications, configure each package's trusted publisher and security settings before merging the Changesets version pull request.

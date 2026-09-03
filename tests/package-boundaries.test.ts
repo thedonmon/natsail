@@ -1,16 +1,22 @@
-import { readFile } from 'node:fs/promises'
+import { readdir, readFile } from 'node:fs/promises'
 
 import { describe, expect, it } from 'vitest'
 
 describe('package boundaries', () => {
   it('keeps the browser broker on Core and SessionSource contracts', async () => {
-    const manifest = JSON.parse(
-      await readFile(new URL('../packages/browser-broker/package.json', import.meta.url), 'utf8')
-    ) as { dependencies: Record<string, string>; sideEffects: boolean }
-    const source = await readFile(
-      new URL('../packages/browser-broker/src/index.ts', import.meta.url),
-      'utf8'
-    )
+    const packageRoot = new URL('../packages/browser-broker/', import.meta.url)
+    const manifest = JSON.parse(await readFile(new URL('package.json', packageRoot), 'utf8')) as {
+      dependencies: Record<string, string>
+      sideEffects: boolean
+    }
+    const sourceRoot = new URL('src/', packageRoot)
+    const source = (
+      await Promise.all(
+        (await readdir(sourceRoot))
+          .filter((file) => file.endsWith('.ts'))
+          .map((file) => readFile(new URL(file, sourceRoot), 'utf8'))
+      )
+    ).join('\n')
 
     expect(Object.keys(manifest.dependencies)).toEqual(['@natsail/core', '@natsail/session'])
     expect(manifest.sideEffects).toBe(false)
