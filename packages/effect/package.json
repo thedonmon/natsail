@@ -1,6 +1,6 @@
 {
   "name": "@natsail/effect",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Scoped Effect v4 Streams for Core NATS, JetStream, and shared sessions.",
   "keywords": [
     "nats",

@@ -1,5 +1,11 @@
 # @natsail/effect
 
+## 0.3.0
+
+### Minor Changes
+
+- ceda618: Add `jetStreamStates()` for registry-shared reducing JetStream definitions with immediate replay and reconnect boundaries plus bounded cumulative live-state coalescing.
+
 ## 0.2.1
 
 ### Patch Changes
