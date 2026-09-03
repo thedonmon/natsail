@@ -1,0 +1,44 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "unicorn", "oxc", "react"],
+  "categories": {
+    "correctness": "error"
+  },
+  "rules": {
+    "eslint/complexity": ["warn", { "max": 20 }],
+    "eslint/eqeqeq": "error",
+    "eslint/prefer-const": "error",
+    "typescript/ban-ts-comment": "error",
+    "typescript/no-explicit-any": "error"
+  },
+  "overrides": [
+    {
+      "files": ["packages/react/src/**"],
+      "rules": {
+        // Existing lifecycle patterns need a separate behavior-tested review.
+        "react/refs": "warn",
+        "react/set-state-in-effect": "warn",
+        "react/exhaustive-deps": "warn",
+        "react/no-children-prop": "warn"
+      }
+    },
+    {
+      "files": ["packages/browser-broker/src/client.ts", "packages/browser-broker/src/worker.ts"],
+      "rules": {
+        // Snapshot collections before callbacks/awaits that can change their membership.
+        "unicorn/no-useless-spread": "off"
+      }
+    }
+  ],
+  "ignorePatterns": [
+    "/*",
+    "!/packages/",
+    "/packages/*/*",
+    "!/packages/*/src/",
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/__tests__/**",
+    "**/*.test.*",
+    "**/*.spec.*"
+  ]
+}
