@@ -40,6 +40,7 @@
     "release:version": "changeset version",
     "test": "vitest run",
     "test:browser": "playwright test",
+    "test:browser-broker": "playwright test --config playwright.browser-broker.config.ts",
     "test:watch": "vitest"
   },
   "devDependencies": {

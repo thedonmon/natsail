@@ -160,6 +160,7 @@ export type NatsailTelemetryAttributes = Readonly<Record<string, NatsailTelemetr
 
 export type NatsailTelemetryCounterName =
   | 'natsail.batch.flushes'
+  | 'natsail.browser.broker.events'
   | 'natsail.buffer.signals'
   | 'natsail.connection.attempts'
   | 'natsail.connection.transitions'
@@ -172,6 +173,11 @@ export type NatsailTelemetryCounterName =
   | 'natsail.work.yields'
 
 export type NatsailTelemetryGaugeName =
+  | 'natsail.browser.broker.connections.active'
+  | 'natsail.browser.broker.queue.bytes'
+  | 'natsail.browser.broker.queue.depth'
+  | 'natsail.browser.broker.sources.active'
+  | 'natsail.browser.broker.tabs.active'
   | 'natsail.jetstream.replay.remaining'
   | 'natsail.runtime.capacity.limit'
   | 'natsail.runtime.capacity.used'

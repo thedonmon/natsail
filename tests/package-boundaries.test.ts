@@ -3,6 +3,20 @@ import { readFile } from 'node:fs/promises'
 import { describe, expect, it } from 'vitest'
 
 describe('package boundaries', () => {
+  it('keeps the browser broker on Core and SessionSource contracts', async () => {
+    const manifest = JSON.parse(
+      await readFile(new URL('../packages/browser-broker/package.json', import.meta.url), 'utf8')
+    ) as { dependencies: Record<string, string>; sideEffects: boolean }
+    const source = await readFile(
+      new URL('../packages/browser-broker/src/index.ts', import.meta.url),
+      'utf8'
+    )
+
+    expect(Object.keys(manifest.dependencies)).toEqual(['@natsail/core', '@natsail/session'])
+    expect(manifest.sideEffects).toBe(false)
+    expect(source).not.toMatch(/@nats-io|cloudflare|durable object/i)
+  })
+
   it('keeps optional libraries out of the Core package', async () => {
     const packageText = await readFile(
       new URL('../packages/core/package.json', import.meta.url),

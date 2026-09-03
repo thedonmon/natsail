@@ -444,6 +444,8 @@ Applications should retain:
 
 ### Phase 4: choose the production cross-tab topology
 
+Implemented: `@natsail/browser-broker` now provides the SharedWorker option through the existing `SessionSource` contract, with protocol-v1 validation, immutable tenant/auth identity, credential refresh, bounded per-tab queues, cursor acknowledgements, explicit lag, heartbeat cleanup, and tab-local fallback policy.
+
 - Retain direct NATS WebSockets when low latency and existing NATS ACL/token infrastructure are the priority.
 - Add a `SharedWorker` host when reducing duplicate same-origin browser-tab connections and consumers is worth the additional lifecycle work.
 - Add the gateway adapter when credentials, tenancy authorization, or protocol portability should be server-owned.

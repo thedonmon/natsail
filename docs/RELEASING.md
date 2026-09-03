@@ -39,7 +39,7 @@ Read the [npm trusted-publishing guide](https://docs.npmjs.com/trusted-publisher
 5. Review the Changesets version pull request.
 6. Merge the version pull request after its package and changelog changes are correct.
 
-The release workflow builds and packs all eight packages. It installs every tarball together before publication.
+The release workflow builds and packs all nine packages. It installs every tarball together before publication.
 
 The NATSail publisher compares each local version with npm. It packs missing versions with pnpm so no `workspace:` dependency reaches npm. It then publishes each tarball with the npm CLI and GitHub Actions OIDC. The Changesets action creates the package tags and GitHub releases. npm attaches provenance to each trusted publication.
 

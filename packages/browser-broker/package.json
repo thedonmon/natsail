@@ -1,0 +1,48 @@
+{
+  "name": "@natsail/browser-broker",
+  "version": "0.0.0",
+  "description": "SharedWorker source sharing, bounded tab delivery, and resume signaling for NATSail browser applications.",
+  "keywords": [
+    "nats",
+    "browser",
+    "sharedworker",
+    "session",
+    "jetstream"
+  ],
+  "license": "Apache-2.0",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thedonmon/natsail.git",
+    "directory": "packages/browser-broker"
+  },
+  "homepage": "https://github.com/thedonmon/natsail/tree/main/packages/browser-broker#readme",
+  "bugs": {
+    "url": "https://github.com/thedonmon/natsail/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepack": "pnpm build"
+  },
+  "dependencies": {
+    "@natsail/core": "workspace:^",
+    "@natsail/session": "workspace:^"
+  }
+}

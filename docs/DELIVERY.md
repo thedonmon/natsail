@@ -116,9 +116,15 @@ The sink is synchronous and runs inline around the observed operation. It should
 
 Many conversations in one browser tab can share one runtime connection. Each active JetStream conversation still has its own consumer and bounded pull loop.
 
-Each browser tab has a separate JavaScript realm. One runtime in each tab creates one connection in each tab.
+Each browser tab has a separate JavaScript realm. One runtime in each tab creates one connection in each tab unless the application opts into `@natsail/browser-broker`.
 
-The repository contains a `SharedWorker` proof that lets two tabs share one connection. It is not a published browser-broker package.
+The browser broker runs caller-supplied `SessionSource` definitions inside a `SharedWorker`. The stable tenant, authentication context, logical key, and contract select one physical source. Contract conflicts fail deterministically. Credentials are transferred from authenticated tab bootstrap, use monotonic revisions, and can refresh without changing source identity.
+
+Each tab has independent item and encoded-byte bounds and at most one transferred batch in flight. It acknowledges the batch cursor only after its local SessionSource handler accepts every item. A tab that exceeds its bound receives `resume-required` with reason `lagged`; no reliable item is silently discarded. A bounded physical-source log supports catch-up from retained per-tab JetStream cursors.
+
+Worker replacement reconnects active tab sources after their last acknowledged cursor. Heartbeats release references for abandoned ports, and final-reference teardown honors the configured idle delay. Applications may configure an explicit tab-local fallback, but strict mode rejects environments without SharedWorker when duplicate connections would violate policy.
+
+The protocol is versioned and same-origin. It does not replace authorization: worker source factories must map authenticated identities to allowed application sources instead of accepting arbitrary subjects, streams, or consumer names.
 
 The Durable Object prototype owns one upstream JetStream consumer for multiple clients. It also stores an upstream checkpoint and supports bounded client catch-up after restart.
 

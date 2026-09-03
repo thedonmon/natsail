@@ -8,6 +8,8 @@ NATSail gives TypeScript applications one managed NATS runtime. It owns connecti
 
 React, RxJS, and Effect adapters can share the same runtime and logical sessions. Your components do not need connection effects, custom retry loops, or byte-decoding boilerplate.
 
+Browser applications can also move those logical sessions into a `SharedWorker`, so same-origin tabs share physical sources without hiding lag or resume requirements.
+
 NATSail is useful when:
 
 - many parts of an application must share one NATS connection
@@ -134,6 +136,7 @@ React, RxJS, and Effect can attach to this definition without creating duplicate
 - [`@natsail/rxjs`](packages/rxjs/README.md) exposes cancellable Observables and frame-coalesced JetStream state.
 - [`@natsail/effect`](packages/effect/README.md) provides scoped Effect v4 Streams with bounded buffers and structured interruption.
 - [`@natsail/opentelemetry`](packages/opentelemetry/README.md) maps optional dependency-free measurements to OpenTelemetry metrics.
+- [`@natsail/browser-broker`](packages/browser-broker/README.md) shares bounded, cursor-aware `SessionSource` leases across same-origin tabs through a versioned SharedWorker protocol.
 
 Applications install only the packages that they use. The Core package does not import JetStream, Effect, React, or RxJS.
 
@@ -160,6 +163,30 @@ const sessions = createSessionRegistry({ telemetry })
 Use only stable, low-cardinality primitive attributes. NATSail does not include subjects, payloads, credentials, session/checkpoint keys, stream names, or consumer names in its default telemetry attributes. Internal operation attributes override colliding caller attributes. A sink runs inline, so it should enqueue measurements and avoid blocking I/O; sink exceptions are isolated from observed operations.
 
 Install [`@natsail/opentelemetry`](packages/opentelemetry/README.md) to map the same interface to OpenTelemetry without adding an OpenTelemetry dependency to Core.
+
+## Share sources across browser tabs
+
+Install `@natsail/browser-broker` when same-origin tabs should share one physical Core or JetStream source. The SharedWorker host uses the normal session contract, transfers one batch at a time to each tab, and requires a cursor acknowledgement before advancing that tab.
+
+```ts
+const browser = await createBrowserBrokerClient({
+  identity: { tenant: tenantId, authenticationContext: 'interactive-user-v1' },
+  credentials: () => credentialStore.current(),
+  connect: () =>
+    new SharedWorker(new URL('./nats-worker.ts', import.meta.url), {
+      name: 'application-nats',
+      type: 'module',
+    }).port,
+  strict: true,
+})
+
+const conversationSource = browser.createSource({
+  key: 'conversation-feed',
+  contract: 'conversation-events:v1',
+})
+```
+
+Per-tab item and encoded-byte queues are bounded independently. A lagging tab receives an explicit resume-required error from its last acknowledged JetStream cursor; other tabs continue. Tenant/authentication context is immutable source identity, while credentials can be refreshed through the authenticated tab bootstrap. See the [browser broker guide](packages/browser-broker/README.md) for worker setup, fallback policy, and protocol v1.
 
 ## Batching and cooperative reducers
 
@@ -354,7 +381,7 @@ The main test server uses native port 4223, monitoring port 8223, and WebSocket 
 
 `pnpm nats:up` writes disposable test credentials to the ignored `.generated/` directory. Git does not store private test credentials.
 
-Run `pnpm nats:down` to stop the fixture servers. Run `pnpm benchmark` for a local machine-readable 1,000/5,000-event replay and configurable live-burst baseline. Run `pnpm release:check` to build and inspect all eight package tarballs.
+Run `pnpm nats:down` to stop the fixture servers. Run `pnpm benchmark` for a local machine-readable 1,000/5,000-event replay and configurable live-burst baseline. Run `pnpm release:check` to build and inspect all nine package tarballs.
 
 ## License
 

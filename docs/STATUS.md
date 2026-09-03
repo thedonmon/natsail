@@ -1,6 +1,6 @@
 # Project status and roadmap
 
-NATSail is a public `0.x` package family. The repository publishes eight packages under the `@natsail` npm scope.
+NATSail is a public `0.x` package family. The repository publishes nine packages under the `@natsail` npm scope.
 
 The test suite uses NATS 2.14.4. Separate fixtures cover anonymous, token, user/password, NKey, operator JWT, and TLS connections.
 
@@ -18,6 +18,7 @@ The test suite uses NATS 2.14.4. Separate fixtures cover anonymous, token, user/
 - Connection-wide limits for consumers, buffered messages, and buffered bytes
 - Dependency-free counters, gauges, and deterministic duration telemetry isolated from runtime operations
 - Optional OpenTelemetry metrics adapter with no Core OpenTelemetry dependency
+- SharedWorker broker protocol with immutable tenant/auth identity and refreshable credentials
 
 ### JetStream
 
@@ -49,6 +50,8 @@ The test suite uses NATS 2.14.4. Separate fixtures cover anonymous, token, user/
 - Frame-coalesced RxJS cumulative state
 - Effect v4 Layers, bounded Streams, replay materialization, and processors
 - One logical session shared by Effect, React, and RxJS
+- One physical SessionSource shared across same-origin tabs with per-tab cursor acknowledgements
+- Bounded per-tab item/byte queues with explicit lagged resume requirements
 
 ### Examples and packaging
 
@@ -58,7 +61,7 @@ The test suite uses NATS 2.14.4. Separate fixtures cover anonymous, token, user/
 - Full-page AI reply recovery with retained state
 - Local Cloudflare Worker WebSocket and TCP transport proofs
 - Local Durable Object fan-out and restart replay
-- SharedWorker cross-tab connection proof
+- Published SharedWorker browser broker with protocol-v1 validation, fallback policy, and two-tab acceptance coverage
 - Changesets, package checks, provenance, and trusted publishing
 - Machine-readable local 1,000/5,000 replay and configurable live-burst benchmark foundation
 
@@ -88,7 +91,7 @@ The Durable Object gateway remains a prototype. A published package needs produc
 
 ### Cross-tab sharing
 
-The `SharedWorker` harness proves that two tabs can share one connection. It does not define a supported broker protocol, authentication model, or complete failure behavior.
+`@natsail/browser-broker` now defines the supported same-origin protocol, authentication bootstrap, bounded fan-out, reference lifecycle, and worker replacement path. A tab crash is detected by heartbeat timeout rather than synchronously, and applications remain responsible for authorizing logical source mappings. Cross-device and remote gateway fan-out are separate concerns.
 
 ### Effect tuning
 
@@ -111,10 +114,10 @@ Named processors support explicit acknowledgements, redelivery, rich cached insp
 5. Prove an atomic catch-up-to-live handoff in the Durable Object gateway.
 6. Add gateway authentication, backpressure, eviction tests, and cost measurements.
 7. Run the Cloudflare examples against a remote NATS endpoint and test Workers VPC access.
-8. Define the `SharedWorker` broker protocol, authentication model, lifecycle, and failure behavior.
+8. Measure SharedWorker broker behavior under long-lived background-tab suspension and browser-specific worker eviction.
 
 ## Publication status
 
-All eight package tarballs pass repository checks. Routine releases use Changesets and GitHub trusted publishing.
+All nine package tarballs pass repository checks. Routine releases use Changesets and GitHub trusted publishing.
 
 A new npm package still needs its first publication and trusted-publisher configuration before routine OIDC releases can publish it.

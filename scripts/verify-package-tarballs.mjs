@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url'
 
 const repositoryRoot = fileURLToPath(new URL('..', import.meta.url))
 const packages = [
+  { directory: 'browser-broker', name: '@natsail/browser-broker' },
   { directory: 'checkpoints', name: '@natsail/checkpoints' },
   { directory: 'core', name: '@natsail/core' },
   { directory: 'jetstream', name: '@natsail/jetstream' },
