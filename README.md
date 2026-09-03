@@ -1,6 +1,6 @@
 # NATSail
 
-[![CI](https://github.com/thedonmon/natsail/actions/workflows/ci.yml/badge.svg)](https://github.com/thedonmon/natsail/actions/workflows/ci.yml)
+[![CI](https://github.com/thedonmon/natsail/actions/workflows/ci.yml/badge.svg)](https://github.com/thedonmon/natsail/actions/workflows/ci.yml) [![npm](https://img.shields.io/npm/v/%40natsail%2Fcore)](https://www.npmjs.com/package/@natsail/core)
 
 NATS has a small API. Keeping a NATS connection healthy inside a real application takes more work.
 
