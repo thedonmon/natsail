@@ -1,6 +1,6 @@
 import { Effect, Stream } from 'effect'
 
-import { natsCodecs, type NatsPayloadCodec } from '@natsail/core'
+import { natsailDefaultScheduler, natsCodecs, type NatsPayloadCodec } from '@natsail/core'
 import type { NatsailService } from '@natsail/effect'
 import {
   demoConversations,
@@ -13,6 +13,8 @@ import {
   type DemoUpdateNotice,
 } from '@natsail/example-chat-ui'
 import { defineReducingJetStreamSession, type JetStreamDelivery } from '@natsail/jetstream'
+
+import { readPerformanceTelemetry, resetPerformanceTelemetry } from './runtime'
 
 export const chatStream = 'NATSAIL_EFFECT_CHAT'
 export const chatSubjectPrefix = 'natsail.examples.effect.chat'
@@ -47,6 +49,8 @@ const initialMetrics = (): DemoPerformanceMetrics => ({
   reactCommits: 0,
   lastBatchSize: 0,
   largestBatchSize: 0,
+  telemetryMeasurements: 0,
+  bufferSignals: 0,
 })
 
 const initialActivity = (): Record<string, DemoConversationActivity> =>
@@ -113,6 +117,7 @@ export class EffectChatController {
   selectConversation = (conversationId: string, updateUrl = true): void => {
     if (!demoConversations.some((conversation) => conversation.id === conversationId)) return
     this.activeAbort?.abort()
+    resetPerformanceTelemetry()
     const abort = new AbortController()
     this.activeAbort = abort
     this.loadStartedAt = performance.now()
@@ -145,6 +150,8 @@ export class EffectChatController {
         duplicateDeliveryPolicy: 'drop',
         recovery: { delayMs: 250 },
         codec: chatCodec,
+        batchPolicy: { maxItems: 256, maxWaitMs: 16 },
+        workBudget: { yieldAfterMs: 4, scheduler: natsailDefaultScheduler },
       },
       {
         scope: 'performance-chat:v1',
@@ -178,6 +185,7 @@ export class EffectChatController {
                 largestBatchSize: firstLive
                   ? 0
                   : Math.max(this.state.metrics.largestBatchSize, batchSize),
+                ...readPerformanceTelemetry(),
               },
               ...(last
                 ? {
@@ -217,6 +225,9 @@ export class EffectChatController {
         chatCodec.encode(message)
       )
     )
+    this.patch({
+      metrics: { ...this.state.metrics, ...readPerformanceTelemetry() },
+    })
   }
 
   busyBurst = async (count: number): Promise<void> => {
@@ -235,6 +246,9 @@ export class EffectChatController {
       return this.natsail.publish(`${chatSubjectPrefix}.${conversation}`, chatCodec.encode(message))
     })
     await Effect.runPromise(Effect.all(effects, { concurrency: 'unbounded', discard: true }))
+    this.patch({
+      metrics: { ...this.state.metrics, ...readPerformanceTelemetry() },
+    })
   }
 
   roomUpdate = async (): Promise<void> => {
@@ -253,6 +267,9 @@ export class EffectChatController {
     await Effect.runPromise(
       this.natsail.publish(`${chatSubjectPrefix}.${conversation.id}`, chatCodec.encode(message))
     )
+    this.patch({
+      metrics: { ...this.state.metrics, ...readPerformanceTelemetry() },
+    })
   }
 
   dismissNotice = (): void => this.patch({ notice: undefined })

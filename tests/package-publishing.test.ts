@@ -3,9 +3,11 @@ import { readFile } from 'node:fs/promises'
 import { describe, expect, it } from 'vitest'
 
 const packageDirectories = [
+  'browser-broker',
   'checkpoints',
   'core',
   'jetstream',
+  'opentelemetry',
   'session',
   'effect',
   'react',
@@ -65,6 +67,7 @@ describe('package publishing', () => {
     for (const directory of [
       'ai-transport',
       'chat-ui',
+      'effect-chat',
       'gateway-chat',
       'react-chat',
       'rxjs-chat',

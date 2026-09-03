@@ -259,9 +259,9 @@ describe('forced reconnect recovery', () => {
     await expect
       .poll(
         () =>
-          events
-            .filter((event) => event.type === 'diagnostic' && event.source === 'jetstream')
-            .map((event) => event.code),
+          events.flatMap((event) =>
+            event.type === 'diagnostic' && event.source === 'jetstream' ? [event.code] : []
+          ),
         { timeout: 5_000 }
       )
       .toEqual(expect.arrayContaining(['consumer-not-found', 'ordered-consumer-recreated']))

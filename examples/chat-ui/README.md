@@ -6,4 +6,4 @@ This package holds the room model, transport-visible timeline types, guided room
 
 It intentionally contains no NATS runtime, React adapter, TanStack Query cache, or gateway client. The rooms examples supply those behaviors through `WorkspaceProps`; the AI example imports only the UI primitives it needs.
 
-The workbench tells the user what to do, what result to wait for, and whether the browser observed it. The performance-chat surface adds conversation switching, atomic loading, assistant messages, unread state, tab presence, update notices, 1,000 and 5,000-message histories, selectable live bursts, and matching replay/render counters. Transport adapters and application state stay in the consuming examples.
+The workbench tells the user what to do, what result to wait for, and whether the browser observed it. The performance-chat surface adds conversation switching, atomic loading, assistant messages, unread state, tab presence, update notices, 1,000 and 5,000-message histories, selectable live bursts, matching replay/render counters, and NATSail telemetry fields. Transport adapters and application state stay in the consuming examples.

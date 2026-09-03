@@ -167,15 +167,19 @@ const conversation = materializeJetStream(
   },
   {
     bufferSize: 256,
-    batchSize: 256,
-    batchWithin: '16 millis',
+    batchPolicy: { maxItems: 256, maxWaitMs: 16 },
+    workBudget: { yieldAfterMs: 4, scheduler },
   }
 )
 
 const render = conversation.pipe(Stream.runForEach((snapshot) => updateConversation(snapshot.data)))
 ```
 
+`materializeNatsJetStreamEvents(events, materializer, options)` applies the same batching and atomic replay rules to an existing `NatsailJetStreamEvent` Stream. Use it when another component already owns event acquisition; `materializeJetStream()` remains the managed NATS source path.
+
 `reduceBatch` is a native Effect. Its typed error and service requirements remain in the returned Stream type. Package-owned recovery can resume admitted events while the current materialized state remains alive. A fresh materializer rebuilds from replay, so `resume` is rejected until a state store can commit the materialized state and cursor atomically.
+
+`batchSize` and `batchWithin` remain compatible aliases. The shared policy additionally supports byte bounds with `sizeOf`. Durable JetStream queues remain lossless: their only overflow modes are backpressure (`suspend`) or a typed `error`.
 
 ## Explicit-ack processing
 
@@ -225,6 +229,8 @@ An interrupted request aborts the underlying NATS request. `makeNatsailScopedLay
 `jetStreamStates()` is the replay-aware presentation adapter for shared reducing JetStream definitions. `sessionSnapshots()` and `sessionValues()` remain available for other application state that should share one validated `SessionRegistry` source. Each Effect consumer retains one registry handle, and the handle is released whenever the Stream completes, fails, or is interrupted.
 
 Session Streams queue at most 32 snapshots by default. Overflow fails with `NatsailStreamBufferOverflowError`; applications may explicitly choose `dropping`, `sliding`, a different bound, or `unbounded`.
+
+When Core telemetry is enabled, `error` overflow paths report `natsail.buffer.signals` before the typed stream failure. The measurement contains only the stable source and overflow signal; it does not contain the subject, stream, or session key.
 
 Session snapshot buffering happens after the registry updates. Use direct subject Streams when downstream Effect demand must reach the NATSail delivery handler.
 

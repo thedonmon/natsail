@@ -1,8 +1,28 @@
-import { readFile } from 'node:fs/promises'
+import { readdir, readFile } from 'node:fs/promises'
 
 import { describe, expect, it } from 'vitest'
 
 describe('package boundaries', () => {
+  it('keeps the browser broker on Core and SessionSource contracts', async () => {
+    const packageRoot = new URL('../packages/browser-broker/', import.meta.url)
+    const manifest = JSON.parse(await readFile(new URL('package.json', packageRoot), 'utf8')) as {
+      dependencies: Record<string, string>
+      sideEffects: boolean
+    }
+    const sourceRoot = new URL('src/', packageRoot)
+    const source = (
+      await Promise.all(
+        (await readdir(sourceRoot))
+          .filter((file) => file.endsWith('.ts'))
+          .map((file) => readFile(new URL(file, sourceRoot), 'utf8'))
+      )
+    ).join('\n')
+
+    expect(Object.keys(manifest.dependencies)).toEqual(['@natsail/core', '@natsail/session'])
+    expect(manifest.sideEffects).toBe(false)
+    expect(source).not.toMatch(/@nats-io|cloudflare|durable object/i)
+  })
+
   it('keeps optional libraries out of the Core package', async () => {
     const packageText = await readFile(
       new URL('../packages/core/package.json', import.meta.url),
@@ -57,6 +77,23 @@ describe('package boundaries', () => {
       '@natsail/session',
     ])
     expect(Object.keys(rxjsManifest.peerDependencies)).toEqual(['rxjs'])
+  })
+
+  it('keeps OpenTelemetry optional and outside Core', async () => {
+    const coreSource = await readFile(
+      new URL('../packages/core/src/index.ts', import.meta.url),
+      'utf8'
+    )
+    const manifest = JSON.parse(
+      await readFile(new URL('../packages/opentelemetry/package.json', import.meta.url), 'utf8')
+    ) as {
+      dependencies: Record<string, string>
+      peerDependencies: Record<string, string>
+    }
+
+    expect(coreSource).not.toContain('@opentelemetry')
+    expect(Object.keys(manifest.dependencies)).toEqual(['@natsail/core'])
+    expect(manifest.peerDependencies).toEqual({ '@opentelemetry/api': '>=1.9.0 <2' })
   })
 
   it('keeps checkpoint storage independent from NATS and frameworks', async () => {

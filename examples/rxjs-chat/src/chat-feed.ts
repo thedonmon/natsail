@@ -1,6 +1,11 @@
 import { type Subscription } from 'rxjs'
 
-import { natsCodecs, type NatsPayloadCodec, type NatsRuntime } from '@natsail/core'
+import {
+  natsailDefaultScheduler,
+  natsCodecs,
+  type NatsPayloadCodec,
+  type NatsRuntime,
+} from '@natsail/core'
 import {
   demoConversations,
   isDemoChatMessage,
@@ -14,6 +19,8 @@ import {
 import { defineReducingJetStreamSession, type JetStreamDelivery } from '@natsail/jetstream'
 import { observeNatsCoreSubscription, observeNatsJetStreamState } from '@natsail/rxjs'
 import type { SessionRegistry } from '@natsail/session'
+
+import { readPerformanceTelemetry, resetPerformanceTelemetry } from './runtime'
 
 export const chatStream = 'NATSAIL_RXJS_CHAT'
 export const chatSubjectPrefix = 'natsail.examples.rxjs.chat'
@@ -48,6 +55,8 @@ const initialMetrics = (): DemoPerformanceMetrics => ({
   reactCommits: 0,
   lastBatchSize: 0,
   largestBatchSize: 0,
+  telemetryMeasurements: 0,
+  bufferSignals: 0,
 })
 
 const initialActivity = (): Record<string, DemoConversationActivity> =>
@@ -115,6 +124,7 @@ export class RxjsChatController {
   selectConversation = (conversationId: string, updateUrl = true): void => {
     if (!demoConversations.some((conversation) => conversation.id === conversationId)) return
     this.activeSubscription?.unsubscribe()
+    resetPerformanceTelemetry()
     this.loadStartedAt = performance.now()
     this.previousEntryCount = 0
     this.patch({
@@ -144,6 +154,8 @@ export class RxjsChatController {
         maxBufferedMessages: 64,
         duplicateDeliveryPolicy: 'drop',
         recovery: { delayMs: 250 },
+        batchPolicy: { maxItems: 256, maxWaitMs: 16 },
+        workBudget: { yieldAfterMs: 4, scheduler: natsailDefaultScheduler },
         codec: chatCodec,
       },
       {
@@ -154,7 +166,7 @@ export class RxjsChatController {
     )
 
     this.activeSubscription = observeNatsJetStreamState(this.sessions, definition, {
-      liveBatchMs: 16,
+      batchPolicy: { maxItems: 256, maxWaitMs: 16 },
     }).subscribe({
       next: (snapshot) => {
         if (snapshot.phase !== 'live') return
@@ -174,6 +186,7 @@ export class RxjsChatController {
             largestBatchSize: firstLive
               ? 0
               : Math.max(this.state.metrics.largestBatchSize, batchSize),
+            ...readPerformanceTelemetry(),
           },
           ...(last
             ? {
@@ -207,6 +220,9 @@ export class RxjsChatController {
       `${chatSubjectPrefix}.${message.conversationId}`,
       chatCodec.encode(message)
     )
+    this.patch({
+      metrics: { ...this.state.metrics, ...readPerformanceTelemetry() },
+    })
   }
 
   busyBurst = async (count: number): Promise<void> => {
@@ -229,6 +245,9 @@ export class RxjsChatController {
         )
       })
     )
+    this.patch({
+      metrics: { ...this.state.metrics, ...readPerformanceTelemetry() },
+    })
   }
 
   roomUpdate = async (): Promise<void> => {
@@ -245,6 +264,9 @@ export class RxjsChatController {
       clientId: 'rxjs-room-notification-test',
     }
     await this.runtime.publish(`${chatSubjectPrefix}.${conversation.id}`, chatCodec.encode(message))
+    this.patch({
+      metrics: { ...this.state.metrics, ...readPerformanceTelemetry() },
+    })
   }
 
   dismissNotice = (): void => this.patch({ notice: undefined })

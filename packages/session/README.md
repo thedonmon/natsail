@@ -28,6 +28,20 @@ A restart rejects deliveries from the prior source generation. A restart does no
 
 `registry.inspect()` reports active keys, contracts, phases, reference counts, revisions, and idle state. `registry.events` emits lifecycle and reference-count changes so applications can detect leaks and unexpected restarts without reaching into an adapter.
 
+Pass `telemetry` to `createSessionRegistry()` to report active session and reference gauges plus open, retain, release, restart, and close counters. Session keys and contracts remain available through explicit inspection/events but are never included in default telemetry attributes:
+
+```ts
+const sessions = createSessionRegistry({
+  idleCloseMs: 250,
+  telemetry,
+  telemetryAttributes: { service: 'orders-ui' },
+})
+```
+
+The sink is synchronous and failure-isolated. It should enqueue measurements instead of performing blocking I/O. `telemetryClock` provides deterministic timestamps in tests.
+
+`createReducingSessionSource()` accepts an optional `workBudget`. Reducer calls remain strictly serial and ordered across yields. A failed reducer value is not published; later calls continue from the last successfully applied state.
+
 See the [NATSail README](https://github.com/thedonmon/natsail#shared-session-adapters) for the registry model.
 
 ## License

@@ -248,7 +248,7 @@ function fakeConnection(): NatsConnection {
       closed = true
       resolveClosed()
     },
-  } as NatsConnection
+  } as unknown as NatsConnection
 }
 
 function controllableConnection(server: string): {
@@ -304,7 +304,7 @@ function controllableConnection(server: string): {
       waiting?.({ done: true, value: undefined })
       waiting = undefined
     },
-  } as NatsConnection
+  } as unknown as NatsConnection
 
   return {
     connection,

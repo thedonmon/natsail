@@ -148,5 +148,5 @@ function fakeConnection(request: ReturnType<typeof vi.fn>): NatsConnection {
       closed = true
       resolveClosed()
     },
-  } as NatsConnection
+  } as unknown as NatsConnection
 }

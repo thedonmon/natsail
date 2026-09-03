@@ -34,19 +34,23 @@ Memory and IndexedDB stores reject sequence regressions. A stale writer cannot r
 
 `processJetStream()` uses a named pull consumer with `AckPolicy.Explicit`. It acknowledges a message after the handler succeeds.
 
-A failed handler leaves the message unacknowledged for server redelivery. The application can configure the acknowledgement wait, maximum deliveries, maximum pending acknowledgements, replay policy, and start position.
+A failed handler leaves the message unacknowledged for server redelivery. The application can configure acknowledgement wait/backoff, maximum deliveries, maximum pending acknowledgements, metadata, acknowledgement sampling, replicas, memory storage, replay policy, and start position.
 
 Consumer ownership has three modes:
 
-- `bind` attaches to an administrator-managed consumer.
-- `ensure` creates or reuses a retained consumer.
-- `owned` creates a consumer that the lease deletes when it closes.
+- `bind` attaches to an administrator-managed consumer and never mutates it.
+- `ensure` creates or reuses a retained consumer and may update editable settings.
+- `owned` creates a durable consumer that the lease deletes when it closes and may safely recreate it.
 
-NATSail checks an existing consumer against the requested filter and start position. It also checks each supplied acknowledgement or replay setting.
+`createJetStreamProcessorController()` exposes cached inspection plus authoritative refresh, reconciliation, pause, resume, and ownership-guarded delete. Operations are serialized. Reconciliation results distinguish unchanged, created, updated, recreated, and rejected outcomes and report normalized desired/active configuration plus editable and immutable drift. Pause, resume, and delete return explicit `paused`, `resumed`, or `deleted` status objects. `error`, `update-editable`, and `recreate-owned` policies cannot grant ownership that the consumer mode does not have.
 
-Set `recovery` to reopen the named consumer after an infrastructure failure. When that consumer is retained, recovery uses its server-side acknowledgement floor: acknowledged messages remain complete, and an interrupted unacknowledged message remains eligible for redelivery. If an `ensure` or `owned` consumer was deleted on the server, it is recreated from the configured start position and previously handled messages can appear again. Handler, decoder, and consumer-contract failures stay terminal.
+Owned immutable-drift recreation preserves a safe stream boundary: the acknowledgement floor, an existing start sequence, or an undelivered `start: 'new'` consumer's creation tail. NATSail refuses deletion if a delivered `start: 'new'` consumer has no safe boundary. A failed replacement is rolled back at the same boundary, and controller inspection is updated to the rollback consumer before the original error is returned.
+
+Set `recovery` to reopen the named consumer after an infrastructure failure. When that consumer is retained, recovery uses its server-side acknowledgement floor: acknowledged messages remain complete, and an interrupted unacknowledged message remains eligible for redelivery. A deleted owned `start: 'new'` consumer is recreated from the last safe acknowledgement boundary, so messages published during the deletion gap are not skipped. Handler, decoder, and consumer-contract failures stay terminal.
 
 An `owned` recovering processor retains its named consumer between attempts and deletes it when the logical processor lease closes.
+
+Processor `inspect()` is synchronous and cached. It includes phase, ownership, restart count, pending messages and acknowledgements, consumer and stream delivery/acknowledgement sequences, redeliveries, pause state, last handler failure, normalized desired/active configuration, and the last reconciliation. Controller `refresh()` performs the explicit management read.
 
 ## Duplicate and retention policy
 
@@ -94,13 +98,39 @@ Effect Streams have a second decoded queue. Reliable JetStream Streams support `
 
 Core NATS Effect Streams can also use dropping or sliding policies. These policies do not add server retention to Core NATS.
 
+## Batch and reducer boundaries
+
+`NatsailBatchPolicy<T>` provides count, byte, and time bounds. Normal completion flushes a partial batch; cancellation discards it. A full batch already applying is allowed to finish, and close does not resolve until that application settles.
+
+Reducing JetStream sessions admit at most one applying batch before backpressuring intake. Reducers run serially and may yield through `NatsailWorkBudget`; yields never introduce concurrent reducer calls. Replay batches remain private until one caught-up state commit. Live cumulative state uses a 16ms default window, while replay/recovery phase notifications remain immediate. Cursor and checkpoint advancement follows successful downstream batch application.
+
+## Telemetry and diagnostics
+
+`runtime.events` is the low-frequency lifecycle and diagnostic stream. High-frequency measurements never enter it.
+
+Pass a `NatsailTelemetrySink` to `createNatsRuntime()` to observe connection attempts and recovery, publish/request durations and outcomes, resource reservations and configured limits, JetStream replay and remaining work, handler/redelivery/acknowledgement outcomes, checkpoint load/save durations, recovery attempts, and slow-consumer or overflow signals. Pass the same sink to `createSessionRegistry()` for active-session, reference-count, and lifecycle measurements.
+
+Telemetry events contain fixed NATSail dimensions plus optional caller-supplied low-cardinality primitive attributes. NATSail does not copy diagnostic details into telemetry, so subjects, payloads, credentials, session/checkpoint keys, stream names, and consumer names are absent by default. NATSail's reserved per-event dimensions take precedence over colliding caller attributes.
+
+The sink is synchronous and runs inline around the observed operation. It should enqueue measurements and avoid network or filesystem I/O. NATSail catches sink exceptions, but it cannot preempt a callback that blocks the JavaScript thread. Duration tests can inject `telemetryClock`; production defaults to the host monotonic performance clock.
+
 ## Browser connection model
 
 Many conversations in one browser tab can share one runtime connection. Each active JetStream conversation still has its own consumer and bounded pull loop.
 
-Each browser tab has a separate JavaScript realm. One runtime in each tab creates one connection in each tab.
+Each browser tab has a separate JavaScript realm. One runtime in each tab creates one connection in each tab unless the application opts into `@natsail/browser-broker`.
 
-The repository contains a `SharedWorker` proof that lets two tabs share one connection. It is not a published browser-broker package.
+The browser broker runs caller-supplied `SessionSource` definitions inside a `SharedWorker`. The stable tenant, authentication context, logical key, and contract select one physical source. Contract conflicts fail deterministically. Credentials are transferred from authenticated tab bootstrap, use monotonic revisions, and can refresh without changing source identity.
+
+Each tab has independent item and encoded-byte bounds and at most one transferred batch in flight. It acknowledges the batch cursor only after its local SessionSource handler accepts every item. A tab that exceeds its bound receives `resume-required` with reason `lagged`; no reliable item is silently discarded. A bounded physical-source log supports catch-up from retained per-tab JetStream cursors.
+
+Worker replacement reconnects active tab sources after their last acknowledged cursor. Heartbeats release references for abandoned ports, and final-reference teardown honors the configured idle delay. Applications may configure an explicit tab-local fallback, but strict mode rejects environments without SharedWorker when duplicate connections would violate policy.
+
+Applications can also route publish and request/reply through the worker with named logical operations. The worker owns the operation-to-subject mapping and authorization; tabs do not send arbitrary NATS subjects. Configure `closeIdleResources` to close and reset the worker-owned runtime after its final physical source is released, so the next attach or operation creates a fresh runtime instead of retaining an idle connection.
+
+Broker publish/request rejection after a timeout or worker replacement is ambiguous: the worker may already have started the operation. The client does not replay it. Use an application idempotency key or deduplication before retrying work that must run at most once.
+
+The protocol is versioned and same-origin. It does not replace authorization: worker source factories must map authenticated identities to allowed application sources instead of accepting arbitrary subjects, streams, or consumer names.
 
 The Durable Object prototype owns one upstream JetStream consumer for multiple clients. It also stores an upstream checkpoint and supports bounded client catch-up after restart.
 

@@ -7,10 +7,12 @@ const fromRoot = (path: string) => fileURLToPath(new URL(path, import.meta.url))
 export default defineConfig({
   resolve: {
     alias: {
+      '@natsail/browser-broker': fromRoot('./packages/browser-broker/src/index.ts'),
       '@natsail/checkpoints': fromRoot('./packages/checkpoints/src/index.ts'),
       '@natsail/core': fromRoot('./packages/core/src/index.ts'),
       '@natsail/effect': fromRoot('./packages/effect/src/index.ts'),
       '@natsail/jetstream': fromRoot('./packages/jetstream/src/index.ts'),
+      '@natsail/opentelemetry': fromRoot('./packages/opentelemetry/src/index.ts'),
       '@natsail/react': fromRoot('./packages/react/src/index.ts'),
       '@natsail/rxjs': fromRoot('./packages/rxjs/src/index.ts'),
       '@natsail/session': fromRoot('./packages/session/src/index.ts'),

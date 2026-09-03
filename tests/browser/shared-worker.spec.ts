@@ -1,63 +1,53 @@
 import { expect, test } from '@playwright/test'
 
-test('replaces two per-tab connections with one SharedWorker runtime', async ({ context }) => {
+test('shares one physical SessionSource across two tabs', async ({ context }) => {
   const first = await context.newPage()
   const second = await context.newPage()
-  const subject = `tests.shared-worker.${crypto.randomUUID()}`
-
-  await Promise.all([first.goto('/'), second.goto('/')])
-  await Promise.all(
-    [first, second].map((page) =>
-      expect(page.locator('html')).toHaveAttribute('data-natsail-ready', 'true')
-    )
-  )
-  const perTabConnectionRequests = await Promise.all(
-    [first, second].map((page) => page.evaluate(() => window.openNatsailBrowserConnection()))
-  )
-  expect(perTabConnectionRequests).toEqual([1, 1])
+  const source = 'acceptance-events'
 
   await Promise.all([first.goto('/shared-worker.html'), second.goto('/shared-worker.html')])
   await Promise.all(
     [first, second].map((page) =>
-      expect(page.locator('html')).toHaveAttribute('data-natsail-shared-worker-ready', 'true')
+      expect(page.locator('html')).toHaveAttribute('data-natsail-browser-broker-ready', 'true')
     )
   )
-
   await Promise.all(
     [first, second].map((page) =>
-      page.evaluate((activeSubject) => window.natsailSharedWorker.subscribe(activeSubject), subject)
+      page.evaluate((sourceKey) => window.natsailBrowserBroker.subscribe(sourceKey), source)
     )
   )
 
   const firstDelivery = first.evaluate(
-    (activeSubject) => window.natsailSharedWorker.nextMessage(activeSubject),
-    subject
+    (sourceKey) => window.natsailBrowserBroker.nextMessage(sourceKey),
+    source
   )
   const secondDelivery = second.evaluate(
-    (activeSubject) => window.natsailSharedWorker.nextMessage(activeSubject),
-    subject
+    (sourceKey) => window.natsailBrowserBroker.nextMessage(sourceKey),
+    source
   )
-
   await first.evaluate(
-    ({ activeSubject, value }) => window.natsailSharedWorker.publish(activeSubject, value),
-    { activeSubject: subject, value: 'shared-connection' }
+    ({ operation, value }) => window.natsailBrowserBroker.publish(operation, value),
+    { operation: 'publish-acceptance-event', value: 'one-physical-source' }
   )
 
   await expect(Promise.all([firstDelivery, secondDelivery])).resolves.toEqual([
-    'shared-connection',
-    'shared-connection',
+    'one-physical-source',
+    'one-physical-source',
   ])
-
-  const stats = await first.evaluate(() => window.natsailSharedWorker.stats())
-  expect(stats).toEqual({ clientCount: 2, connectionRequests: 1, subscriptionCount: 2 })
+  await expect(
+    first.evaluate(
+      ({ operation, value }) => window.natsailBrowserBroker.request(operation, value),
+      { operation: 'echo', value: 'brokered-request' }
+    )
+  ).resolves.toBe('brokered-request')
+  await expect(first.evaluate(() => window.natsailBrowserBroker.stats())).resolves.toMatchObject({
+    tabCount: 2,
+    activeConnectionCount: 1,
+    physicalSourceCount: 1,
+    subscriptionCount: 2,
+  })
 
   await Promise.all(
-    [first, second].map((page) => page.evaluate(() => window.natsailSharedWorker.close()))
+    [first, second].map((page) => page.evaluate(() => window.natsailBrowserBroker.close()))
   )
 })
-
-declare global {
-  interface Window {
-    openNatsailBrowserConnection: () => Promise<number>
-  }
-}

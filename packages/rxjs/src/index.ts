@@ -3,10 +3,12 @@ import type { SchedulerLike, Subscription } from 'rxjs'
 
 import type {
   CoreSubscriptionOptions,
+  NatsailBatchPolicy,
   NatsRuntime,
   NatsRuntimeEvent,
   NatsRuntimeStatusEvent,
 } from '@natsail/core'
+import { defineNatsailBatchPolicy } from '@natsail/core'
 import {
   createJetStreamSessionSource,
   type JetStreamDelivery,
@@ -122,13 +124,15 @@ export function observeNatsJetStreamReducer<State>(
   return observeNatsSession(registry, definition)
 }
 
-export interface NatsailJetStreamStateOptions {
+export interface NatsailJetStreamStateOptions<State = unknown> {
   /**
    * Maximum time that subsequent cumulative live states are coalesced. The
    * initial replaying and hydrated live states remain immediate. Defaults to
    * 16ms; use 0 to observe every reduced live state.
    */
   readonly liveBatchMs?: number
+  /** Shared count/byte/time bounds for cumulative live presentation. */
+  readonly batchPolicy?: NatsailBatchPolicy<JetStreamStateSnapshot<State>>
   /** Overrides the RxJS async scheduler, primarily for tests or custom hosts. */
   readonly scheduler?: SchedulerLike
 }
@@ -141,13 +145,24 @@ export interface NatsailJetStreamStateOptions {
 export function observeNatsJetStreamState<State>(
   registry: SessionRegistry,
   definition: SessionDefinition<JetStreamStateSnapshot<State>>,
-  options: NatsailJetStreamStateOptions = {}
+  options: NatsailJetStreamStateOptions<State> = {}
 ): Observable<JetStreamStateSnapshot<State>> {
-  const liveBatchMs = options.liveBatchMs ?? 16
+  const liveBatchMs = options.liveBatchMs ?? options.batchPolicy?.maxWaitMs ?? 16
   if (!Number.isFinite(liveBatchMs) || liveBatchMs < 0) {
     throw new TypeError('NATSail RxJS liveBatchMs must be a finite non-negative number')
   }
 
+  const policy = defineNatsailBatchPolicy<JetStreamStateSnapshot<State>>(
+    options.liveBatchMs === 0
+      ? { maxItems: 1 }
+      : {
+          ...(options.batchPolicy ?? {}),
+          ...(options.liveBatchMs === undefined ? {} : { maxWaitMs: options.liveBatchMs }),
+          ...(options.batchPolicy === undefined && options.liveBatchMs === undefined
+            ? { maxWaitMs: 16 }
+            : {}),
+        }
+  )
   const values = observeNatsSessionValues(registry, definition)
   if (liveBatchMs === 0) return values
   const scheduler = options.scheduler ?? asyncScheduler
@@ -155,6 +170,8 @@ export function observeNatsJetStreamState<State>(
   return new Observable((subscriber) => {
     let seenLive = false
     let pendingLive: JetStreamStateSnapshot<State> | undefined
+    let pendingCount = 0
+    let pendingBytes = 0
     let scheduledFlush: Subscription | undefined
 
     const flush = () => {
@@ -162,6 +179,8 @@ export function observeNatsJetStreamState<State>(
       if (pendingLive === undefined) return
       const value = pendingLive
       pendingLive = undefined
+      pendingCount = 0
+      pendingBytes = 0
       subscriber.next(value)
     }
     const cancelFlush = () => {
@@ -174,7 +193,7 @@ export function observeNatsJetStreamState<State>(
       const scheduled = scheduler.schedule(() => {
         ranSynchronously = true
         flush()
-      }, liveBatchMs)
+      }, policy.maxWaitMs ?? 0)
       if (!ranSynchronously) scheduledFlush = scheduled
     }
     const source = values.subscribe({
@@ -192,12 +211,49 @@ export function observeNatsJetStreamState<State>(
           return
         }
 
+        let size = 0
+        if (policy.maxBytes !== undefined) {
+          try {
+            size = policy.sizeOf!(value)
+          } catch (error) {
+            cancelFlush()
+            subscriber.error(error)
+            return
+          }
+          if (!Number.isFinite(size) || size < 0) {
+            cancelFlush()
+            subscriber.error(
+              new TypeError('NATSail batch sizeOf must return a finite non-negative number')
+            )
+            return
+          }
+          if (size > policy.maxBytes) {
+            cancelFlush()
+            subscriber.error(
+              new RangeError(`NATSail live state size ${size} exceeds maxBytes ${policy.maxBytes}`)
+            )
+            return
+          }
+          if (pendingLive !== undefined && pendingBytes + size > policy.maxBytes) flush()
+        }
+
         pendingLive = value
-        scheduleFlush()
+        pendingCount += 1
+        pendingBytes += size
+        const countReached = policy.maxItems !== undefined && pendingCount >= policy.maxItems
+        const bytesReached = policy.maxBytes !== undefined && pendingBytes >= policy.maxBytes
+        if (countReached || bytesReached) {
+          cancelFlush()
+          flush()
+        } else if (policy.maxWaitMs !== undefined) {
+          scheduleFlush()
+        }
       },
       error: (error) => {
         cancelFlush()
-        flush()
+        pendingLive = undefined
+        pendingCount = 0
+        pendingBytes = 0
         subscriber.error(error)
       },
       complete: () => {

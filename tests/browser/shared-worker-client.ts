@@ -1,107 +1,46 @@
-interface SharedWorkerStats {
-  clientCount: number
-  connectionRequests: number
-  subscriptionCount: number
-}
-
-interface WorkerResult {
-  error?: string
-  id: number
-  result?: unknown
-  type: 'result'
-}
-
-interface WorkerDelivery {
-  subject: string
-  type: 'delivery'
-  value: string
-}
-
-interface PendingRequest {
-  reject(error: Error): void
-  resolve(value: unknown): void
-}
+import {
+  createBrowserBrokerClient,
+  type BrowserBrokerClient,
+  type BrowserBrokerStats,
+} from '@natsail/browser-broker'
+import type { SubscriptionLease } from '@natsail/core'
 
 interface DeliveryWaiter {
-  reject(error: Error): void
   resolve(value: string): void
   timeout: ReturnType<typeof setTimeout>
 }
 
-const worker = new SharedWorker(new URL('./nats-shared-worker.ts', import.meta.url), {
-  name: 'natsail-browser-test',
-  type: 'module',
-})
-const pending = new Map<number, PendingRequest>()
 const queuedDeliveries = new Map<string, string[]>()
 const waitingDeliveries = new Map<string, DeliveryWaiter[]>()
-let nextRequestId = 1
+const leases = new Map<string, SubscriptionLease>()
+const encoder = new TextEncoder()
+const decoder = new TextDecoder()
+let client: BrowserBrokerClient
 
-const request = <T>(action: string, details: Record<string, unknown> = {}): Promise<T> => {
-  const id = nextRequestId
-  nextRequestId += 1
-
-  return new Promise<T>((resolve, reject) => {
-    pending.set(id, {
-      reject,
-      resolve: (value) => resolve(value as T),
-    })
-    worker.port.postMessage({ action, id, ...details })
-  })
-}
-
-const acceptDelivery = (delivery: WorkerDelivery): void => {
-  const waiters = waitingDeliveries.get(delivery.subject)
+const acceptDelivery = (subject: string, value: string): void => {
+  const waiters = waitingDeliveries.get(subject)
   const waiter = waiters?.shift()
-
   if (waiter) {
     clearTimeout(waiter.timeout)
-    waiter.resolve(delivery.value)
+    waiter.resolve(value)
     return
   }
-
-  const queue = queuedDeliveries.get(delivery.subject) ?? []
-  queue.push(delivery.value)
-  queuedDeliveries.set(delivery.subject, queue)
+  const queue = queuedDeliveries.get(subject) ?? []
+  queue.push(value)
+  queuedDeliveries.set(subject, queue)
 }
-
-worker.port.onmessage = (event: MessageEvent<WorkerDelivery | WorkerResult>) => {
-  if (event.data.type === 'delivery') {
-    acceptDelivery(event.data)
-    return
-  }
-
-  const active = pending.get(event.data.id)
-  if (!active) {
-    return
-  }
-
-  pending.delete(event.data.id)
-  if (event.data.error) {
-    active.reject(new Error(event.data.error))
-  } else {
-    active.resolve(event.data.result)
-  }
-}
-worker.port.start()
 
 const nextMessage = (subject: string): Promise<string> => {
   const queue = queuedDeliveries.get(subject)
   const value = queue?.shift()
-  if (value !== undefined) {
-    return Promise.resolve(value)
-  }
-
+  if (value !== undefined) return Promise.resolve(value)
   return new Promise((resolve, reject) => {
     const waiters = waitingDeliveries.get(subject) ?? []
     const waiter: DeliveryWaiter = {
-      reject,
       resolve,
       timeout: setTimeout(() => {
         const index = waiters.indexOf(waiter)
-        if (index >= 0) {
-          waiters.splice(index, 1)
-        }
+        if (index >= 0) waiters.splice(index, 1)
         reject(new Error(`Timed out waiting for ${subject}`))
       }, 5_000),
     }
@@ -110,26 +49,48 @@ const nextMessage = (subject: string): Promise<string> => {
   })
 }
 
-window.natsailSharedWorker = {
-  close: async () => {
-    await request<void>('close')
-    worker.port.close()
-  },
-  nextMessage,
-  publish: (subject, value) => request<void>('publish', { subject, value }),
-  stats: () => request<SharedWorkerStats>('stats'),
-  subscribe: (subject) => request<void>('subscribe', { subject }),
-}
+void (async () => {
+  client = await createBrowserBrokerClient({
+    identity: { tenant: 'browser-acceptance', authenticationContext: 'anonymous-v1' },
+    credentials: () => ({ revision: 1, bytes: new Uint8Array(0) }),
+    connect: () =>
+      new SharedWorker(new URL('./nats-shared-worker.ts', import.meta.url), {
+        name: 'natsail-browser-broker-acceptance',
+        type: 'module',
+      }).port,
+    strict: true,
+  })
 
-document.documentElement.dataset.natsailSharedWorkerReady = 'true'
+  window.natsailBrowserBroker = {
+    close: async () => {
+      await Promise.all([...leases.values()].map((lease) => lease.close()))
+      leases.clear()
+      await client.close()
+    },
+    nextMessage,
+    publish: (subject, value) => client.publish(subject, encoder.encode(value)),
+    request: async (subject, value) =>
+      decoder.decode(await client.request(subject, encoder.encode(value))),
+    stats: () => client.stats(),
+    subscribe: async (subject) => {
+      const lease = client.createSource({ key: subject, contract: 'core-text:v1' })(
+        async (delivery) => acceptDelivery(subject, decoder.decode(delivery.data))
+      )
+      leases.set(subject, lease)
+      await lease.ready
+    },
+  }
+  document.documentElement.dataset.natsailBrowserBrokerReady = 'true'
+})()
 
 declare global {
   interface Window {
-    natsailSharedWorker: {
+    natsailBrowserBroker: {
       close(): Promise<void>
       nextMessage(subject: string): Promise<string>
       publish(subject: string, value: string): Promise<void>
-      stats(): Promise<SharedWorkerStats>
+      request(subject: string, value: string): Promise<string>
+      stats(): Promise<BrowserBrokerStats>
       subscribe(subject: string): Promise<void>
     }
   }

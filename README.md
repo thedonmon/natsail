@@ -8,6 +8,8 @@ NATSail gives TypeScript applications one managed NATS runtime. It owns connecti
 
 React, RxJS, and Effect adapters can share the same runtime and logical sessions. Your components do not need connection effects, custom retry loops, or byte-decoding boilerplate.
 
+Browser applications can also move those logical sessions into a `SharedWorker`, so same-origin tabs share physical sources without hiding lag or resume requirements.
+
 NATSail is useful when:
 
 - many parts of an application must share one NATS connection
@@ -133,8 +135,65 @@ React, RxJS, and Effect can attach to this definition without creating duplicate
 - [`@natsail/react`](packages/react/README.md) provides an ownership-safe provider, status hooks, selectors, reducers, and processor hooks.
 - [`@natsail/rxjs`](packages/rxjs/README.md) exposes cancellable Observables and frame-coalesced JetStream state.
 - [`@natsail/effect`](packages/effect/README.md) provides scoped Effect v4 Streams with bounded buffers and structured interruption.
+- [`@natsail/opentelemetry`](packages/opentelemetry/README.md) maps optional dependency-free measurements to OpenTelemetry metrics.
+- [`@natsail/browser-broker`](packages/browser-broker/README.md) shares bounded, cursor-aware `SessionSource` leases across same-origin tabs through a versioned SharedWorker protocol.
 
 Applications install only the packages that they use. The Core package does not import JetStream, Effect, React, or RxJS.
+
+## Telemetry
+
+Core accepts an optional synchronous `NatsailTelemetrySink`. The same sink can observe a session registry. Measurements are discriminated counters, gauges, and durations; they do not enter `runtime.events`, which remains the low-volume connection and diagnostic stream.
+
+```ts
+const telemetry = {
+  record(event: NatsailTelemetryEvent) {
+    measurementQueue.push(event)
+  },
+}
+
+const runtime = createNatsRuntime({
+  connect,
+  telemetry,
+  telemetryAttributes: { service: 'orders-api', region: 'us-west' },
+})
+
+const sessions = createSessionRegistry({ telemetry })
+```
+
+Use only stable, low-cardinality primitive attributes. NATSail does not include subjects, payloads, credentials, session/checkpoint keys, stream names, or consumer names in its default telemetry attributes. Internal operation attributes override colliding caller attributes. A sink runs inline, so it should enqueue measurements and avoid blocking I/O; sink exceptions are isolated from observed operations.
+
+Install [`@natsail/opentelemetry`](packages/opentelemetry/README.md) to map the same interface to OpenTelemetry without adding an OpenTelemetry dependency to Core.
+
+## Share sources across browser tabs
+
+Install `@natsail/browser-broker` when same-origin tabs should share one physical Core or JetStream source. The SharedWorker host uses the normal session contract, transfers one batch at a time to each tab, and requires a cursor acknowledgement before advancing that tab.
+
+```ts
+const browser = await createBrowserBrokerClient({
+  identity: { tenant: tenantId, authenticationContext: 'interactive-user-v1' },
+  credentials: () => credentialStore.current(),
+  connect: () =>
+    new SharedWorker(new URL('./nats-worker.ts', import.meta.url), {
+      name: 'application-nats',
+      type: 'module',
+    }).port,
+  strict: true,
+})
+
+const conversationSource = browser.createSource({
+  key: 'conversation-feed',
+  contract: 'conversation-events:v1',
+})
+
+await browser.publish('send-message', encodedMessage)
+const reply = await browser.request('lookup-message', encodedQuery)
+```
+
+Per-tab item and encoded-byte queues are bounded independently. A lagging tab receives an explicit resume-required error from its last acknowledged JetStream cursor; other tabs continue. Tenant/authentication context is immutable source identity, while credentials can be refreshed through the authenticated tab bootstrap. Publish and request use logical operation names that the worker maps to authorized NATS subjects or services. See the [browser broker guide](packages/browser-broker/README.md) for worker setup, idle runtime cleanup, fallback policy, and protocol v1.
+
+## Batching and cooperative reducers
+
+Core exports one dependency-free `NatsailBatchPolicy<T>` for count, byte, and time bounds plus `NatsailWorkBudget` for cooperative serial reducer yields. Reducing JetStream sessions apply replay in bounded batches but publish one atomic hydrated state, then coalesce live cumulative state with a 16ms default. RxJS, React, and Effect accept the same policy while keeping their native scheduling APIs and legacy options. Ordered cursor/checkpoint advancement remains behind successful batch application; close discards a pending partial batch and waits for in-flight work.
 
 ## Shared session adapters
 
@@ -242,7 +301,29 @@ const processor = processJetStream(
 await processor.ready
 ```
 
-The processor acknowledges a message after its handler succeeds. A failed handler leaves the message available for server redelivery. With `recovery` enabled, NATSail reopens the same named consumer after infrastructure failures and exposes `reconnecting` plus a restart count through the processor lease.
+The processor acknowledges a message after its handler succeeds. A failed handler leaves the message available for server redelivery. With `recovery` enabled, NATSail reopens the same named consumer after infrastructure failures and exposes `reconnecting` plus rich cached progress through the processor lease.
+
+Named consumers also have an administration seam:
+
+```ts
+import { createJetStreamProcessorController } from '@natsail/jetstream'
+
+const jobs = createJetStreamProcessorController(runtime, {
+  stream: 'JOBS',
+  consumer: { mode: 'ensure', name: 'billing_workers' },
+  filter: 'jobs.billing',
+  start: 'all',
+  ackWaitMs: 60_000,
+  backoffMs: [60_000, 120_000, 300_000],
+  maxDeliver: 10,
+  metadata: { team: 'billing' },
+})
+
+const result = await jobs.reconcile()
+const authoritative = await jobs.refresh()
+```
+
+`bind` is inspect-only, `ensure` may update editable settings but never recreates a consumer, and `owned` may recreate or delete only its own durable consumer. Reconciliation is serialized and returns normalized before/after configuration plus editable and immutable drift. Safe owned recreation resumes at the first sequence after the previous acknowledgement floor.
 
 ## Run the examples
 
@@ -296,13 +377,14 @@ pnpm nats:up
 pnpm test
 pnpm test:browser
 pnpm check
+pnpm benchmark
 ```
 
 The main test server uses native port 4223, monitoring port 8223, and WebSocket port 9223. Authentication fixtures use ports 4224 through 4228.
 
 `pnpm nats:up` writes disposable test credentials to the ignored `.generated/` directory. Git does not store private test credentials.
 
-Run `pnpm nats:down` to stop the fixture servers. Run `pnpm release:check` to build and inspect all seven package tarballs.
+Run `pnpm nats:down` to stop the fixture servers. Run `pnpm benchmark` for a local machine-readable 1,000/5,000-event replay and configurable live-burst baseline. Run `pnpm release:check` to build and inspect all nine package tarballs.
 
 ## License
 

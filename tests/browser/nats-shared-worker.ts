@@ -2,120 +2,83 @@
 
 import { wsconnect } from '@nats-io/nats-core'
 
-import {
-  createNatsRuntime,
-  natsCodecs,
-  type NatsRuntime,
-  type SubscriptionLease,
-} from '@natsail/core'
+import { createBrowserBrokerWorker } from '@natsail/browser-broker'
+import { createNatsRuntime, natsCodecs, type NatsRuntime } from '@natsail/core'
+import { createCoreSessionSource, createSessionRegistry } from '@natsail/session'
 
-interface WorkerRequest {
-  action: 'close' | 'publish' | 'stats' | 'subscribe'
-  id: number
-  subject?: string
-  value?: string
-}
+declare const __NATS_WS_URL__: string
 
-interface ClientState {
-  leases: Set<SubscriptionLease>
-  port: MessagePort
-}
-
-const clients = new Set<ClientState>()
-let connectionRequests = 0
+const sessions = createSessionRegistry()
 let runtime: NatsRuntime | undefined
 
-const getRuntime = (): NatsRuntime => {
+const sourceSubjects = new Map([['acceptance-events', 'tests.browser-broker.acceptance.events']])
+const publishSubjects = new Map([
+  ['publish-acceptance-event', 'tests.browser-broker.acceptance.events'],
+])
+const requestSubjects = new Map([['echo', 'tests.browser-broker.acceptance.echo']])
+
+const mappedSubject = (mapping: ReadonlyMap<string, string>, logicalName: string): string => {
+  const subject = mapping.get(logicalName)
+  if (!subject) throw new Error(`Browser broker operation ${logicalName} is not allowed`)
+  return subject
+}
+
+const runtimeForWorker = (): NatsRuntime => {
   runtime ??= createNatsRuntime({
     connect: async () => {
-      connectionRequests += 1
-      return wsconnect({ servers: 'ws://127.0.0.1:9223', timeout: 2_000 })
+      const connection = await wsconnect({ servers: __NATS_WS_URL__, timeout: 2_000 })
+      broker.reportConnection('opened')
+      void connection.closed().finally(() => broker.reportConnection('closed'))
+      void (async () => {
+        for await (const status of connection.status()) {
+          if (status.type === 'reconnect') broker.reportConnection('reconnected')
+        }
+      })()
+      return connection
     },
   })
-
   return runtime
 }
 
-const postResult = (port: MessagePort, id: number, result?: unknown): void => {
-  port.postMessage({ id, result, type: 'result' })
-}
-
-const closeClient = async (client: ClientState): Promise<void> => {
-  await Promise.allSettled(Array.from(client.leases, (lease) => lease.close()))
-  clients.delete(client)
-
-  if (clients.size === 0 && runtime) {
-    await runtime.close()
-    runtime = undefined
-  }
-}
-
-const handleRequest = async (client: ClientState, request: WorkerRequest): Promise<void> => {
-  const activeRuntime = getRuntime()
-
-  switch (request.action) {
-    case 'subscribe': {
-      if (!request.subject) {
-        throw new Error('A subject is required')
-      }
-
-      const subject = request.subject
-      const lease = activeRuntime.subscribe(
-        {
-          subject,
-          codec: natsCodecs.text,
-        },
-        async (value) => {
-          client.port.postMessage({ subject, type: 'delivery', value })
-        }
-      )
-      client.leases.add(lease)
-      await lease.ready
-      postResult(client.port, request.id)
-      return
+const broker = createBrowserBrokerWorker({
+  sessions,
+  createSource: ({ descriptor }) => {
+    const source = createCoreSessionSource(runtimeForWorker(), {
+      subject: mappedSubject(sourceSubjects, descriptor.key),
+      codec: natsCodecs.text,
+    })
+    const encoder = new TextEncoder()
+    return (accept) => source(async (value) => accept({ data: encoder.encode(value) }))
+  },
+  publish: async ({ operation, data }) => {
+    const activeRuntime = runtimeForWorker()
+    await activeRuntime.publish(mappedSubject(publishSubjects, operation), data)
+    await (await activeRuntime.connection()).flush()
+  },
+  request: async ({ operation, data }) => {
+    const activeRuntime = runtimeForWorker()
+    const connection = await activeRuntime.connection()
+    const subject = mappedSubject(requestSubjects, operation)
+    const responder = connection.subscribe(subject, {
+      max: 1,
+      callback: (_error, message) => {
+        message.respond(message.data)
+      },
+    })
+    try {
+      await connection.flush()
+      return await activeRuntime.request({ subject, data, codec: natsCodecs.bytes })
+    } finally {
+      responder.unsubscribe()
     }
-
-    case 'publish':
-      if (!request.subject || request.value === undefined) {
-        throw new Error('A subject and value are required')
-      }
-
-      await activeRuntime.publish(request.subject, request.value)
-      postResult(client.port, request.id)
-      return
-
-    case 'stats':
-      postResult(client.port, request.id, {
-        clientCount: clients.size,
-        connectionRequests,
-        subscriptionCount: Array.from(clients).reduce(
-          (total, current) => total + current.leases.size,
-          0
-        ),
-      })
-      return
-
-    case 'close':
-      await closeClient(client)
-      postResult(client.port, request.id)
-  }
-}
+  },
+  closeIdleResources: async () => {
+    const activeRuntime = runtime
+    runtime = undefined
+    await activeRuntime?.close()
+  },
+  idleTeardownMs: 50,
+})
 
 const workerScope = self as unknown as SharedWorkerGlobalScope
-
-workerScope.onconnect = (event) => {
-  const port = event.ports[0]
-  const client: ClientState = { leases: new Set(), port }
-  clients.add(client)
-
-  port.onmessage = (message: MessageEvent<WorkerRequest>) => {
-    void handleRequest(client, message.data).catch((error: unknown) => {
-      port.postMessage({
-        error: error instanceof Error ? error.message : String(error),
-        id: message.data.id,
-        type: 'result',
-      })
-    })
-  }
-  port.start()
-}
+workerScope.onconnect = (event) => broker.connect(event.ports[0]!)

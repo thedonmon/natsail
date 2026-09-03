@@ -1,0 +1,25 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "allowJs": true,
+    "declaration": false,
+    "declarationMap": false,
+    "lib": ["ES2022", "DOM", "DOM.Iterable", "WebWorker", "ESNext.Disposable"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "paths": {
+      "@natsail/browser-broker": ["./packages/browser-broker/src/index.ts"],
+      "@natsail/checkpoints": ["./packages/checkpoints/src/index.ts"],
+      "@natsail/core": ["./packages/core/src/index.ts"],
+      "@natsail/effect": ["./packages/effect/src/index.ts"],
+      "@natsail/jetstream": ["./packages/jetstream/src/index.ts"],
+      "@natsail/opentelemetry": ["./packages/opentelemetry/src/index.ts"],
+      "@natsail/react": ["./packages/react/src/index.ts"],
+      "@natsail/rxjs": ["./packages/rxjs/src/index.ts"],
+      "@natsail/session": ["./packages/session/src/index.ts"]
+    },
+    "types": ["node", "vite/client"]
+  },
+  "include": ["tests/**/*.ts", "vitest.config.ts", "playwright*.config.ts"]
+}

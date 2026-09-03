@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM", "DOM.Iterable", "WebWorker"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "paths": {
+      "@natsail/browser-broker": ["../../packages/browser-broker/src/index.ts"],
+      "@natsail/core": ["../../packages/core/src/index.ts"],
+      "@natsail/jetstream": ["../../packages/jetstream/src/index.ts"],
+      "@natsail/session": ["../../packages/session/src/index.ts"]
+    },
+    "types": ["node", "vite/client"]
+  },
+  "include": ["./*.ts"]
+}

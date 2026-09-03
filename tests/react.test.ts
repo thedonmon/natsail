@@ -450,6 +450,60 @@ describe('React session adapter', () => {
       vi.useRealTimers()
     }
   })
+
+  it('flushes React notification work before a live selection crosses maxBytes', async () => {
+    Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
+    vi.useFakeTimers()
+    try {
+      const registry = createSessionRegistry()
+      const controlled = controllableSource<JetStreamStateSnapshot<string[]>>()
+      const definition = defineSession({
+        key: 'conversation:react-byte-policy',
+        contract: 'conversation:v1',
+        source: controlled.source,
+      })
+      const runtime = { events: emptyEvents() } as NatsRuntime
+      const container = document.createElement('div')
+      let renders = 0
+      let root!: Root
+
+      function Probe() {
+        renders += 1
+        const snapshot = useNatsJetStreamReducer(definition, {
+          batchPolicy: { maxBytes: 3, sizeOf: () => 2 },
+        })
+        return createElement('output', null, snapshot.value?.data.join(',') ?? '')
+      }
+      await act(async () => {
+        root = createRoot(container)
+        root.render(
+          createElement(NatsProvider, { runtime, sessions: registry }, createElement(Probe))
+        )
+      })
+      const before = renders
+      await act(async () => {
+        await controlled.deliver({
+          phase: 'live',
+          data: ['one'],
+          restarts: 0,
+          replay: { delivered: 0, remaining: 0 },
+        })
+        await controlled.deliver({
+          phase: 'live',
+          data: ['one', 'two'],
+          restarts: 0,
+          replay: { delivered: 0, remaining: 0 },
+        })
+      })
+
+      expect(renders).toBe(before + 1)
+      expect(container.textContent).toBe('one,two')
+      await act(async () => root.unmount())
+      await registry.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })
 
 function emptyEvents(): AsyncIterable<NatsRuntimeEvent> {

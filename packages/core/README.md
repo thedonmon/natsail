@@ -42,6 +42,38 @@ The retry policy accepts fixed or computed delays. It also accepts `shouldRetry`
 
 Call `runtime.inspect()` to read the current connection generation, resource reservations, and configured limits.
 
+## Telemetry
+
+Pass an optional synchronous `NatsailTelemetrySink` to observe counters, gauges, and durations without adding an observability dependency to Core:
+
+```ts
+import { createNatsRuntime, type NatsailTelemetryEvent } from '@natsail/core'
+
+const runtime = createNatsRuntime({
+  connect: connectToNats,
+  telemetry: {
+    record(event: NatsailTelemetryEvent) {
+      measurementQueue.push(event)
+    },
+  },
+  telemetryAttributes: { service: 'orders-api', region: 'us-west' },
+})
+```
+
+The runtime reports connection attempts and recovery, publish/request duration and outcome, resource allocations, current reservations, configured limits, and slow-consumer signals. JetStream and Effect add their measurements through the same reporter.
+
+Caller attributes must be primitive and low-cardinality. NATSail's internal attributes win on key collisions. Default events never contain subjects, payloads, credentials, session/checkpoint keys, stream names, or consumer names. Measurements do not enter `runtime.events`.
+
+The sink runs inline. Enqueue work and avoid blocking I/O. Sink exceptions are ignored, but NATSail cannot preempt a blocking callback. Tests and deterministic hosts can supply `telemetryClock: { now }`.
+
+Use [`@natsail/opentelemetry`](../opentelemetry/README.md) to send the same events to OpenTelemetry.
+
+## Batching and cooperative work
+
+`NatsailBatchPolicy<T>` supplies optional `maxItems`, `maxBytes`, and `maxWaitMs` bounds; at least one bound is required and byte policies require a finite, non-negative `sizeOf` result. `createNatsailBatcher()` serializes count, byte, time, explicit, and normal-completion flushes. `cancel()` discards only the pending partial batch and never interrupts an already applying batch.
+
+`NatsailWorkBudget` combines `yieldAfterMs` with one injectable `NatsailScheduler` (`now`, `schedule`, and `yield`). `createNatsailWorkController()` lets serial reducer loops yield cooperatively without running reducer calls concurrently. The default scheduler uses the host monotonic clock and timers; tests can provide a manual scheduler.
+
 `runtime.request()` uses the shared connection with a response codec or raw-message decoder and optional timeout, headers, and abort signal. It does not replay a request whose outcome may be ambiguous.
 
 `runtime.connection()` exposes the runtime-owned nats.js connection for operations without a managed NATSail seam. Consumers must not close or drain that connection.

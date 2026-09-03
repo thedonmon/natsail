@@ -1,4 +1,16 @@
-import type { CoreSubscriptionOptions, NatsRuntime, SubscriptionLease } from '@natsail/core'
+import { createNatsailTelemetryReporter, createNatsailWorkController } from '@natsail/core'
+import type {
+  CoreSubscriptionOptions,
+  NatsailTelemetryAttributes,
+  NatsailTelemetryClock,
+  NatsailTelemetryCounterName,
+  NatsailTelemetryGaugeName,
+  NatsailTelemetryReporter,
+  NatsailTelemetrySink,
+  NatsailWorkBudget,
+  NatsRuntime,
+  SubscriptionLease,
+} from '@natsail/core'
 
 export type SessionPhase = 'connecting' | 'live' | 'closed' | 'error'
 
@@ -16,6 +28,13 @@ export type SessionListener = () => void
 export type SessionSource<T> = (accept: (value: T) => Promise<void>) => SubscriptionLease
 
 export type SessionReducer<Value, State> = (state: State, value: Value) => State | Promise<State>
+
+export interface NatsailReducingSessionOptions {
+  /** Yields between serial reducer applications after this cooperative slice is consumed. */
+  readonly workBudget?: NatsailWorkBudget
+  /** Adapter-owned reporter used only for low-cardinality work-yield measurements. */
+  readonly telemetry?: NatsailTelemetryReporter
+}
 
 /** One validated logical source shared by every framework adapter. */
 export interface SessionDefinition<T> {
@@ -100,6 +119,12 @@ export interface SessionRegistry {
 export interface SessionRegistryOptions {
   /** Delay before closing a session with no callers. Defaults to 0. */
   idleCloseMs?: number
+  /** Optional synchronous measurement sink. Session keys and contracts are never included. */
+  telemetry?: NatsailTelemetrySink
+  /** Low-cardinality primitive attributes added to each session measurement. */
+  telemetryAttributes?: NatsailTelemetryAttributes
+  /** Monotonic telemetry clock override, primarily for deterministic hosts and tests. */
+  telemetryClock?: NatsailTelemetryClock
 }
 
 type Deferred<T> = {
@@ -136,15 +161,21 @@ export function createCoreSessionSource<T>(
 export function createReducingSessionSource<Value, State>(
   source: SessionSource<Value>,
   initialState: () => State,
-  reducer: SessionReducer<Value, State>
+  reducer: SessionReducer<Value, State>,
+  options: NatsailReducingSessionOptions = {}
 ): SessionSource<State> {
   return (accept) => {
     let state = initialState()
     let pending = Promise.resolve()
+    const work =
+      options.workBudget === undefined
+        ? undefined
+        : createNatsailWorkController(options.workBudget, options.telemetry, 'session')
 
     return source((value) => {
       const update = pending.then(async () => {
         state = await reducer(state, value)
+        await work?.checkpoint()
         await accept(state)
       })
       pending = update.catch(() => undefined)
@@ -172,7 +203,8 @@ class SharedSession<T> {
     readonly key: string,
     readonly contract: string | undefined,
     private readonly source: SessionSource<T>,
-    private readonly emit: (event: SessionRegistryEvent) => void
+    private readonly emit: (event: SessionRegistryEvent) => void,
+    private readonly telemetry: NatsailTelemetryReporter
   ) {
     this.currentReady = this.start()
     void this.currentReady.catch(() => undefined)
@@ -184,11 +216,13 @@ class SharedSession<T> {
 
   retain(): void {
     this.references += 1
+    this.recordReference('retained')
     this.report('retained')
   }
 
   release(): number {
     this.references -= 1
+    this.recordReference('released-reference')
     this.report('released')
     return this.references
   }
@@ -228,6 +262,11 @@ class SharedSession<T> {
             revision: this.snapshot.revision + 1,
           })
         }
+        recordCounter(this.telemetry, 'natsail.session.lifecycle', 1, {
+          action: 'closed',
+          phase: 'closed',
+          source: 'session',
+        })
         this.report('closed')
       }
     })()
@@ -240,6 +279,11 @@ class SharedSession<T> {
     }
 
     if (!this.restartPromise) {
+      recordCounter(this.telemetry, 'natsail.session.lifecycle', 1, {
+        action: 'restarting',
+        phase: 'reconnecting',
+        source: 'session',
+      })
       this.report('restarting')
       this.restartPromise = this.restartSession().finally(() => {
         this.restartPromise = undefined
@@ -322,7 +366,15 @@ class SharedSession<T> {
   }
 
   private update(snapshot: SessionSnapshot<T>): void {
+    const previousPhase = this.snapshot.phase
     this.snapshot = snapshot
+    if (previousPhase !== snapshot.phase) {
+      recordCounter(this.telemetry, 'natsail.session.lifecycle', 1, {
+        action: 'phase-change',
+        phase: snapshot.phase,
+        source: 'session',
+      })
+    }
     this.report('updated')
     for (const listener of this.listeners) {
       listener()
@@ -342,6 +394,48 @@ class SharedSession<T> {
       ...(this.snapshot.error === undefined ? {} : { error: this.snapshot.error }),
     })
   }
+
+  private recordReference(action: 'retained' | 'released-reference'): void {
+    recordCounter(this.telemetry, 'natsail.session.references', 1, {
+      action,
+      source: 'session',
+    })
+    recordGauge(this.telemetry, 'natsail.session.references.active', this.references, {
+      source: 'session',
+    })
+  }
+}
+
+function recordCounter(
+  telemetry: NatsailTelemetryReporter,
+  name: NatsailTelemetryCounterName,
+  value: number,
+  attributes?: NatsailTelemetryAttributes
+): void {
+  if (!telemetry.enabled) return
+  telemetry.record({
+    type: 'counter',
+    name,
+    value,
+    at: telemetry.now(),
+    ...(attributes === undefined ? {} : { attributes }),
+  })
+}
+
+function recordGauge(
+  telemetry: NatsailTelemetryReporter,
+  name: NatsailTelemetryGaugeName,
+  value: number,
+  attributes?: NatsailTelemetryAttributes
+): void {
+  if (!telemetry.enabled) return
+  telemetry.record({
+    type: 'gauge',
+    name,
+    value,
+    at: telemetry.now(),
+    ...(attributes === undefined ? {} : { attributes }),
+  })
 }
 
 type SessionEventSubscriber = {
@@ -421,10 +515,19 @@ class DefaultSessionRegistry implements SessionRegistry {
   private closePromise?: Promise<void>
   private closeRequested = false
   private readonly eventStream = new SessionEventStream()
+  private readonly telemetry: NatsailTelemetryReporter
 
   readonly events: AsyncIterable<SessionRegistryEvent> = this.eventStream
 
-  constructor(private readonly options: SessionRegistryOptions) {}
+  constructor(private readonly options: SessionRegistryOptions) {
+    this.telemetry = createNatsailTelemetryReporter({
+      ...(options.telemetry === undefined ? {} : { sink: options.telemetry }),
+      ...(options.telemetryClock === undefined ? {} : { clock: options.telemetryClock }),
+      ...(options.telemetryAttributes === undefined
+        ? {}
+        : { attributes: options.telemetryAttributes }),
+    })
+  }
 
   acquire<T>(definition: SessionDefinition<T>): SessionHandle<T>
   acquire<T>(key: string, source: SessionSource<T>): SessionHandle<T>
@@ -442,8 +545,16 @@ class DefaultSessionRegistry implements SessionRegistry {
 
     let session = this.sessions.get(key) as SharedSession<T> | undefined
     if (!session) {
-      session = new SharedSession(key, contract, source, (event) => this.eventStream.emit(event))
+      session = new SharedSession(
+        key,
+        contract,
+        source,
+        (event) => this.eventStream.emit(event),
+        this.telemetry
+      )
       this.sessions.set(key, session as SharedSession<unknown>)
+      this.recordLifecycle('opened', 'connecting')
+      this.recordActiveSessions()
       this.eventStream.emit({
         type: 'opened',
         key,
@@ -526,6 +637,7 @@ class DefaultSessionRegistry implements SessionRegistry {
     const sessions = [...this.sessions.values()]
     this.sessions.clear()
     await Promise.allSettled(sessions.map((session) => session.close()))
+    this.recordActiveSessions()
     this.eventStream.close()
   }
 
@@ -533,7 +645,11 @@ class DefaultSessionRegistry implements SessionRegistry {
     const idleCloseMs = this.options.idleCloseMs ?? 0
     if (idleCloseMs === 0) {
       this.sessions.delete(key)
-      await session.close()
+      try {
+        await session.close()
+      } finally {
+        this.recordActiveSessions()
+      }
       return
     }
 
@@ -541,10 +657,32 @@ class DefaultSessionRegistry implements SessionRegistry {
       this.cleanupTimers.delete(key)
       if (this.sessions.get(key) === session) {
         this.sessions.delete(key)
-        void session.close().catch(() => undefined)
+        void session
+          .close()
+          .finally(() => {
+            this.recordActiveSessions()
+          })
+          .catch(() => undefined)
       }
     }, idleCloseMs)
     this.cleanupTimers.set(key, timer)
+  }
+
+  private recordLifecycle(
+    action: 'opened' | 'restarting' | 'closed',
+    phase: NatsailTelemetryAttributes['phase']
+  ): void {
+    recordCounter(this.telemetry, 'natsail.session.lifecycle', 1, {
+      action,
+      ...(phase === undefined ? {} : { phase }),
+      source: 'session',
+    })
+  }
+
+  private recordActiveSessions(): void {
+    recordGauge(this.telemetry, 'natsail.session.active', this.sessions.size, {
+      source: 'session',
+    })
   }
 }
 

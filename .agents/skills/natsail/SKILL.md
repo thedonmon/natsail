@@ -1,6 +1,6 @@
 ---
 name: natsail
-description: Build TypeScript applications with the NATSail package family. Use when choosing packages, creating a shared runtime, deciding between live Core NATS, ordered JetStream replay, and explicit-ack processing, or composing React, RxJS, and Effect integrations.
+description: Build TypeScript applications with the NATSail package family. Use when choosing packages, creating a shared runtime, deciding between live Core NATS, ordered JetStream replay, and explicit-ack processing, sharing browser sources, adding telemetry, or composing React, RxJS, and Effect integrations.
 ---
 
 # Use NATSail in an application
@@ -19,15 +19,17 @@ Do not use Core NATS when missed messages are unacceptable. Do not treat an orde
 
 ## Choose packages
 
-| Package                | Add it when                                                              | Detailed skill                                         |
-| ---------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------ |
-| `@natsail/core`        | Runtime-backed messaging; it owns the shared runtime and Core operations | [natsail-core](../natsail-core/SKILL.md)               |
-| `@natsail/jetstream`   | Replay, checkpoints, reducing sessions, or durable processors are needed | [natsail-jetstream](../natsail-jetstream/SKILL.md)     |
-| `@natsail/checkpoints` | The application configures memory or IndexedDB resume state              | [natsail-checkpoints](../natsail-checkpoints/SKILL.md) |
-| `@natsail/session`     | Multiple consumers or adapters should share one keyed source             | [natsail-session](../natsail-session/SKILL.md)         |
-| `@natsail/react`       | React providers, hooks, and selectors are needed                         | [natsail-react](../natsail-react/SKILL.md)             |
-| `@natsail/rxjs`        | NATS sources should be consumed as Observables                           | [natsail-rxjs](../natsail-rxjs/SKILL.md)               |
-| `@natsail/effect`      | NATS sources should use Effect services, Layers, and scoped Streams      | [natsail-effect](../natsail-effect/SKILL.md)           |
+| Package                   | Add it when                                                              | Detailed skill                                               |
+| ------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------ |
+| `@natsail/core`           | Runtime-backed messaging; it owns the shared runtime and Core operations | [natsail-core](../natsail-core/SKILL.md)                     |
+| `@natsail/jetstream`      | Replay, checkpoints, reducing sessions, or durable processors are needed | [natsail-jetstream](../natsail-jetstream/SKILL.md)           |
+| `@natsail/checkpoints`    | The application configures memory or IndexedDB resume state              | [natsail-checkpoints](../natsail-checkpoints/SKILL.md)       |
+| `@natsail/session`        | Multiple consumers or adapters should share one keyed source             | [natsail-session](../natsail-session/SKILL.md)               |
+| `@natsail/react`          | React providers, hooks, and selectors are needed                         | [natsail-react](../natsail-react/SKILL.md)                   |
+| `@natsail/rxjs`           | NATS sources should be consumed as Observables                           | [natsail-rxjs](../natsail-rxjs/SKILL.md)                     |
+| `@natsail/effect`         | NATS sources should use Effect services, Layers, and scoped Streams      | [natsail-effect](../natsail-effect/SKILL.md)                 |
+| `@natsail/browser-broker` | Same-origin tabs must share worker-owned sources and operations          | [natsail-browser-broker](../natsail-browser-broker/SKILL.md) |
+| `@natsail/opentelemetry`  | NATSail measurements should feed an OpenTelemetry MeterProvider          | [natsail-opentelemetry](../natsail-opentelemetry/SKILL.md)   |
 
 Install every package imported by application code instead of relying on transitive dependency hoisting. NATSail package versions are independent; do not assume every package has the same version number. For Effect, follow the exact peer version and npm tag in the Effect skill.
 
