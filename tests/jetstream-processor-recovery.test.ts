@@ -2,7 +2,9 @@ import {
   AckPolicy,
   DeliverPolicy,
   ReplayPolicy,
+  type ConsumerConfig,
   type Consumer,
+  type ConsumerInfo,
   type ConsumerMessages,
   type JsMsg,
 } from '@nats-io/jetstream'
@@ -15,6 +17,10 @@ import { processJetStream } from '@natsail/jetstream'
 const jetStreamMocks = vi.hoisted(() => ({
   addConsumer: vi.fn(),
   deleteConsumer: vi.fn(),
+  infoConsumer: vi.fn(),
+  pauseConsumer: vi.fn(),
+  resumeConsumer: vi.fn(),
+  updateConsumer: vi.fn(),
   getConsumer: vi.fn(),
 }))
 
@@ -28,6 +34,10 @@ vi.mock('@nats-io/jetstream', async (importOriginal) => {
       consumers: {
         add: jetStreamMocks.addConsumer,
         delete: jetStreamMocks.deleteConsumer,
+        info: jetStreamMocks.infoConsumer,
+        pause: jetStreamMocks.pauseConsumer,
+        resume: jetStreamMocks.resumeConsumer,
+        update: jetStreamMocks.updateConsumer,
       },
     }),
   }
@@ -42,6 +52,8 @@ function message(sequence: number, value: string): JsMsg {
     data: natsCodecs.text.encode(value),
     info: {
       deliveryCount: 1,
+      deliverySequence: sequence,
+      pending: 0,
       stream,
       streamSequence: sequence,
     },
@@ -97,6 +109,30 @@ function consumer(deliveries: readonly JsMsg[], closedError?: Error, stayOpen = 
   } as unknown as Consumer
 }
 
+function consumerInfo(config: Partial<ConsumerConfig>): ConsumerInfo {
+  return {
+    stream_name: stream,
+    name: 'processor',
+    created: '2026-09-02T00:00:00.000Z',
+    config: {
+      ack_policy: AckPolicy.Explicit,
+      deliver_policy: DeliverPolicy.All,
+      durable_name: 'processor',
+      filter_subject: subject,
+      replay_policy: ReplayPolicy.Instant,
+      ...config,
+    },
+    delivered: { consumer_seq: 0, stream_seq: 0, last_active: 0 },
+    ack_floor: { consumer_seq: 0, stream_seq: 0, last_active: 0 },
+    num_ack_pending: 0,
+    num_pending: 0,
+    num_redelivered: 0,
+    num_waiting: 0,
+    push_bound: false,
+    pause_remaining: 0,
+  }
+}
+
 function runtime(telemetryEvents?: NatsailTelemetryEvent[]) {
   let closeConnection!: () => void
   const closed = new Promise<void>((resolve) => {
@@ -119,8 +155,19 @@ function runtime(telemetryEvents?: NatsailTelemetryEvent[]) {
 
 describe('recovering explicit-ack JetStream processor', () => {
   beforeEach(() => {
-    jetStreamMocks.addConsumer.mockReset().mockResolvedValue(undefined)
+    let active: ConsumerInfo | undefined
+    jetStreamMocks.addConsumer.mockReset().mockImplementation(async (_stream, config) => {
+      active = consumerInfo(config)
+      return active
+    })
     jetStreamMocks.deleteConsumer.mockReset().mockResolvedValue(true)
+    jetStreamMocks.infoConsumer.mockReset().mockImplementation(async () => {
+      if (active === undefined) throw { code: 404 }
+      return active
+    })
+    jetStreamMocks.pauseConsumer.mockReset()
+    jetStreamMocks.resumeConsumer.mockReset()
+    jetStreamMocks.updateConsumer.mockReset()
     jetStreamMocks.getConsumer.mockReset()
   })
 
@@ -155,7 +202,12 @@ describe('recovering explicit-ack JetStream processor', () => {
       stream,
       expect.objectContaining({ durable_name: 'processor' })
     )
-    expect(lease.inspect()).toMatchObject({ phase: 'live', restarts: 1 })
+    expect(lease.inspect()).toMatchObject({
+      phase: 'live',
+      restarts: 1,
+      delivered: { consumer: 2, stream: 2 },
+      acknowledged: { consumer: 2, stream: 2 },
+    })
     expect(telemetryEvents).toContainEqual(
       expect.objectContaining({
         type: 'counter',
@@ -166,7 +218,7 @@ describe('recovering explicit-ack JetStream processor', () => {
     expect(jetStreamMocks.deleteConsumer).not.toHaveBeenCalled()
 
     await lease.close()
-    expect(activeConsumer.delete).toHaveBeenCalledOnce()
+    expect(jetStreamMocks.deleteConsumer).toHaveBeenCalledOnce()
     await nats.close()
   })
 
@@ -190,8 +242,61 @@ describe('recovering explicit-ack JetStream processor', () => {
     await lease.ready
     await nats.close()
 
-    expect(activeConsumer.delete).toHaveBeenCalledOnce()
+    expect(jetStreamMocks.deleteConsumer).toHaveBeenCalledOnce()
     await expect(lease.closed).resolves.toBeUndefined()
+  })
+
+  it('recreates a deleted start:new consumer after the last safe acknowledgement boundary', async () => {
+    const firstInfo = consumerInfo({ deliver_policy: DeliverPolicy.New })
+    const resumedInfo = consumerInfo({
+      deliver_policy: DeliverPolicy.StartSequence,
+      opt_start_seq: 2,
+    })
+    jetStreamMocks.infoConsumer
+      .mockReset()
+      .mockRejectedValueOnce({ code: 404 })
+      .mockResolvedValueOnce(firstInfo)
+      .mockRejectedValueOnce({ code: 404 })
+      .mockResolvedValueOnce(resumedInfo)
+    const activeConsumer = consumer([message(2, 'published-in-gap')], undefined, true)
+    jetStreamMocks.getConsumer
+      .mockResolvedValueOnce(consumer([message(1, 'before-gap')], new Error('consumer deleted')))
+      .mockResolvedValueOnce(activeConsumer)
+    const nats = runtime()
+    const received: string[] = []
+    const lease = processJetStream(
+      nats,
+      {
+        stream,
+        consumer: { mode: 'owned', name: 'processor' },
+        filter: subject,
+        start: 'new',
+        recovery: { maxAttempts: 2, delayMs: 0 },
+        codec: natsCodecs.text,
+      },
+      ({ value }) => received.push(value)
+    )
+
+    await lease.ready
+    await vi.waitFor(() => expect(received).toEqual(['before-gap', 'published-in-gap']))
+    expect(jetStreamMocks.addConsumer).toHaveBeenCalledTimes(2)
+    expect(jetStreamMocks.addConsumer).toHaveBeenNthCalledWith(
+      2,
+      stream,
+      expect.objectContaining({
+        durable_name: 'processor',
+        deliver_policy: DeliverPolicy.StartSequence,
+        opt_start_seq: 2,
+      })
+    )
+    expect(lease.inspect()).toMatchObject({
+      phase: 'live',
+      restarts: 1,
+      acknowledged: { stream: 2 },
+    })
+
+    await lease.close()
+    await nats.close()
   })
 
   it('does not retry an application handler failure', async () => {

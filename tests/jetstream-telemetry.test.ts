@@ -2,6 +2,8 @@ import {
   AckPolicy,
   DeliverPolicy,
   ReplayPolicy,
+  type ConsumerConfig,
+  type ConsumerInfo,
   type Consumer,
   type ConsumerMessages,
   type JsMsg,
@@ -15,6 +17,8 @@ import { consumeJetStream, processJetStream } from '@natsail/jetstream'
 
 const mocks = vi.hoisted(() => ({
   addConsumer: vi.fn(),
+  infoConsumer: vi.fn(),
+  updateConsumer: vi.fn(),
   getConsumer: vi.fn(),
   streamInfo: vi.fn(),
 }))
@@ -25,7 +29,11 @@ vi.mock('@nats-io/jetstream', async (importOriginal) => {
     ...original,
     jetstream: () => ({ consumers: { get: mocks.getConsumer } }),
     jetstreamManager: () => ({
-      consumers: { add: mocks.addConsumer },
+      consumers: {
+        add: mocks.addConsumer,
+        info: mocks.infoConsumer,
+        update: mocks.updateConsumer,
+      },
       streams: { info: mocks.streamInfo },
     }),
   }
@@ -40,6 +48,7 @@ function message(sequence: number, redelivered = false): JsMsg {
     data: natsCodecs.text.encode(`value-${sequence}`),
     info: {
       deliveryCount: redelivered ? 2 : 1,
+      deliverySequence: sequence,
       pending: 0,
       stream,
       streamSequence: sequence,
@@ -47,6 +56,30 @@ function message(sequence: number, redelivered = false): JsMsg {
     redelivered,
     subject: 'private.subject',
   } as unknown as JsMsg
+}
+
+function processorInfo(config: Partial<ConsumerConfig>): ConsumerInfo {
+  return {
+    stream_name: stream,
+    name: 'private-consumer',
+    created: '2026-09-02T00:00:00.000Z',
+    config: {
+      ack_policy: AckPolicy.Explicit,
+      deliver_policy: DeliverPolicy.All,
+      durable_name: 'private-consumer',
+      filter_subject: filter,
+      replay_policy: ReplayPolicy.Instant,
+      ...config,
+    },
+    delivered: { consumer_seq: 0, stream_seq: 0, last_active: 0 },
+    ack_floor: { consumer_seq: 0, stream_seq: 0, last_active: 0 },
+    num_ack_pending: 0,
+    num_pending: 0,
+    num_redelivered: 0,
+    num_waiting: 0,
+    push_bound: false,
+    pause_remaining: 0,
+  }
 }
 
 function messages(deliveries: readonly JsMsg[]): ConsumerMessages {
@@ -84,7 +117,16 @@ function runtime(
 
 describe('JetStream telemetry', () => {
   beforeEach(() => {
-    mocks.addConsumer.mockReset().mockResolvedValue(undefined)
+    let active: ConsumerInfo | undefined
+    mocks.addConsumer.mockReset().mockImplementation(async (_stream, config) => {
+      active = processorInfo(config)
+      return active
+    })
+    mocks.infoConsumer.mockReset().mockImplementation(async () => {
+      if (active === undefined) throw { code: 404 }
+      return active
+    })
+    mocks.updateConsumer.mockReset()
     mocks.getConsumer.mockReset()
     mocks.streamInfo.mockReset().mockResolvedValue({
       created: '2026-09-02T00:00:00.000Z',
@@ -326,6 +368,13 @@ describe('JetStream telemetry', () => {
     )
 
     await expect(lease.closed).rejects.toBe(failure)
+    expect(lease.inspect()).toMatchObject({
+      phase: 'error',
+      handlerFailure: failure,
+      pendingAcknowledgements: 1,
+      delivered: { consumer: 10, stream: 10 },
+      acknowledged: { consumer: 0, stream: 0 },
+    })
     expect(events).toContainEqual(
       expect.objectContaining({
         type: 'duration',

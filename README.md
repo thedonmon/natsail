@@ -271,7 +271,29 @@ const processor = processJetStream(
 await processor.ready
 ```
 
-The processor acknowledges a message after its handler succeeds. A failed handler leaves the message available for server redelivery. With `recovery` enabled, NATSail reopens the same named consumer after infrastructure failures and exposes `reconnecting` plus a restart count through the processor lease.
+The processor acknowledges a message after its handler succeeds. A failed handler leaves the message available for server redelivery. With `recovery` enabled, NATSail reopens the same named consumer after infrastructure failures and exposes `reconnecting` plus rich cached progress through the processor lease.
+
+Named consumers also have an administration seam:
+
+```ts
+import { createJetStreamProcessorController } from '@natsail/jetstream'
+
+const jobs = createJetStreamProcessorController(runtime, {
+  stream: 'JOBS',
+  consumer: { mode: 'ensure', name: 'billing_workers' },
+  filter: 'jobs.billing',
+  start: 'all',
+  ackWaitMs: 60_000,
+  backoffMs: [60_000, 120_000, 300_000],
+  maxDeliver: 10,
+  metadata: { team: 'billing' },
+})
+
+const result = await jobs.reconcile()
+const authoritative = await jobs.refresh()
+```
+
+`bind` is inspect-only, `ensure` may update editable settings but never recreates a consumer, and `owned` may recreate or delete only its own durable consumer. Reconciliation is serialized and returns normalized before/after configuration plus editable and immutable drift. Safe owned recreation resumes at the first sequence after the previous acknowledgement floor.
 
 ## Run the examples
 

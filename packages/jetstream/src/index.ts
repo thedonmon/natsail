@@ -4,7 +4,6 @@ import {
   jetstream,
   jetstreamManager,
   ReplayPolicy,
-  type ConsumerConfig,
   type Consumer,
   type ConsumerMessages,
   type ConsumerNotification,
@@ -44,7 +43,45 @@ import {
   type SessionSource,
 } from '@natsail/session'
 
-export type JetStreamStart = 'all' | 'new' | { after: number }
+import {
+  createJetStreamProcessorController,
+  createJetStreamProcessorControllerForRecovery,
+  inspectJetStreamProcessorConsumerState,
+  validateJetStreamProcessorAdminOptions,
+  JetStreamProcessorConfigurationError,
+  JetStreamProcessorReconciliationError,
+  type JetStreamProcessorAdminOptions,
+  type JetStreamProcessorConsumerStateInspection,
+  type JetStreamProcessorReconciliationInspection,
+  type JetStreamProcessorReconciliationResult,
+} from './processor-admin.js'
+
+export {
+  classifyJetStreamProcessorDrift,
+  createJetStreamProcessorController,
+  inspectJetStreamProcessorConsumerState,
+  jetStreamProcessorConsumerConfig,
+  normalizeJetStreamProcessorActive,
+  normalizeJetStreamProcessorDesired,
+  validateJetStreamProcessorAdminOptions,
+  JetStreamProcessorConfigurationError,
+  JetStreamProcessorReconciliationError,
+  type JetStreamProcessorAdminOptions,
+  type JetStreamProcessorConfigurationErrorCode,
+  type JetStreamProcessorConsumer,
+  type JetStreamProcessorConsumerStateInspection,
+  type JetStreamProcessorController,
+  type JetStreamProcessorDriftPolicy,
+  type JetStreamProcessorEditableField,
+  type JetStreamProcessorImmutableField,
+  type JetStreamProcessorNormalizedConfig,
+  type JetStreamProcessorReconciliationInspection,
+  type JetStreamProcessorReconciliationResult,
+  type JetStreamProcessorSequenceInspection,
+  type JetStreamProcessorStart,
+} from './processor-admin.js'
+
+export type JetStreamStart = import('./processor-admin.js').JetStreamProcessorStart
 
 export interface StreamCursor {
   stream: string
@@ -243,11 +280,6 @@ export class JetStreamDuplicateError extends Error {
 
 export type JetStreamHandler<T> = (delivery: JetStreamDelivery<T>) => void | Promise<void>
 
-export type JetStreamProcessorConsumer =
-  | { mode: 'bind'; name: string }
-  | { mode: 'ensure'; name: string }
-  | { mode: 'owned'; name: string }
-
 export interface JetStreamProcessingDelivery<T> {
   value: T
   subject: string
@@ -256,17 +288,8 @@ export interface JetStreamProcessingDelivery<T> {
   deliveryAttempt: number
 }
 
-export interface JetStreamProcessorBaseOptions {
-  stream: string
-  consumer: JetStreamProcessorConsumer
-  filter: string | readonly string[]
-  start: JetStreamStart
+export interface JetStreamProcessorBaseOptions extends JetStreamProcessorAdminOptions {
   signal?: AbortSignal
-  /** Server wait before an unacknowledged delivery becomes eligible for redelivery. */
-  ackWaitMs?: number
-  maxDeliver?: number
-  maxAckPending?: number
-  replayPolicy?: ReplayPolicy
   /** Reopens the named consumer after infrastructure failures. */
   recovery?: JetStreamProcessorRecoveryOptions
 }
@@ -283,6 +306,18 @@ export type JetStreamProcessorPhase = 'connecting' | 'live' | 'reconnecting' | '
 export interface JetStreamProcessorInspection {
   readonly phase: JetStreamProcessorPhase
   readonly restarts: number
+  readonly stream: string
+  readonly consumer: JetStreamProcessorReconciliationInspection['consumer']
+  readonly pendingAcknowledgements: number
+  readonly pendingMessages: number
+  readonly delivered: JetStreamProcessorConsumerStateInspection['delivered']
+  readonly acknowledged: JetStreamProcessorConsumerStateInspection['acknowledged']
+  readonly redeliveries: number
+  readonly paused: boolean
+  readonly desired: JetStreamProcessorReconciliationInspection['desired']
+  readonly active?: JetStreamProcessorReconciliationInspection['active']
+  readonly lastReconciliation?: JetStreamProcessorReconciliationResult
+  readonly handlerFailure?: unknown
   readonly error?: unknown
 }
 
@@ -298,27 +333,6 @@ export interface JetStreamProcessorRecoveryOptions {
   delayMs?: number | ((context: JetStreamRecoveryContext) => number)
   /** Returns false to stop retrying an infrastructure error. */
   shouldRetry?: (context: JetStreamRecoveryContext) => boolean
-}
-
-export type JetStreamProcessorConfigurationErrorCode =
-  | 'ack-policy'
-  | 'push-consumer'
-  | 'filter-mismatch'
-  | 'start-mismatch'
-  | 'ack-wait-mismatch'
-  | 'max-deliver-mismatch'
-  | 'max-ack-pending-mismatch'
-  | 'replay-policy-mismatch'
-
-export class JetStreamProcessorConfigurationError extends Error {
-  readonly name = 'JetStreamProcessorConfigurationError'
-
-  constructor(
-    readonly code: JetStreamProcessorConfigurationErrorCode,
-    message: string
-  ) {
-    super(message)
-  }
 }
 
 type Deferred<T> = {
@@ -1011,40 +1025,6 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
   }
 }
 
-function millisecondsToNanos(value: number): number {
-  const nanos = value * 1_000_000
-  if (!Number.isSafeInteger(nanos)) {
-    throw new RangeError('JetStream millisecond duration is too large')
-  }
-  return nanos
-}
-
-function durableConsumerConfig<T>(options: JetStreamProcessorOptions<T>): ConsumerConfig {
-  const filters = typeof options.filter === 'string' ? [options.filter] : [...options.filter]
-  const start = options.start
-  const config: ConsumerConfig = {
-    ...(options.consumer.mode === 'owned' && !options.recovery
-      ? { name: options.consumer.name }
-      : { durable_name: options.consumer.name }),
-    ack_policy: AckPolicy.Explicit,
-    deliver_policy:
-      start === 'all'
-        ? DeliverPolicy.All
-        : start === 'new'
-          ? DeliverPolicy.New
-          : DeliverPolicy.StartSequence,
-    replay_policy: options.replayPolicy ?? ReplayPolicy.Instant,
-    ...(typeof start === 'object' ? { opt_start_seq: start.after + 1 } : {}),
-    ...(filters.length === 1 ? { filter_subject: filters[0]! } : { filter_subjects: filters }),
-    ...(options.ackWaitMs === undefined
-      ? {}
-      : { ack_wait: millisecondsToNanos(options.ackWaitMs) }),
-    ...(options.maxDeliver === undefined ? {} : { max_deliver: options.maxDeliver }),
-    ...(options.maxAckPending === undefined ? {} : { max_ack_pending: options.maxAckPending }),
-  }
-  return config
-}
-
 class JetStreamProcessor<T> implements JetStreamProcessorLease {
   readonly ready: Promise<void>
   readonly closed: Promise<void>
@@ -1059,16 +1039,28 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
   private phase: JetStreamProcessorPhase = 'connecting'
   private error?: unknown
   private statusFailure?: Error
+  private handlerFailure?: unknown
+  private consumerState: JetStreamProcessorConsumerStateInspection = {
+    pendingAcknowledgements: 0,
+    pendingMessages: 0,
+    delivered: { consumer: 0, stream: 0 },
+    acknowledged: { consumer: 0, stream: 0 },
+    redeliveries: 0,
+    paused: false,
+  }
   private readonly listeners = new Set<() => void>()
   private readonly telemetry: NatsailTelemetryReporter
+  private readonly controller: ReturnType<typeof createJetStreamProcessorController>
 
   constructor(
     runtime: NatsRuntime,
     private readonly options: JetStreamProcessorOptions<T>,
     private readonly handler: JetStreamProcessorHandler<T>,
-    private readonly deleteOwnedOnClose = true
+    private readonly deleteOwnedOnClose = true,
+    resumeAfter?: number
   ) {
     this.telemetry = runtime[NATS_RUNTIME_ADAPTER].telemetry
+    this.controller = createJetStreamProcessorControllerForRecovery(runtime, options, resumeAfter)
     this.ready = this.readyState.promise
     this.closed = this.closedState.promise
     void this.closed.catch(() => undefined)
@@ -1076,9 +1068,24 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
   }
 
   inspect(): JetStreamProcessorInspection {
+    const admin = this.controller.inspect()
     return {
       phase: this.phase,
       restarts: 0,
+      stream: this.options.stream,
+      consumer: admin.consumer,
+      pendingAcknowledgements: this.consumerState.pendingAcknowledgements,
+      pendingMessages: this.consumerState.pendingMessages,
+      delivered: this.consumerState.delivered,
+      acknowledged: this.consumerState.acknowledged,
+      redeliveries: this.consumerState.redeliveries,
+      paused: this.consumerState.paused,
+      desired: admin.desired,
+      ...(admin.active === undefined ? {} : { active: admin.active }),
+      ...(admin.lastReconciliation === undefined
+        ? {}
+        : { lastReconciliation: admin.lastReconciliation }),
+      ...(this.handlerFailure === undefined ? {} : { handlerFailure: this.handlerFailure }),
       ...(this.error === undefined ? {} : { error: this.error }),
     }
   }
@@ -1104,30 +1111,15 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
     try {
       const connection = await runtime.connection()
       const client = jetstream(connection)
-      if (this.options.consumer.mode !== 'bind') {
-        const manager = await jetstreamManager(connection)
-        try {
-          await manager.consumers.add(this.options.stream, durableConsumerConfig(this.options))
-        } catch (error) {
-          if (this.options.consumer.mode === 'ensure') {
-            try {
-              const existing = await manager.consumers.info(
-                this.options.stream,
-                this.options.consumer.name
-              )
-              validateProcessorConsumer(existing.config, this.options)
-            } catch (contractError) {
-              if (contractError instanceof JetStreamProcessorConfigurationError) {
-                throw contractError
-              }
-            }
-          }
-          throw error
-        }
+      const reconciliation = await this.controller.reconcile()
+      if (reconciliation.status === 'rejected') {
+        throw new JetStreamProcessorReconciliationError(reconciliation)
       }
+      const managed = this.controller.inspect()
+      if (managed.state !== undefined) this.consumerState = managed.state
       this.consumer = await client.consumers.get(this.options.stream, this.options.consumer.name)
       const consumerInfo = await this.consumer.info()
-      validateProcessorConsumer(consumerInfo.config, this.options)
+      this.consumerState = inspectJetStreamProcessorConsumerState(consumerInfo)
 
       if (this.closeRequested || this.options.signal?.aborted) {
         this.resolveReady()
@@ -1148,6 +1140,17 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
       this.resolveReady()
 
       for await (const message of this.messages) {
+        this.consumerState = {
+          ...this.consumerState,
+          pendingAcknowledgements: this.consumerState.pendingAcknowledgements + 1,
+          pendingMessages: message.info.pending,
+          delivered: {
+            consumer: message.info.deliverySequence,
+            stream: message.info.streamSequence,
+          },
+          redeliveries: this.consumerState.redeliveries + (message.redelivered ? 1 : 0),
+        }
+        this.notify()
         recordCounter(this.telemetry, 'natsail.jetstream.deliveries', 1, {
           redelivered: message.redelivered,
           source: 'jetstream',
@@ -1165,6 +1168,8 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
             deliveryAttempt: message.info.deliveryCount,
           })
         } catch (error) {
+          this.handlerFailure = error
+          this.notify()
           recordDuration(this.telemetry, 'natsail.jetstream.handler.duration', handlerStartedAt, {
             operation: 'processor-handler',
             outcome: 'failure',
@@ -1181,6 +1186,15 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
         })
         try {
           message.ack()
+          this.consumerState = {
+            ...this.consumerState,
+            pendingAcknowledgements: Math.max(0, this.consumerState.pendingAcknowledgements - 1),
+            acknowledged: {
+              consumer: message.info.deliverySequence,
+              stream: message.info.streamSequence,
+            },
+          }
+          this.notify()
           recordCounter(this.telemetry, 'natsail.jetstream.acknowledgements', 1, {
             outcome: 'success',
             redelivered: message.redelivered,
@@ -1232,15 +1246,21 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
   private setPhase(phase: JetStreamProcessorPhase): void {
     if (this.phase === phase) return
     this.phase = phase
+    this.notify()
+  }
+
+  private notify(): void {
     for (const listener of this.listeners) listener()
   }
 
   async deleteOwnedConsumer(): Promise<void> {
-    if (this.options.consumer.mode !== 'owned' || !this.consumer || this.ownedConsumerDeleted) {
+    if (this.options.consumer.mode !== 'owned' || this.ownedConsumerDeleted) {
       return
     }
     this.ownedConsumerDeleted = true
-    await this.consumer.delete().catch(() => undefined)
+    // Re-read the metadata ownership marker immediately before deletion. A consumer
+    // can be externally replaced under the same durable name while a lease is open.
+    await this.controller.delete().catch(() => undefined)
   }
 
   private async observeDiagnostics(
@@ -1277,102 +1297,6 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
   }
 }
 
-function validateProcessorConsumer<T>(
-  config: ConsumerConfig,
-  options: JetStreamProcessorOptions<T>
-): void {
-  const name = options.consumer.name
-  if (config.ack_policy !== AckPolicy.Explicit) {
-    throw new JetStreamProcessorConfigurationError(
-      'ack-policy',
-      `JetStream consumer ${name} must use AckPolicy.Explicit`
-    )
-  }
-  if (config.deliver_subject) {
-    throw new JetStreamProcessorConfigurationError(
-      'push-consumer',
-      `JetStream consumer ${name} must be a pull consumer`
-    )
-  }
-
-  const actualFilters = [
-    ...(config.filter_subject ? [config.filter_subject] : []),
-    ...(config.filter_subjects ?? []),
-  ].sort()
-  const expectedFilters = (
-    typeof options.filter === 'string' ? [options.filter] : [...options.filter]
-  ).sort()
-  if (
-    actualFilters.length !== expectedFilters.length ||
-    actualFilters.some((filter, index) => filter !== expectedFilters[index])
-  ) {
-    throw new JetStreamProcessorConfigurationError(
-      'filter-mismatch',
-      `JetStream consumer ${name} filters do not match the requested processor filters`
-    )
-  }
-
-  const expectedDeliverPolicy =
-    options.start === 'all'
-      ? DeliverPolicy.All
-      : options.start === 'new'
-        ? DeliverPolicy.New
-        : DeliverPolicy.StartSequence
-  if (
-    config.deliver_policy !== expectedDeliverPolicy ||
-    (typeof options.start === 'object' && config.opt_start_seq !== options.start.after + 1)
-  ) {
-    throw new JetStreamProcessorConfigurationError(
-      'start-mismatch',
-      `JetStream consumer ${name} start position does not match the requested processor start`
-    )
-  }
-
-  validateOptionalConsumerField(
-    name,
-    'ack-wait-mismatch',
-    'ack wait',
-    options.ackWaitMs === undefined ? undefined : millisecondsToNanos(options.ackWaitMs),
-    config.ack_wait
-  )
-  validateOptionalConsumerField(
-    name,
-    'max-deliver-mismatch',
-    'maximum deliveries',
-    options.maxDeliver,
-    config.max_deliver
-  )
-  validateOptionalConsumerField(
-    name,
-    'max-ack-pending-mismatch',
-    'maximum pending acknowledgements',
-    options.maxAckPending,
-    config.max_ack_pending
-  )
-  validateOptionalConsumerField(
-    name,
-    'replay-policy-mismatch',
-    'replay policy',
-    options.replayPolicy,
-    config.replay_policy
-  )
-}
-
-function validateOptionalConsumerField(
-  consumerName: string,
-  code: JetStreamProcessorConfigurationErrorCode,
-  label: string,
-  expected: number | string | undefined,
-  actual: number | string | undefined
-): void {
-  if (expected !== undefined && actual !== expected) {
-    throw new JetStreamProcessorConfigurationError(
-      code,
-      `JetStream consumer ${consumerName} ${label} does not match the requested processor value`
-    )
-  }
-}
-
 class RecoveringJetStreamProcessor<T> implements JetStreamProcessorLease {
   readonly ready: Promise<void>
   readonly closed: Promise<void>
@@ -1388,6 +1312,7 @@ class RecoveringJetStreamProcessor<T> implements JetStreamProcessorLease {
   private restarts = 0
   private phase: JetStreamProcessorPhase = 'connecting'
   private error?: unknown
+  private readonly initialInspection: JetStreamProcessorReconciliationInspection
 
   constructor(
     private readonly runtime: NatsRuntime,
@@ -1395,6 +1320,7 @@ class RecoveringJetStreamProcessor<T> implements JetStreamProcessorLease {
     private readonly recovery: JetStreamProcessorRecoveryOptions,
     private readonly handler: JetStreamProcessorHandler<T>
   ) {
+    this.initialInspection = createJetStreamProcessorController(runtime, options).inspect()
     this.ready = this.readyState.promise
     this.closed = this.closedState.promise
     void this.closed.catch(() => undefined)
@@ -1402,10 +1328,29 @@ class RecoveringJetStreamProcessor<T> implements JetStreamProcessorLease {
   }
 
   inspect(): JetStreamProcessorInspection {
+    const inner = this.active?.inspect() ?? this.retained?.inspect()
+    const error = this.error ?? inner?.error
+    if (inner !== undefined) {
+      return {
+        ...inner,
+        phase: this.phase,
+        restarts: this.restarts,
+        ...(error === undefined ? {} : { error }),
+      }
+    }
     return {
       phase: this.phase,
       restarts: this.restarts,
-      ...(this.error === undefined ? {} : { error: this.error }),
+      stream: this.options.stream,
+      consumer: this.initialInspection.consumer,
+      pendingAcknowledgements: 0,
+      pendingMessages: 0,
+      delivered: { consumer: 0, stream: 0 },
+      acknowledged: { consumer: 0, stream: 0 },
+      redeliveries: 0,
+      paused: false,
+      desired: this.initialInspection.desired,
+      ...(error === undefined ? {} : { error }),
     }
   }
 
@@ -1437,7 +1382,14 @@ class RecoveringJetStreamProcessor<T> implements JetStreamProcessorLease {
 
       while (!this.closeRequested && !this.options.signal?.aborted) {
         attempt += 1
-        const lease = new JetStreamProcessor(this.runtime, this.options, this.handler, false)
+        const resumeAfter = this.retained?.inspect().acknowledged.stream
+        const lease = new JetStreamProcessor(
+          this.runtime,
+          this.options,
+          this.handler,
+          false,
+          resumeAfter
+        )
         this.active = lease
 
         try {
@@ -1645,45 +1597,9 @@ export function processJetStream<T>(
 
 function validateProcessorOptions<T>(options: JetStreamProcessorOptions<T>): void {
   validateJetStreamDecoder(options, 'JetStream processor')
-  if (options.stream.trim().length === 0) {
-    throw new TypeError('JetStream processor stream must not be empty')
-  }
-  if (options.consumer.name.trim().length === 0) {
-    throw new TypeError('JetStream processor consumer name must not be empty')
-  }
-  const filters = typeof options.filter === 'string' ? [options.filter] : options.filter
-  if (filters.length === 0 || filters.some((filter) => filter.trim().length === 0)) {
-    throw new TypeError('JetStream processor filter must contain at least one subject')
-  }
+  validateJetStreamProcessorAdminOptions(options)
   validateStart(options.start)
   validateBufferOptions(options)
-  if (
-    options.ackWaitMs !== undefined &&
-    (!Number.isSafeInteger(options.ackWaitMs) || options.ackWaitMs <= 0)
-  ) {
-    throw new RangeError('JetStream processor ackWaitMs must be a positive integer')
-  }
-  if (options.ackWaitMs !== undefined) millisecondsToNanos(options.ackWaitMs)
-  if (
-    options.maxDeliver !== undefined &&
-    options.maxDeliver !== -1 &&
-    (!Number.isSafeInteger(options.maxDeliver) || options.maxDeliver <= 0)
-  ) {
-    throw new RangeError('JetStream processor maxDeliver must be -1 or a positive integer')
-  }
-  if (
-    options.maxAckPending !== undefined &&
-    (!Number.isSafeInteger(options.maxAckPending) || options.maxAckPending <= 0)
-  ) {
-    throw new RangeError('JetStream processor maxAckPending must be a positive integer')
-  }
-  if (
-    options.replayPolicy !== undefined &&
-    options.replayPolicy !== ReplayPolicy.Instant &&
-    options.replayPolicy !== ReplayPolicy.Original
-  ) {
-    throw new TypeError('JetStream processor replayPolicy must be Instant or Original')
-  }
   if (options.recovery) validateRecovery(options.recovery)
 }
 

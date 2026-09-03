@@ -31,6 +31,9 @@ The test suite uses NATS 2.14.4. Separate fixtures cover anonymous, token, user/
 - Named explicit-ack processing with redelivery
 - Package-owned infrastructure recovery for named explicit-ack processors
 - Bound, retained, and lease-owned processor lifecycles
+- Ownership-aware processor inspection, reconciliation, pause/resume, and guarded deletion
+- Editable consumer drift updates and safe owned recreation from acknowledgement boundaries
+- Backoff, metadata, acknowledgement sampling, replicas, and memory-storage processor configuration
 - Message-count and byte-capacity pull limits
 - Replay/remaining, handler, redelivery, acknowledgement, checkpoint, recovery, and buffer-signal measurements
 
@@ -97,7 +100,7 @@ Shared count/byte/time batching and cooperative work budgets are implemented in 
 
 ### Processor policy
 
-Named processors support explicit acknowledgements and redelivery. Progress heartbeats, confirmed acknowledgements, and higher-level `nak` or terminal-message policy are not packaged yet.
+Named processors support explicit acknowledgements, redelivery, rich cached inspection, and ownership-aware administration. Progress heartbeats, confirmed acknowledgements, and higher-level `nak` or terminal-message policy are not packaged yet.
 
 ## Roadmap
 

@@ -34,19 +34,21 @@ Memory and IndexedDB stores reject sequence regressions. A stale writer cannot r
 
 `processJetStream()` uses a named pull consumer with `AckPolicy.Explicit`. It acknowledges a message after the handler succeeds.
 
-A failed handler leaves the message unacknowledged for server redelivery. The application can configure the acknowledgement wait, maximum deliveries, maximum pending acknowledgements, replay policy, and start position.
+A failed handler leaves the message unacknowledged for server redelivery. The application can configure acknowledgement wait/backoff, maximum deliveries, maximum pending acknowledgements, metadata, acknowledgement sampling, replicas, memory storage, replay policy, and start position.
 
 Consumer ownership has three modes:
 
-- `bind` attaches to an administrator-managed consumer.
-- `ensure` creates or reuses a retained consumer.
-- `owned` creates a consumer that the lease deletes when it closes.
+- `bind` attaches to an administrator-managed consumer and never mutates it.
+- `ensure` creates or reuses a retained consumer and may update editable settings.
+- `owned` creates a durable consumer that the lease deletes when it closes and may safely recreate it.
 
-NATSail checks an existing consumer against the requested filter and start position. It also checks each supplied acknowledgement or replay setting.
+`createJetStreamProcessorController()` exposes cached inspection plus authoritative refresh, reconciliation, pause, resume, and ownership-guarded delete. Operations are serialized. Reconciliation results distinguish unchanged, created, updated, recreated, and rejected outcomes and report normalized desired/active configuration plus editable and immutable drift. `error`, `update-editable`, and `recreate-owned` policies cannot grant ownership that the consumer mode does not have.
 
-Set `recovery` to reopen the named consumer after an infrastructure failure. When that consumer is retained, recovery uses its server-side acknowledgement floor: acknowledged messages remain complete, and an interrupted unacknowledged message remains eligible for redelivery. If an `ensure` or `owned` consumer was deleted on the server, it is recreated from the configured start position and previously handled messages can appear again. Handler, decoder, and consumer-contract failures stay terminal.
+Set `recovery` to reopen the named consumer after an infrastructure failure. When that consumer is retained, recovery uses its server-side acknowledgement floor: acknowledged messages remain complete, and an interrupted unacknowledged message remains eligible for redelivery. A deleted owned `start: 'new'` consumer is recreated from the last safe acknowledgement boundary, so messages published during the deletion gap are not skipped. Handler, decoder, and consumer-contract failures stay terminal.
 
 An `owned` recovering processor retains its named consumer between attempts and deletes it when the logical processor lease closes.
+
+Processor `inspect()` is synchronous and cached. It includes phase, ownership, restart count, pending messages and acknowledgements, consumer and stream delivery/acknowledgement sequences, redeliveries, pause state, last handler failure, normalized desired/active configuration, and the last reconciliation. Controller `refresh()` performs the explicit management read.
 
 ## Duplicate and retention policy
 

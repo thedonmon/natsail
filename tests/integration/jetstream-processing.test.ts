@@ -154,6 +154,7 @@ describe('managed explicit-ack JetStream processing', () => {
         consumer: { mode: 'ensure', name: consumerName },
         filter: expectedSubject,
         start: 'all',
+        driftPolicy: 'error',
         codec: natsCodecs.bytes,
       },
       async () => undefined
@@ -318,11 +319,10 @@ describe('managed explicit-ack JetStream processing', () => {
       .toBe(first.seq)
 
     await manager.consumers.delete(stream, consumerName)
+    await client.publish(subject, 'two')
     await expect.poll(() => lease.inspect().restarts, { timeout: 10_000 }).toBeGreaterThan(0)
     await expect.poll(() => lease.inspect().phase, { timeout: 10_000 }).toBe('live')
     await expect(manager.consumers.info(stream, consumerName)).resolves.toBeDefined()
-
-    await client.publish(subject, 'two')
     await expect.poll(() => received, { timeout: 10_000 }).toEqual(['one', 'two'])
 
     await runtime.close()
