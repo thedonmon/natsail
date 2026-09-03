@@ -16,14 +16,15 @@ import type {
   NatsConnection,
   NatsRuntime,
   NatsRuntimeStatusEvent,
-  SubscriptionLease,
 } from '@natsail/core'
 import {
   createJetStreamSessionSource,
   processJetStream,
   type JetStreamDelivery,
   type JetStreamProcessorHandler,
+  type JetStreamProcessorLease,
   type JetStreamProcessorOptions,
+  type JetStreamProcessorPhase,
   type JetStreamSessionSourceOptions,
   type JetStreamStateSnapshot,
 } from '@natsail/jetstream'
@@ -33,7 +34,6 @@ import type {
   SessionDefinition,
   SessionHandle,
   SessionRegistry,
-  SessionPhase,
   SessionSnapshot,
   SessionSource,
 } from '@natsail/session'
@@ -344,7 +344,9 @@ export function useNatsJetStreamReducerSelector<State, Selected>(
 }
 
 export interface NatsJetStreamProcessorSnapshot {
-  phase: SessionPhase
+  phase: JetStreamProcessorPhase
+  /** Number of package-owned processor restarts. */
+  restarts: number
   error?: unknown
 }
 
@@ -360,6 +362,7 @@ export function useNatsJetStreamProcessor<T>(
   const { runtime } = useRequiredContext()
   const optionsRef = useRef(options)
   const handlerRef = useRef(handler)
+  const closingRef = useRef<Promise<void>>(Promise.resolve())
   optionsRef.current = options
   handlerRef.current = handler
   const [active, setActive] = useState<{
@@ -369,50 +372,80 @@ export function useNatsJetStreamProcessor<T>(
 
   useEffect(() => {
     let cancelled = false
+    let lease: JetStreamProcessorLease | undefined
+    let unsubscribe: () => void = () => undefined
+
     if (optionsRef.current === null) {
-      setActive({ key, snapshot: { phase: 'closed' } })
-      return () => {
-        cancelled = true
-      }
-    }
-    setActive({ key, snapshot: { phase: 'connecting' } })
-    let lease: SubscriptionLease
-    try {
-      lease = processJetStream(runtime, optionsRef.current, (delivery) =>
-        handlerRef.current(delivery)
-      )
-    } catch (error) {
-      setActive({ key, snapshot: { phase: 'error', error } })
+      setActive({ key, snapshot: { phase: 'closed', restarts: 0 } })
       return () => {
         cancelled = true
       }
     }
 
-    void lease.ready.then(
-      () => {
-        if (!cancelled) setActive({ key, snapshot: { phase: 'live' } })
-      },
-      (error) => {
-        if (!cancelled) setActive({ key, snapshot: { phase: 'error', error } })
+    setActive({ key, snapshot: { phase: 'connecting', restarts: 0 } })
+
+    const previousClose = closingRef.current
+    const start = async () => {
+      await previousClose
+      if (cancelled || optionsRef.current === null) return
+
+      try {
+        lease = processJetStream(runtime, optionsRef.current, (delivery) =>
+          handlerRef.current(delivery)
+        )
+      } catch (error) {
+        setActive({
+          key,
+          snapshot: { phase: 'error', restarts: 0, error },
+        })
+        return
       }
-    )
-    void lease.closed.then(
-      () => {
-        if (!cancelled) setActive({ key, snapshot: { phase: 'closed' } })
-      },
-      (error) => {
-        if (!cancelled) setActive({ key, snapshot: { phase: 'error', error } })
+
+      const activeLease = lease
+      const updateSnapshot = () => {
+        if (cancelled) return
+        const inspection = activeLease.inspect()
+        setActive({
+          key,
+          snapshot: {
+            phase: inspection.phase,
+            restarts: inspection.restarts,
+            ...(inspection.error === undefined ? {} : { error: inspection.error }),
+          },
+        })
       }
-    )
+      unsubscribe = activeLease.subscribe(updateSnapshot)
+      updateSnapshot()
+
+      void activeLease.ready.then(updateSnapshot, (error) => {
+        if (!cancelled) {
+          setActive({
+            key,
+            snapshot: { phase: 'error', restarts: activeLease.inspect().restarts, error },
+          })
+        }
+      })
+      void activeLease.closed.then(updateSnapshot, (error) => {
+        if (!cancelled) {
+          setActive({
+            key,
+            snapshot: { phase: 'error', restarts: activeLease.inspect().restarts, error },
+          })
+        }
+      })
+    }
+
+    void start()
 
     return () => {
       cancelled = true
-      void lease.close().catch(() => undefined)
+      unsubscribe()
+      if (lease) closingRef.current = lease.close().catch(() => undefined)
     }
   }, [key, options !== null, runtime])
 
-  if (options === null) return { phase: 'closed' }
-  return active?.key === key ? active.snapshot : { phase: 'connecting' }
+  if (options === null) return { phase: 'closed', restarts: 0 }
+  return active?.key === key ? active.snapshot : { phase: 'connecting', restarts: 0 }
 }
 
 /** Selects state from one registry-shared checkpointed JetStream session. */

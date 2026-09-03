@@ -237,6 +237,7 @@ const processor = processJetStream(
     ackWaitMs: 60_000,
     maxDeliver: 10,
     maxAckPending: 64,
+    recovery: { delayMs: 500 },
     codec: natsCodecs.json<BillingJob>(),
   },
   async ({ value, deliveryAttempt }) => {
@@ -247,7 +248,7 @@ const processor = processJetStream(
 await processor.ready
 ```
 
-The processor acknowledges a message after its handler succeeds. A failed handler leaves the message available for server redelivery.
+The processor acknowledges a message after its handler succeeds. A failed handler leaves the message available for server redelivery. With `recovery` enabled, NATSail reopens the same named consumer after infrastructure failures and exposes `reconnecting` plus a restart count through the processor lease.
 
 ## Run the examples
 

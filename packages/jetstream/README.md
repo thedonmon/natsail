@@ -61,7 +61,11 @@ The same `codec` option works with `processJetStream()`. Supply any `NatsPayload
 
 `processJetStream()` is the work-processing seam. `ensure` creates or reuses a retained named pull consumer, `bind` validates and attaches to an existing consumer, and `owned` deletes its named consumer before the lease closes. Every mode requires `AckPolicy.Explicit`; the package acknowledges only after the handler succeeds. Existing consumers must match the requested filter, start position, and any explicitly supplied acknowledgement or replay settings. A mismatch fails with `JetStreamProcessorConfigurationError` instead of consuming under a different server contract.
 
-Configure `ackWaitMs`, `maxDeliver` (`-1` means unlimited), `maxAckPending`, replay policy, start position, and pull-buffer capacity. Invalid policies fail before a connection is acquired. A failed handler stops the lease without acknowledging its delivery, allowing server redelivery when the consumer is rebound or restarted.
+Set `recovery` to reopen the same named consumer after a connection or consumer-loop failure. When the named consumer is retained, its server-side acknowledgement floor determines where processing resumes, so acknowledged work stays complete and an interrupted delivery remains eligible for redelivery. If an `ensure` or `owned` consumer was deleted on the server, NATSail recreates it from the configured start position; handlers should therefore remain idempotent. Handler and decoder failures are terminal and are not hidden by infrastructure retries. An `owned` recovering processor uses a retained consumer during recovery and deletes it only when the logical lease closes.
+
+The processor lease exposes `inspect()` and `subscribe()`. Its phase is `connecting`, `live`, `reconnecting`, `closed`, or `error`, and its inspection includes the package-owned restart count.
+
+Configure `ackWaitMs`, `maxDeliver` (`-1` means unlimited), `maxAckPending`, replay policy, start position, pull-buffer capacity, and recovery attempts or delay. Invalid policies fail before a connection is acquired. A failed handler stops the lease without acknowledging its delivery, allowing server redelivery when the consumer is rebound or restarted.
 
 Use `maxBufferedMessages` or `maxBufferedBytes` to bound the nats.js pull loop. These modes are mutually exclusive. The runtime reserves the selected capacity before it opens the consumer.
 

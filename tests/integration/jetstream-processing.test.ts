@@ -278,6 +278,58 @@ describe('managed explicit-ack JetStream processing', () => {
     await expect(manager.consumers.info(stream, consumerName)).rejects.toThrow()
   })
 
+  it('recreates a deleted owned consumer and deletes it when the runtime closes', async () => {
+    const adminConnection = await connectToTestNats()
+    const runtimeConnection = await connectToTestNats()
+    const manager = await jetstreamManager(adminConnection)
+    const client = jetstream(adminConnection)
+    const stream = `PROCESS_${crypto.randomUUID().replaceAll('-', '_').toUpperCase()}`
+    const consumerName = `processor_${crypto.randomUUID().replaceAll('-', '_')}`
+    const subject = uniqueSubject('processing-recovery')
+
+    await manager.streams.add({ name: stream, subjects: [subject], storage: StorageType.Memory })
+    const runtime = createNatsRuntime({ connect: async () => runtimeConnection })
+    closeAfterTest.push(async () => {
+      await runtime.close()
+      await manager.streams.delete(stream)
+      await adminConnection.drain()
+    })
+    const received: string[] = []
+    const lease = processJetStream(
+      runtime,
+      {
+        stream,
+        consumer: { mode: 'owned', name: consumerName },
+        filter: subject,
+        start: 'new',
+        recovery: { maxAttempts: 5, delayMs: 10 },
+        codec: natsCodecs.text,
+      },
+      ({ value }) => {
+        received.push(value)
+      }
+    )
+
+    await lease.ready
+    const first = await client.publish(subject, 'one')
+    await expect.poll(() => received).toEqual(['one'])
+    await expect
+      .poll(async () => (await manager.consumers.info(stream, consumerName)).ack_floor.stream_seq)
+      .toBe(first.seq)
+
+    await manager.consumers.delete(stream, consumerName)
+    await expect.poll(() => lease.inspect().restarts, { timeout: 10_000 }).toBeGreaterThan(0)
+    await expect.poll(() => lease.inspect().phase, { timeout: 10_000 }).toBe('live')
+    await expect(manager.consumers.info(stream, consumerName)).resolves.toBeDefined()
+
+    await client.publish(subject, 'two')
+    await expect.poll(() => received, { timeout: 10_000 }).toEqual(['one', 'two'])
+
+    await runtime.close()
+    await expect(lease.closed).resolves.toBeUndefined()
+    await expect(manager.consumers.info(stream, consumerName)).rejects.toThrow()
+  }, 20_000)
+
   it('applies the supported durable-consumer delivery and redelivery configuration', async () => {
     const adminConnection = await connectToTestNats()
     const runtimeConnection = await connectToTestNats()

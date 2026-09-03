@@ -44,6 +44,10 @@ Consumer ownership has three modes:
 
 NATSail checks an existing consumer against the requested filter and start position. It also checks each supplied acknowledgement or replay setting.
 
+Set `recovery` to reopen the named consumer after an infrastructure failure. When that consumer is retained, recovery uses its server-side acknowledgement floor: acknowledged messages remain complete, and an interrupted unacknowledged message remains eligible for redelivery. If an `ensure` or `owned` consumer was deleted on the server, it is recreated from the configured start position and previously handled messages can appear again. Handler, decoder, and consumer-contract failures stay terminal.
+
+An `owned` recovering processor retains its named consumer between attempts and deletes it when the logical processor lease closes.
+
 ## Duplicate and retention policy
 
 An incoming sequence at or behind the application cursor is a duplicate. The default `duplicateDeliveryPolicy` is `drop`.
@@ -69,6 +73,8 @@ A fresh reducing session rebuilds its state from the retained stream. Persisted 
 The runtime replaces a permanently closed connection by default. Its event stream remains active until `runtime.close()` completes.
 
 Shared JetStream sources can use package-owned consumer recovery. Recovery starts after the last successfully processed cursor.
+
+Named explicit-ack processors can also use package-owned recovery. They resume from the server acknowledgement floor instead of an application checkpoint.
 
 Configuration, decode, retention-gap, duplicate-policy, and application-handler failures remain terminal by default.
 
