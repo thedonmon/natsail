@@ -17,13 +17,16 @@ import type { JetStreamStateSnapshot } from '@natsail/jetstream'
 function controllableSource<T>(): {
   source: SessionSource<T>
   deliver(value: T): Promise<void>
+  fail(error: unknown): void
   close: ReturnType<typeof vi.fn<() => Promise<void>>>
   starts: ReturnType<typeof vi.fn<SessionSource<T>>>
 } {
   let accept!: (value: T) => Promise<void>
   let closeSession!: () => void
-  const closed = new Promise<void>((resolve) => {
+  let failSession!: (error: unknown) => void
+  const closed = new Promise<void>((resolve, reject) => {
     closeSession = resolve
+    failSession = reject
   })
   const close = vi.fn(async () => closeSession())
   const lease: SubscriptionLease = {
@@ -39,6 +42,7 @@ function controllableSource<T>(): {
   return {
     source: starts,
     deliver: (value) => accept(value),
+    fail: (error) => failSession(error),
     close,
     starts,
   }
@@ -399,6 +403,74 @@ describe('RxJS session adapter', () => {
       expect(rendered).toEqual([0, 217, 434])
 
       subscription.unsubscribe()
+      await registry.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('applies shared count and byte bounds to cumulative live presentation', async () => {
+    const registry = createSessionRegistry()
+    const controlled = controllableSource<JetStreamStateSnapshot<number>>()
+    const definition = defineSession({
+      key: 'conversation:rxjs-shared-policy',
+      contract: 'conversation:v1',
+      source: controlled.source,
+    })
+    const states: number[] = []
+    const subscription = observeNatsJetStreamState(registry, definition, {
+      batchPolicy: { maxItems: 2, maxBytes: 2, sizeOf: () => 1 },
+    }).subscribe((state) => states.push(state.data))
+    await Promise.resolve()
+
+    for (const data of [1, 2, 3]) {
+      await controlled.deliver({
+        phase: 'live',
+        data,
+        restarts: 0,
+        replay: { delivered: 0, remaining: 0 },
+      })
+    }
+
+    expect(states).toEqual([1, 3])
+    subscription.unsubscribe()
+    await registry.close()
+  })
+
+  it('discards a pending live partial when the source fails', async () => {
+    vi.useFakeTimers()
+    try {
+      const registry = createSessionRegistry()
+      const controlled = controllableSource<JetStreamStateSnapshot<number>>()
+      const definition = defineSession({
+        key: 'conversation:rxjs-abnormal-batch',
+        contract: 'conversation:v1',
+        source: controlled.source,
+      })
+      const states: number[] = []
+      let failure: unknown
+      observeNatsJetStreamState(registry, definition, { liveBatchMs: 16 }).subscribe({
+        next: (state) => states.push(state.data),
+        error: (error) => (failure = error),
+      })
+      await Promise.resolve()
+      await controlled.deliver({
+        phase: 'live',
+        data: 1,
+        restarts: 0,
+        replay: { delivered: 0, remaining: 0 },
+      })
+      await controlled.deliver({
+        phase: 'live',
+        data: 2,
+        restarts: 0,
+        replay: { delivered: 0, remaining: 0 },
+      })
+      controlled.fail(new Error('source failed'))
+      await Promise.resolve()
+
+      expect(states).toEqual([1])
+      expect(failure).toMatchObject({ message: 'source failed' })
       await registry.close()
     } finally {
       vi.useRealTimers()

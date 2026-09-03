@@ -18,13 +18,21 @@ import {
   type StreamCheckpoint,
 } from '@natsail/checkpoints'
 import {
+  createNatsailBatcher,
+  createNatsailWorkController,
+  defineNatsailBatchPolicy,
+  natsailDefaultScheduler,
   NATS_RUNTIME_ADAPTER,
+  type NatsailBatchPolicy,
+  type NatsailBatcher,
+  type NatsailScheduler,
   type NatsPayloadCodec,
   type NatsailTelemetryAttributes,
   type NatsailTelemetryCounterName,
   type NatsailTelemetryDurationName,
   type NatsailTelemetryGaugeName,
   type NatsailTelemetryReporter,
+  type NatsailWorkBudget,
   type NatsRuntime,
   type NatsRuntimeDiagnostic,
   type SubscriptionLease,
@@ -156,6 +164,14 @@ export type JetStreamSessionSourceOptions<T> = JetStreamSubscriptionOptions<T> &
 export type ReducingJetStreamSessionOptions<T> = JetStreamSubscriptionOptions<T> & {
   readonly resume?: never
   recovery?: JetStreamSessionRecoveryOptions
+  /** Shared delivery bounds used by batch-capable materializers and adapters. */
+  batchPolicy?: NatsailBatchPolicy<JetStreamDelivery<T>>
+  /** Legacy-friendly live time-window override. Defaults to 16ms; use 0 to disable time flushes. */
+  liveBatchMs?: number
+  /** Timer and monotonic clock for state batching when the default host scheduler is unsuitable. */
+  scheduler?: NatsailScheduler
+  /** Cooperative serial reducer time slice. */
+  workBudget?: NatsailWorkBudget
 }
 
 export type JetStreamStatePhase = 'replaying' | 'live' | 'reconnecting'
@@ -572,6 +588,15 @@ function reportConsumerBufferSignal(
   })
 }
 
+interface JetStreamBatchHandlerControl {
+  flush(): Promise<void>
+  backpressure(): Promise<void> | undefined
+  pendingItems(): number
+  barrier(commit: Promise<void>): void
+  settled(): Promise<void>
+  cancel(): void
+}
+
 class JetStreamSubscription<T> implements JetStreamLease<T> {
   readonly ready: Promise<void>
   readonly closed: Promise<void>
@@ -594,11 +619,13 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
   private error?: unknown
   private readonly telemetry: NatsailTelemetryReporter
   private readonly replayStartedAt: number
+  private batchSettlement = Promise.resolve()
 
   constructor(
     runtime: NatsRuntime,
     private readonly options: JetStreamSubscriptionOptions<T>,
-    private readonly handler: JetStreamHandler<T>
+    private readonly handler: JetStreamHandler<T>,
+    private readonly batchControl?: JetStreamBatchHandlerControl
   ) {
     this.telemetry = runtime[NATS_RUNTIME_ADAPTER].telemetry
     this.replayStartedAt = this.telemetry.enabled ? this.telemetry.now() : 0
@@ -630,10 +657,13 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
   async close(): Promise<void> {
     if (!this.closeRequested) {
       this.closeRequested = true
+      this.batchControl?.cancel()
       if (!this.caughtUpSettled) this.rejectCaughtUp(new JetStreamCatchUpCancelledError())
       if (this.messages) {
         await this.messages.close()
       }
+      await this.batchControl?.settled()
+      await this.batchSettlement
     }
 
     return this.closed
@@ -742,9 +772,14 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
       this.resolveReady()
       if (this.initialPending === 0) this.resolveCaughtUp(startingCursor)
 
+      let assignedInitial = 0
+      let pendingApplications = Promise.resolve()
+      let lastApplication = Promise.resolve()
+      let applicationFailure: unknown
       for await (const message of this.messages) {
         const sequence = message.info.streamSequence
-        const replay = this.remaining > 0 ? 'initial' : 'live'
+        const replay = assignedInitial < this.initialPending ? 'initial' : 'live'
+        if (replay === 'initial') assignedInitial += 1
         recordCounter(this.telemetry, 'natsail.jetstream.deliveries', 1, {
           delivery: replay,
           redelivered: message.redelivered,
@@ -755,6 +790,9 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
           const policy = this.options.duplicateDeliveryPolicy ?? 'drop'
           if (policy === 'drop') {
             this.advanceInitialReplay()
+            if (replay === 'initial' && assignedInitial === this.initialPending) {
+              await this.batchControl?.flush()
+            }
             continue
           }
           if (policy === 'error') {
@@ -767,50 +805,100 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
           ...(streamEpoch === undefined ? {} : { epoch: streamEpoch }),
           sequence,
         }
+        const delivery: JetStreamDelivery<T> = {
+          value: decodeJetStreamPayload(this.options, message),
+          subject: message.subject,
+          cursor,
+          duplicate,
+          redelivered: message.redelivered,
+          consumerPending: message.info.pending,
+          replay,
+        }
         const handlerStartedAt = this.telemetry.enabled ? this.telemetry.now() : 0
-        try {
-          await this.handler({
-            value: decodeJetStreamPayload(this.options, message),
-            subject: message.subject,
-            cursor,
-            duplicate,
-            redelivered: message.redelivered,
-            consumerPending: message.info.pending,
-            replay,
-          })
-        } catch (error) {
+        const handleDelivery = async () => {
+          try {
+            await this.handler(delivery)
+          } catch (error) {
+            recordDuration(this.telemetry, 'natsail.jetstream.handler.duration', handlerStartedAt, {
+              delivery: replay,
+              operation: 'ordered-handler',
+              outcome: 'failure',
+              source: 'jetstream',
+            })
+            markApplicationDeliveryFailure(error)
+          }
           recordDuration(this.telemetry, 'natsail.jetstream.handler.duration', handlerStartedAt, {
             delivery: replay,
             operation: 'ordered-handler',
-            outcome: 'failure',
+            outcome: 'success',
             source: 'jetstream',
           })
-          markApplicationDeliveryFailure(error)
         }
-        recordDuration(this.telemetry, 'natsail.jetstream.handler.duration', handlerStartedAt, {
-          delivery: replay,
-          operation: 'ordered-handler',
-          outcome: 'success',
-          source: 'jetstream',
-        })
 
-        this.cursor = cursor
-        this.advanceInitialReplay(cursor)
-
-        if (!duplicate) {
-          committedSequence = cursor.sequence
-        }
-        if (!duplicate && this.options.resume && streamEpoch) {
-          checkpoint = {
-            stream: this.options.stream,
-            epoch: streamEpoch,
-            sequence: cursor.sequence,
-            ...(streamScope === undefined ? {} : { scope: streamScope }),
+        const commitDelivery = async (handled?: Promise<void>) => {
+          await handled
+          if (!duplicate && this.options.resume && streamEpoch) {
+            checkpoint = {
+              stream: this.options.stream,
+              epoch: streamEpoch,
+              sequence: cursor.sequence,
+              ...(streamScope === undefined ? {} : { scope: streamScope }),
+            }
+            try {
+              await measureCheckpoint(this.telemetry, 'save', () =>
+                this.options.resume!.store.save(this.options.resume!.key, checkpoint!)
+              )
+            } catch (error) {
+              markApplicationDeliveryFailure(error)
+            }
           }
-          await measureCheckpoint(this.telemetry, 'save', () =>
-            this.options.resume!.store.save(this.options.resume!.key, checkpoint!)
-          )
+          this.cursor = cursor
+          this.advanceInitialReplay(cursor)
+          if (!duplicate) committedSequence = cursor.sequence
         }
+
+        if (this.batchControl) {
+          const previousApplication = lastApplication
+          const handled = handleDelivery()
+          const application = pendingApplications.then(() => commitDelivery(handled))
+          lastApplication = application
+          pendingApplications = application.catch((error) => {
+            applicationFailure ??= error
+            void this.messages?.close().catch(() => undefined)
+          })
+          this.batchSettlement = pendingApplications
+          if (replay === 'initial' && assignedInitial === this.initialPending) {
+            await this.batchControl.flush()
+            this.batchControl.barrier(application)
+            await this.batchControl.backpressure()
+            await application.catch(() => undefined)
+            if (applicationFailure !== undefined) throw applicationFailure
+          } else {
+            const backpressure = this.batchControl.backpressure()
+            if (backpressure) {
+              const commit =
+                this.batchControl.pendingItems() === 0 ? application : previousApplication
+              this.batchControl.barrier(commit)
+              await this.batchControl.backpressure()
+              await commit.catch(() => undefined)
+              if (applicationFailure !== undefined) throw applicationFailure
+            }
+          }
+        } else {
+          await handleDelivery()
+          await commitDelivery()
+        }
+      }
+
+      if (this.batchControl && !this.closeRequested) {
+        await this.batchControl.flush()
+        this.batchControl.barrier(lastApplication)
+        await this.batchControl.backpressure()
+        await lastApplication.catch(() => undefined)
+        if (applicationFailure !== undefined) throw applicationFailure
+      } else if (this.batchControl) {
+        await this.batchControl.settled()
+        await this.batchSettlement
       }
 
       const messageError = await this.messages.closed()
@@ -821,6 +909,7 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
       this.setPhase('closed')
       this.closedState.resolve()
     } catch (error) {
+      this.batchControl?.cancel()
       this.error = error
       this.setPhase('error')
       if (!this.readySettled) {
@@ -1509,6 +1598,28 @@ export function consumeJetStream<T>(
   ) as JetStreamLease<T>
 }
 
+function consumeJetStreamBatched<T>(
+  runtime: NatsRuntime,
+  options: JetStreamSubscriptionOptions<T>,
+  handler: JetStreamHandler<T>,
+  control: JetStreamBatchHandlerControl
+): JetStreamLease<T> {
+  validateJetStreamDecoder(options, 'JetStream subscription')
+  validateStart(options.start)
+  validateBufferOptions(options)
+  const maxBufferedMessages =
+    options.maxBufferedMessages ?? (options.maxBufferedBytes === undefined ? 32 : 0)
+  const maxBufferedBytes = options.maxBufferedBytes ?? 0
+  return runtime[NATS_RUNTIME_ADAPTER].manage(
+    () => new JetStreamSubscription(runtime, options, handler, control),
+    {
+      jetStreamConsumers: 1,
+      bufferedMessages: maxBufferedMessages,
+      bufferedBytes: maxBufferedBytes,
+    }
+  ) as JetStreamLease<T>
+}
+
 /** Processes one named pull consumer and acknowledges each message after its handler succeeds. */
 export function processJetStream<T>(
   runtime: NatsRuntime,
@@ -1629,7 +1740,8 @@ class RecoveringJetStreamLease<T> implements JetStreamLease<T> {
     private readonly runtime: NatsRuntime,
     private readonly options: JetStreamSubscriptionOptions<T>,
     private readonly recovery: JetStreamSessionRecoveryOptions,
-    private readonly handler: JetStreamHandler<T>
+    private readonly handler: JetStreamHandler<T>,
+    private readonly open?: () => JetStreamLease<T>
   ) {
     this.ready = this.readyState.promise
     this.closed = this.closedState.promise
@@ -1669,7 +1781,7 @@ class RecoveringJetStreamLease<T> implements JetStreamLease<T> {
     try {
       while (!this.closeRequested) {
         attempt += 1
-        const lease = consumeJetStream(this.runtime, this.options, this.handler)
+        const lease = this.open?.() ?? consumeJetStream(this.runtime, this.options, this.handler)
         this.active = lease
         this.unsubscribeActive = lease.subscribe(() => {
           this.lastInspection = lease.inspect()
@@ -1909,6 +2021,25 @@ export interface JetStreamStateReducer<Value, State> {
   readonly reduce: SessionReducer<JetStreamDelivery<Value>, State>
 }
 
+function reducingBatchPolicy<T>(
+  options: ReducingJetStreamSessionOptions<T>
+): Readonly<NatsailBatchPolicy<JetStreamDelivery<T>>> {
+  if (
+    options.liveBatchMs !== undefined &&
+    (!Number.isFinite(options.liveBatchMs) || options.liveBatchMs < 0)
+  ) {
+    throw new TypeError('JetStream liveBatchMs must be a finite non-negative number')
+  }
+  const { maxWaitMs: configuredMaxWaitMs, ...policy } = options.batchPolicy ?? {}
+  return defineNatsailBatchPolicy({
+    ...policy,
+    maxItems: options.batchPolicy?.maxItems ?? 256,
+    ...(options.liveBatchMs === 0
+      ? {}
+      : { maxWaitMs: options.liveBatchMs ?? configuredMaxWaitMs ?? 16 }),
+  })
+}
+
 /**
  * Builds initial state silently, publishes it once when replay catches up, and
  * then publishes every serially reduced live state through the shared session.
@@ -1924,14 +2055,26 @@ export function createReducingJetStreamSessionSource<Value, State>(
       'A reducing JetStream session cannot resume an event cursor without restoring matching materialized state'
     )
   }
+  const batchPolicy = reducingBatchPolicy(options)
 
   return (accept) => {
     // Create the memory checkpoint with each logical source lease. It survives
     // package-owned retries, but a registry restart rebuilds state from replay.
-    const source = createJetStreamSessionSource(runtime, {
-      ...options,
-      recovery: options.recovery ?? {},
-    })
+    const {
+      batchPolicy: _batchPolicy,
+      liveBatchMs: _liveBatchMs,
+      scheduler: _scheduler,
+      workBudget: _workBudget,
+      recovery = {},
+      ...subscriptionOptions
+    } = options
+    const effectiveOptions: JetStreamSubscriptionOptions<Value> = {
+      ...subscriptionOptions,
+      resume: {
+        key: 'logical-session',
+        store: createMemoryCheckpointStore(),
+      },
+    }
     let state = reducer.initial()
     let hydrated = false
     let cursor: StreamCursor | undefined
@@ -1939,6 +2082,14 @@ export function createReducingJetStreamSessionSource<Value, State>(
     let restarts = 0
     let publishedPhase: JetStreamStatePhase = 'replaying'
     let pending = Promise.resolve()
+    const work =
+      options.workBudget === undefined
+        ? undefined
+        : createNatsailWorkController(
+            options.workBudget,
+            runtime[NATS_RUNTIME_ADAPTER].telemetry,
+            'jetstream'
+          )
 
     const snapshot = (phase: JetStreamStatePhase): JetStreamStateSnapshot<State> => ({
       phase,
@@ -1952,33 +2103,63 @@ export function createReducingJetStreamSessionSource<Value, State>(
     })
     const publish = (phase: JetStreamStatePhase) => {
       publishedPhase = phase
-      const update = pending.then(() => accept(snapshot(phase)))
+      const value = snapshot(phase)
+      const update = pending.then(() => accept(value))
       pending = update.catch(() => undefined)
       return update
     }
 
     void publish('replaying')
-    const lease = source((delivery) => {
-      const update = pending.then(async () => {
-        state = await reducer.reduce(state, delivery)
-        cursor = delivery.cursor
-        if (!hydrated) replayDelivered += 1
+    const batcher: NatsailBatcher<JetStreamDelivery<Value>> = createNatsailBatcher(
+      batchPolicy,
+      async (deliveries) => {
+        work?.reset()
+        let nextState = state
+        let nextCursor = cursor
+        let nextReplayDelivered = replayDelivered
+        for (const delivery of deliveries) {
+          nextState = await reducer.reduce(nextState, delivery)
+          await work?.checkpoint()
+          nextCursor = delivery.cursor
+          if (!hydrated) nextReplayDelivered += 1
+        }
+        state = nextState
+        cursor = nextCursor
+        replayDelivered = nextReplayDelivered
         if (hydrated) {
           const leasePhase = lease.inspect().phase
-          await accept(
-            snapshot(
-              leasePhase === 'connecting' ||
-                leasePhase === 'replaying' ||
-                leasePhase === 'reconnecting'
-                ? 'reconnecting'
-                : 'live'
-            )
+          await publish(
+            leasePhase === 'connecting' ||
+              leasePhase === 'replaying' ||
+              leasePhase === 'reconnecting'
+              ? 'reconnecting'
+              : 'live'
           )
         }
-      })
-      pending = update.catch(() => undefined)
-      return update
-    }) as JetStreamLease<Value>
+      },
+      {
+        scheduler: options.scheduler ?? natsailDefaultScheduler,
+        telemetry: runtime[NATS_RUNTIME_ADAPTER].telemetry,
+        source: 'jetstream',
+      }
+    )
+    const handle = (delivery: JetStreamDelivery<Value>) => batcher.add(delivery)
+    const control: JetStreamBatchHandlerControl = {
+      flush: () => batcher.flush(),
+      backpressure: () => batcher.backpressure(),
+      pendingItems: () => batcher.pendingItems(),
+      barrier: (commit) => batcher.barrier(commit),
+      settled: () => batcher.settled(),
+      cancel: () => batcher.cancel(),
+    }
+    const open = () => consumeJetStreamBatched(runtime, effectiveOptions, handle, control)
+    const lease = new RecoveringJetStreamLease(
+      runtime,
+      effectiveOptions,
+      recovery,
+      handle,
+      open
+    ) as JetStreamLease<Value>
 
     const unsubscribe = lease.subscribe(() => {
       const inspection = lease.inspect()
@@ -2011,7 +2192,10 @@ export function createReducingJetStreamSessionSource<Value, State>(
       ready,
       caughtUp,
       closed: lease.closed,
-      close: () => lease.close(),
+      close: () => {
+        batcher.cancel()
+        return lease.close()
+      },
       inspect: () => lease.inspect(),
       subscribe: (listener) => lease.subscribe(listener),
     } satisfies JetStreamLease<Value>
@@ -2031,9 +2215,16 @@ export function defineReducingJetStreamSession<Value, State>(
     )
   }
   const effectiveOptions = { ...options, recovery: options.recovery ?? {} }
+  const resolvedBatchPolicy = reducingBatchPolicy(options)
+  const batchContract = {
+    maxItems: resolvedBatchPolicy.maxItems ?? null,
+    maxBytes: resolvedBatchPolicy.maxBytes ?? null,
+    maxWaitMs: resolvedBatchPolicy.maxWaitMs ?? null,
+  }
+  const workContract = options.workBudget ? { yieldAfterMs: options.workBudget.yieldAfterMs } : null
   return defineSession({
     key,
-    contract: `${sessionContract(effectiveOptions)}|reducer:${reducer.scope}`,
+    contract: `${sessionContract(effectiveOptions)}|reducer:${reducer.scope}|batch:${JSON.stringify(batchContract)}|work:${JSON.stringify(workContract)}`,
     source: createReducingJetStreamSessionSource(runtime, effectiveOptions, reducer),
   })
 }

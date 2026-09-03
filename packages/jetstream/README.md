@@ -39,6 +39,8 @@ The reduced snapshot reports `replaying`, `reconnecting`, or `live`, the last cu
 
 A reducing session does not accept `resume` yet. An event cursor is safe only when the matching materialized reducer state is restored atomically with it. Package-owned recovery preserves both within the active source lease; a fresh lease reconstructs state from an atomic replay.
 
+Reducing sessions accept the shared `batchPolicy`, `scheduler`, and `workBudget`. They rebuild replay in bounded batches but expose one atomic hydration commit. After catch-up, the default live policy is 256 deliveries or 16ms; `liveBatchMs: 0` disables the time window. Count and byte bounds remain hard intake limits. Only one batch may apply at once, reducer calls stay serial, and cursor/checkpoint advancement waits for successful downstream batch publication. Closing waits for an in-flight batch and discards a pending partial batch.
+
 Normal consumers select a package-owned payload codec instead of constructing text encoders or decoders:
 
 ```ts

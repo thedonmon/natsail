@@ -13,10 +13,13 @@ import {
 
 import type {
   CoreSubscriptionOptions,
+  NatsailBatchPolicy,
+  NatsailScheduler,
   NatsConnection,
   NatsRuntime,
   NatsRuntimeStatusEvent,
 } from '@natsail/core'
+import { defineNatsailBatchPolicy } from '@natsail/core'
 import {
   createJetStreamSessionSource,
   processJetStream,
@@ -79,9 +82,13 @@ export interface NatsManagedProviderProps {
 
 export type SessionNotificationMode = 'immediate' | 'microtask' | 'animation-frame'
 
-export interface NatsJetStreamReducerOptions {
+export interface NatsJetStreamReducerOptions<State = unknown> {
   /** React notification scheduling. Every delivery is still reduced serially. */
   notifications?: SessionNotificationMode
+  /** Optional shared count/byte/time bounds for cumulative live notifications. */
+  batchPolicy?: NatsailBatchPolicy<JetStreamStateSnapshot<State>>
+  /** Host scheduler for deterministic time-bounded notifications. */
+  scheduler?: NatsailScheduler
 }
 
 type ActiveSession<T> = {
@@ -316,14 +323,20 @@ export function useNatsJetStreamSubscription<T>(
 /** Renders one validated atomic replay/live reduced JetStream session. */
 export function useNatsJetStreamReducer<State>(
   definition: SessionDefinition<JetStreamStateSnapshot<State>>,
-  options: NatsJetStreamReducerOptions = {}
+  options: NatsJetStreamReducerOptions<State> = {}
 ): SessionSnapshot<JetStreamStateSnapshot<State>> {
   const resolved = useResolvedSession(definition)
+  const batchPolicy = useMemo(
+    () => (options.batchPolicy ? defineNatsailBatchPolicy(options.batchPolicy) : undefined),
+    [options.batchPolicy]
+  )
   return useSessionSelection(
     resolved,
     selectSnapshot,
     Object.is,
-    options.notifications ?? 'animation-frame'
+    options.notifications ?? 'animation-frame',
+    batchPolicy,
+    options.scheduler
   )
 }
 
@@ -332,14 +345,20 @@ export function useNatsJetStreamReducerSelector<State, Selected>(
   definition: SessionDefinition<JetStreamStateSnapshot<State>>,
   selector: (snapshot: SessionSnapshot<JetStreamStateSnapshot<State>>) => Selected,
   isEqual: (previous: Selected, next: Selected) => boolean = Object.is,
-  options: NatsJetStreamReducerOptions = {}
+  options: NatsJetStreamReducerOptions<State> = {}
 ): Selected {
   const resolved = useResolvedSession(definition)
+  const batchPolicy = useMemo(
+    () => (options.batchPolicy ? defineNatsailBatchPolicy(options.batchPolicy) : undefined),
+    [options.batchPolicy]
+  )
   return useSessionSelection(
     resolved,
     selector,
     isEqual,
-    options.notifications ?? 'animation-frame'
+    options.notifications ?? 'animation-frame',
+    batchPolicy,
+    options.scheduler
   )
 }
 
@@ -602,7 +621,9 @@ function useSessionSelection<T, Selected>(
   { registry, key, contract, source }: ResolvedSession<T>,
   selector: (snapshot: SessionSnapshot<T>) => Selected,
   isEqual: (previous: Selected, next: Selected) => boolean = Object.is,
-  notifications: SessionNotificationMode = 'immediate'
+  notifications: SessionNotificationMode = 'immediate',
+  batchPolicy?: NatsailBatchPolicy<T>,
+  batchScheduler?: NatsailScheduler
 ): Selected {
   const handle = useSessionHandle(registry, key, contract, source)
   const selectorRef = useRef(selector)
@@ -640,13 +661,81 @@ function useSessionSelection<T, Selected>(
       let cancelled = false
       let scheduled = false
       let cancelScheduled: (() => void) | undefined
-      const notify = () => {
-        if (notifications === 'immediate') {
+      let pendingCount = 0
+      let pendingBytes = 0
+      let previousValuePhase = cumulativeStatePhase(getSnapshot().value)
+      const notify = (immediate: boolean, snapshot: SessionSnapshot<T>) => {
+        const valuePhase = cumulativeStatePhase(snapshot.value)
+        const phaseTransition =
+          valuePhase !== undefined &&
+          (valuePhase !== 'live' ||
+            (previousValuePhase !== undefined && valuePhase !== previousValuePhase))
+        previousValuePhase = valuePhase
+        if (notifications === 'immediate' || immediate || phaseTransition) {
+          cancelScheduled?.()
+          scheduled = false
+          cancelScheduled = undefined
+          pendingCount = 0
+          pendingBytes = 0
+          listener()
+          return
+        }
+        pendingCount += 1
+        if (batchPolicy?.maxBytes !== undefined && snapshot.value !== undefined) {
+          const size = batchPolicy.sizeOf!(snapshot.value)
+          if (!Number.isFinite(size) || size < 0) {
+            throw new TypeError('NATSail batch sizeOf must return a finite non-negative number')
+          }
+          if (size > batchPolicy.maxBytes) {
+            throw new RangeError(
+              `NATSail React selection size ${size} exceeds maxBytes ${batchPolicy.maxBytes}`
+            )
+          }
+          if (pendingBytes > 0 && pendingBytes + size > batchPolicy.maxBytes) {
+            cancelScheduled?.()
+            scheduled = false
+            cancelScheduled = undefined
+            pendingCount = 0
+            pendingBytes = 0
+            listener()
+            return
+          }
+          pendingBytes += size
+        }
+        const countReached =
+          batchPolicy?.maxItems !== undefined && pendingCount >= batchPolicy.maxItems
+        const bytesReached =
+          batchPolicy?.maxBytes !== undefined && pendingBytes >= batchPolicy.maxBytes
+        if (countReached || bytesReached) {
+          cancelScheduled?.()
+          scheduled = false
+          cancelScheduled = undefined
+          pendingCount = 0
+          pendingBytes = 0
           listener()
           return
         }
         if (scheduled) return
         scheduled = true
+        if (batchPolicy?.maxWaitMs !== undefined) {
+          const scheduledTask = (
+            batchScheduler ?? {
+              now: () => globalThis.performance?.now() ?? Date.now(),
+              schedule: (task: () => void, delayMs: number) => {
+                const timer = setTimeout(task, delayMs)
+                return { cancel: () => clearTimeout(timer) }
+              },
+              yield: () => Promise.resolve(),
+            }
+          ).schedule(() => {
+            scheduled = false
+            pendingCount = 0
+            pendingBytes = 0
+            if (!cancelled) listener()
+          }, batchPolicy.maxWaitMs)
+          cancelScheduled = () => scheduledTask.cancel()
+          return
+        }
         if (notifications === 'microtask') {
           queueMicrotask(() => {
             scheduled = false
@@ -670,10 +759,11 @@ function useSessionSelection<T, Selected>(
         }
       }
       const unsubscribe = handle.subscribe(() => {
+        const snapshot = getSnapshot()
         const next = getSelection()
         if (!isEqualRef.current(selected, next)) {
           selected = next
-          notify()
+          notify(false, snapshot)
         }
       })
 
@@ -683,10 +773,16 @@ function useSessionSelection<T, Selected>(
         unsubscribe()
       }
     },
-    [getSelection, handle, notifications]
+    [batchPolicy, batchScheduler, getSelection, getSnapshot, handle, notifications]
   )
 
   return useSyncExternalStore(subscribe, getSelection, getSelection)
+}
+
+function cumulativeStatePhase(value: unknown): string | undefined {
+  if (typeof value !== 'object' || value === null || !('phase' in value)) return undefined
+  const phase = (value as { phase?: unknown }).phase
+  return typeof phase === 'string' ? phase : undefined
 }
 
 function useSessionHandle<T>(

@@ -252,6 +252,88 @@ describe('Effect JetStream adapter', () => {
     expect(controlled.close).toHaveBeenCalledOnce()
   })
 
+  it('flushes caught-up state without waiting for the live batch timer', async () => {
+    const controlled = controlledJetStreamSource<number>()
+    const service = makeNatsail({
+      runtime: runtimeStub(),
+      sessions: createSessionRegistry(),
+    })
+    const fiber = Effect.runFork(
+      service
+        .materializeJetStream(
+          sourceOptions,
+          {
+            initial: () => 0,
+            reduceBatch: (state, deliveries) =>
+              Effect.succeed(state + deliveries.reduce((sum, event) => sum + event.value, 0)),
+          },
+          { batchPolicy: { maxItems: 256, maxWaitMs: 60_000 } }
+        )
+        .pipe(Stream.take(2), Stream.runCollect)
+    )
+
+    await vi.waitFor(() => expect(controlled.source).toHaveBeenCalledOnce())
+    await controlled.deliver(delivery(1, 1, 'initial'))
+    controlled.catchUp({ cursor: { stream: 'ORDERS', sequence: 1 }, delivered: 1 })
+    const result = await Promise.race([
+      Effect.runPromise(Fiber.join(fiber)),
+      new Promise<'timer-delayed'>((resolve) => setTimeout(() => resolve('timer-delayed'), 25)),
+    ])
+
+    expect(result).toEqual([
+      { phase: 'replaying', data: 0, replay: { delivered: 0 } },
+      {
+        phase: 'live',
+        data: 1,
+        cursor: { stream: 'ORDERS', sequence: 1 },
+        replay: { delivered: 1 },
+      },
+    ])
+    expect(controlled.close).toHaveBeenCalledOnce()
+  })
+
+  it('partitions materializer work at the shared byte bound', async () => {
+    const controlled = controlledJetStreamSource<number>()
+    const service = makeNatsail({
+      runtime: runtimeStub(),
+      sessions: createSessionRegistry(),
+    })
+    const reduced: number[][] = []
+    const fiber = Effect.runFork(
+      service
+        .materializeJetStream(
+          sourceOptions,
+          {
+            initial: () => 0,
+            reduceBatch: (state, deliveries) =>
+              Effect.sync(() => {
+                reduced.push(deliveries.map((event) => event.value))
+                return state + deliveries.reduce((sum, event) => sum + event.value, 0)
+              }),
+          },
+          { batchPolicy: { maxBytes: 3, sizeOf: () => 2 } }
+        )
+        .pipe(Stream.take(2), Stream.runCollect)
+    )
+
+    await vi.waitFor(() => expect(controlled.source).toHaveBeenCalledOnce())
+    await controlled.deliver(delivery(1, 1, 'initial'))
+    await controlled.deliver(delivery(2, 2, 'initial'))
+    controlled.catchUp({ cursor: { stream: 'ORDERS', sequence: 2 }, delivered: 2 })
+
+    expect(await Effect.runPromise(Fiber.join(fiber))).toEqual([
+      { phase: 'replaying', data: 0, replay: { delivered: 0 } },
+      {
+        phase: 'live',
+        data: 3,
+        cursor: { stream: 'ORDERS', sequence: 2 },
+        replay: { delivered: 2 },
+      },
+    ])
+    expect(reduced).toEqual([[1], [2]])
+    expect(controlled.close).toHaveBeenCalledOnce()
+  })
+
   it('does not complete a processor handler until its Effect succeeds', async () => {
     let processorHandler!: JetStreamProcessorHandler<number>
     const closed = deferred<void>()

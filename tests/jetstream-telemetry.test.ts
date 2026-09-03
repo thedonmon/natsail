@@ -161,7 +161,7 @@ describe('JetStream telemetry', () => {
       expect.objectContaining({
         type: 'duration',
         name: 'natsail.jetstream.replay.duration',
-        durationMs: 7,
+        durationMs: 10,
       })
     )
     expect(

@@ -159,6 +159,7 @@ export type NatsailTelemetryAttributeValue = string | number | boolean
 export type NatsailTelemetryAttributes = Readonly<Record<string, NatsailTelemetryAttributeValue>>
 
 export type NatsailTelemetryCounterName =
+  | 'natsail.batch.flushes'
   | 'natsail.buffer.signals'
   | 'natsail.connection.attempts'
   | 'natsail.connection.transitions'
@@ -168,6 +169,7 @@ export type NatsailTelemetryCounterName =
   | 'natsail.runtime.resource.operations'
   | 'natsail.session.lifecycle'
   | 'natsail.session.references'
+  | 'natsail.work.yields'
 
 export type NatsailTelemetryGaugeName =
   | 'natsail.jetstream.replay.remaining'
@@ -270,6 +272,314 @@ export function createNatsailTelemetryReporter(
       }
     },
   })
+}
+
+/** A cancellable task scheduled against a host-provided clock. */
+export interface NatsailScheduledTask {
+  cancel(): void
+}
+
+/**
+ * The small scheduling surface shared by batching and cooperative reducer work.
+ * Tests and non-browser hosts can replace it without patching global timers.
+ */
+export interface NatsailScheduler {
+  /** Monotonic milliseconds. */
+  now(): number
+  schedule(task: () => void, delayMs: number): NatsailScheduledTask
+  /** Gives other work a turn before reducer processing continues. */
+  yield(): Promise<void>
+}
+
+export const natsailDefaultScheduler: NatsailScheduler = Object.freeze({
+  now: () => globalThis.performance?.now() ?? Date.now(),
+  schedule: (task: () => void, delayMs: number) => {
+    const timer = setTimeout(task, delayMs)
+    return { cancel: () => clearTimeout(timer) }
+  },
+  yield: () => new Promise<void>((resolve) => setTimeout(resolve, 0)),
+})
+
+/** At least one bound must be supplied. Byte bounds require `sizeOf`. */
+export interface NatsailBatchPolicy<T> {
+  readonly maxItems?: number
+  readonly maxBytes?: number
+  readonly maxWaitMs?: number
+  readonly sizeOf?: (value: T) => number
+}
+
+/** Cooperative time slice for serial reducer work. */
+export interface NatsailWorkBudget {
+  readonly yieldAfterMs: number
+  readonly scheduler: NatsailScheduler
+}
+
+export type NatsailBatchFlushReason = 'count' | 'bytes' | 'time' | 'completion' | 'manual'
+
+export class NatsailBatchCancelledError extends Error {
+  readonly name = 'NatsailBatchCancelledError'
+
+  constructor() {
+    super('The NATSail batch was cancelled before its pending values were applied')
+  }
+}
+
+export class NatsailBatchItemTooLargeError extends Error {
+  readonly name = 'NatsailBatchItemTooLargeError'
+
+  constructor(
+    readonly size: number,
+    readonly limit: number
+  ) {
+    super(`NATSail batch item size ${size} exceeds the configured byte limit ${limit}`)
+  }
+}
+
+function positiveSafeInteger(value: number | undefined, label: string): void {
+  if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) {
+    throw new TypeError(`NATSail ${label} must be a positive safe integer`)
+  }
+}
+
+/** Validates and freezes a batch policy without evaluating application values. */
+export function defineNatsailBatchPolicy<T>(
+  policy: NatsailBatchPolicy<T>
+): Readonly<NatsailBatchPolicy<T>> {
+  positiveSafeInteger(policy.maxItems, 'batch maxItems')
+  positiveSafeInteger(policy.maxBytes, 'batch maxBytes')
+  if (
+    policy.maxWaitMs !== undefined &&
+    (!Number.isFinite(policy.maxWaitMs) || policy.maxWaitMs <= 0)
+  ) {
+    throw new TypeError('NATSail batch maxWaitMs must be a positive finite number')
+  }
+  if (
+    policy.maxItems === undefined &&
+    policy.maxBytes === undefined &&
+    policy.maxWaitMs === undefined
+  ) {
+    throw new TypeError('NATSail batch policy must define at least one bound')
+  }
+  if (policy.maxBytes !== undefined && policy.sizeOf === undefined) {
+    throw new TypeError('NATSail batch maxBytes requires sizeOf')
+  }
+  return Object.freeze({ ...policy })
+}
+
+/** Validates and freezes one cooperative work budget. */
+export function defineNatsailWorkBudget(budget: NatsailWorkBudget): Readonly<NatsailWorkBudget> {
+  if (!Number.isFinite(budget.yieldAfterMs) || budget.yieldAfterMs <= 0) {
+    throw new TypeError('NATSail work yieldAfterMs must be a positive finite number')
+  }
+  if (
+    typeof budget.scheduler?.now !== 'function' ||
+    typeof budget.scheduler.schedule !== 'function' ||
+    typeof budget.scheduler.yield !== 'function'
+  ) {
+    throw new TypeError('NATSail work scheduler must implement now, schedule, and yield')
+  }
+  return Object.freeze({ ...budget })
+}
+
+export interface NatsailBatcher<T> {
+  /** Resolves only after the batch containing this value was applied. */
+  add(value: T): Promise<void>
+  /** Applies a pending partial batch during normal source completion. */
+  complete(): Promise<void>
+  /** Applies a pending partial batch explicitly. */
+  flush(): Promise<void>
+  /** Current application barrier, or undefined when intake may continue. */
+  backpressure(): Promise<void> | undefined
+  /** Number of values waiting for the next application. */
+  pendingItems(): number
+  /** Prevents later batch applications until a downstream commit settles. */
+  barrier(commit: Promise<void>): void
+  /** Settles after currently applying work and registered barriers. */
+  settled(): Promise<void>
+  /** Drops a pending partial batch. An in-flight application is not interrupted. */
+  cancel(): void
+}
+
+export interface NatsailBatcherOptions {
+  readonly scheduler?: NatsailScheduler
+  readonly telemetry?: NatsailTelemetryReporter
+  /** Stable low-cardinality adapter name, such as `session` or `effect`. */
+  readonly source?: string
+}
+
+type PendingBatchValue<T> = {
+  readonly value: T
+  readonly size: number
+  readonly resolve: () => void
+  readonly reject: (error: unknown) => void
+}
+
+/**
+ * Creates a bounded asynchronous batch coordinator. Applications are serialized;
+ * a failed application rejects only that batch and later batches may continue.
+ */
+export function createNatsailBatcher<T>(
+  policyInput: NatsailBatchPolicy<T>,
+  apply: (values: readonly T[], reason: NatsailBatchFlushReason) => void | Promise<void>,
+  options: NatsailBatcherOptions = {}
+): NatsailBatcher<T> {
+  const policy = defineNatsailBatchPolicy(policyInput)
+  const scheduler = options.scheduler ?? natsailDefaultScheduler
+  let pending: PendingBatchValue<T>[] = []
+  let pendingBytes = 0
+  let timer: NatsailScheduledTask | undefined
+  let applications = Promise.resolve()
+  let queuedApplications = 0
+  let barrierFailure: unknown
+  let cancelled = false
+  let completed = false
+
+  const recordFlush = (reason: NatsailBatchFlushReason) => {
+    if (!options.telemetry?.enabled) return
+    options.telemetry.record({
+      type: 'counter',
+      name: 'natsail.batch.flushes',
+      value: 1,
+      at: options.telemetry.now(),
+      attributes: { reason, source: options.source ?? 'core' },
+    })
+  }
+  const clearTimer = () => {
+    timer?.cancel()
+    timer = undefined
+  }
+  const drain = (reason: NatsailBatchFlushReason): Promise<void> => {
+    if (pending.length === 0 || cancelled) return applications
+    clearTimer()
+    const batch = pending
+    pending = []
+    pendingBytes = 0
+    queuedApplications += 1
+    const operation = applications.then(async () => {
+      try {
+        if (barrierFailure !== undefined) throw barrierFailure
+        await apply(
+          batch.map((entry) => entry.value),
+          reason
+        )
+        recordFlush(reason)
+        for (const entry of batch) entry.resolve()
+      } catch (error) {
+        for (const entry of batch) entry.reject(error)
+      } finally {
+        queuedApplications -= 1
+      }
+    })
+    applications = operation.catch(() => undefined)
+    return operation
+  }
+  const armTimer = () => {
+    if (timer !== undefined || policy.maxWaitMs === undefined) return
+    timer = scheduler.schedule(() => {
+      timer = undefined
+      void drain('time')
+    }, policy.maxWaitMs)
+  }
+
+  return {
+    add: (value) => {
+      if (cancelled || completed) {
+        return Promise.reject(new NatsailBatchCancelledError())
+      }
+      let size = 0
+      if (policy.maxBytes !== undefined) {
+        try {
+          size = policy.sizeOf!(value)
+        } catch (error) {
+          return Promise.reject(error)
+        }
+        if (!Number.isFinite(size) || size < 0) {
+          return Promise.reject(
+            new TypeError('NATSail batch sizeOf must return a finite non-negative number')
+          )
+        }
+        if (size > policy.maxBytes) {
+          return Promise.reject(new NatsailBatchItemTooLargeError(size, policy.maxBytes))
+        }
+      }
+      if (
+        policy.maxBytes !== undefined &&
+        pending.length > 0 &&
+        pendingBytes + size > policy.maxBytes
+      ) {
+        void drain('bytes')
+      }
+      const promise = new Promise<void>((resolve, reject) => {
+        pending.push({ value, size, resolve, reject })
+      })
+      pendingBytes += size
+      const countReached = policy.maxItems !== undefined && pending.length >= policy.maxItems
+      const bytesReached = policy.maxBytes !== undefined && pendingBytes >= policy.maxBytes
+      if (countReached || bytesReached) void drain(countReached ? 'count' : 'bytes')
+      else armTimer()
+      return promise
+    },
+    complete: async () => {
+      if (cancelled || completed) return applications
+      completed = true
+      await drain('completion')
+    },
+    flush: () => drain('manual'),
+    backpressure: () => (queuedApplications > 0 ? applications : undefined),
+    pendingItems: () => pending.length,
+    barrier: (commit) => {
+      applications = applications
+        .then(() => commit)
+        .catch((error) => {
+          barrierFailure ??= error
+        })
+    },
+    settled: () => applications,
+    cancel: () => {
+      if (cancelled) return
+      cancelled = true
+      clearTimer()
+      const error = new NatsailBatchCancelledError()
+      for (const entry of pending) entry.reject(error)
+      pending = []
+      pendingBytes = 0
+    },
+  }
+}
+
+export interface NatsailWorkController {
+  /** Yields when the current slice consumed the configured budget. */
+  checkpoint(): Promise<void>
+  reset(): void
+}
+
+/** Creates a serial-loop work controller using only the injected scheduler. */
+export function createNatsailWorkController(
+  budgetInput: NatsailWorkBudget,
+  telemetry?: NatsailTelemetryReporter,
+  source = 'core'
+): NatsailWorkController {
+  const budget = defineNatsailWorkBudget(budgetInput)
+  let startedAt = budget.scheduler.now()
+  return {
+    checkpoint: async () => {
+      if (budget.scheduler.now() - startedAt < budget.yieldAfterMs) return
+      await budget.scheduler.yield()
+      startedAt = budget.scheduler.now()
+      if (telemetry?.enabled) {
+        telemetry.record({
+          type: 'counter',
+          name: 'natsail.work.yields',
+          value: 1,
+          at: telemetry.now(),
+          attributes: { source },
+        })
+      }
+    },
+    reset: () => {
+      startedAt = budget.scheduler.now()
+    },
+  }
 }
 
 export type NatsRuntimeLimitCode = 'jetstream-consumers' | 'buffered-messages' | 'buffered-bytes'

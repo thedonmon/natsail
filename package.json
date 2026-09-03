@@ -9,7 +9,7 @@
     "node": ">=22.14.0"
   },
   "scripts": {
-    "benchmark": "node benchmarks/replay-burst.mjs",
+    "benchmark": "pnpm --filter @natsail/core build && node benchmarks/replay-burst.mjs",
     "build": "pnpm --recursive --stream build",
     "changeset": "changeset",
     "check": "pnpm format:check && pnpm build && pnpm test && pnpm test:browser",

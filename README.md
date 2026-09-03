@@ -161,6 +161,10 @@ Use only stable, low-cardinality primitive attributes. NATSail does not include 
 
 Install [`@natsail/opentelemetry`](packages/opentelemetry/README.md) to map the same interface to OpenTelemetry without adding an OpenTelemetry dependency to Core.
 
+## Batching and cooperative reducers
+
+Core exports one dependency-free `NatsailBatchPolicy<T>` for count, byte, and time bounds plus `NatsailWorkBudget` for cooperative serial reducer yields. Reducing JetStream sessions apply replay in bounded batches but publish one atomic hydrated state, then coalesce live cumulative state with a 16ms default. RxJS, React, and Effect accept the same policy while keeping their native scheduling APIs and legacy options. Ordered cursor/checkpoint advancement remains behind successful batch application; close discards a pending partial batch and waits for in-flight work.
+
 ## Shared session adapters
 
 Create one session registry beside the runtime. A short idle delay prevents subscription churn during React Strict Mode remounts.

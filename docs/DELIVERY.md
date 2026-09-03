@@ -94,6 +94,12 @@ Effect Streams have a second decoded queue. Reliable JetStream Streams support `
 
 Core NATS Effect Streams can also use dropping or sliding policies. These policies do not add server retention to Core NATS.
 
+## Batch and reducer boundaries
+
+`NatsailBatchPolicy<T>` provides count, byte, and time bounds. Normal completion flushes a partial batch; cancellation discards it. A full batch already applying is allowed to finish, and close does not resolve until that application settles.
+
+Reducing JetStream sessions admit at most one applying batch before backpressuring intake. Reducers run serially and may yield through `NatsailWorkBudget`; yields never introduce concurrent reducer calls. Replay batches remain private until one caught-up state commit. Live cumulative state uses a 16ms default window, while replay/recovery phase notifications remain immediate. Cursor and checkpoint advancement follows successful downstream batch application.
+
 ## Telemetry and diagnostics
 
 `runtime.events` is the low-frequency lifecycle and diagnostic stream. High-frequency measurements never enter it.

@@ -1,6 +1,6 @@
 import { Effect, Stream } from 'effect'
 
-import { natsCodecs, type NatsPayloadCodec } from '@natsail/core'
+import { natsailDefaultScheduler, natsCodecs, type NatsPayloadCodec } from '@natsail/core'
 import type { NatsailService } from '@natsail/effect'
 import {
   demoConversations,
@@ -150,6 +150,8 @@ export class EffectChatController {
         duplicateDeliveryPolicy: 'drop',
         recovery: { delayMs: 250 },
         codec: chatCodec,
+        batchPolicy: { maxItems: 256, maxWaitMs: 16 },
+        workBudget: { yieldAfterMs: 4, scheduler: natsailDefaultScheduler },
       },
       {
         scope: 'performance-chat:v1',

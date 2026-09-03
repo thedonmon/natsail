@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import type { NatsRuntime, SubscriptionLease } from '@natsail/core'
+import type { NatsRuntime, NatsailScheduler, SubscriptionLease } from '@natsail/core'
 import {
   createCoreSessionSource,
   createReducingSessionSource,
@@ -104,6 +104,54 @@ describe('session registry', () => {
     await Promise.all([deliver('one'), deliver('two'), deliver('three')])
 
     expect(snapshots).toEqual([['one'], ['one', 'two'], ['one', 'two', 'three']])
+  })
+
+  it('keeps reducers serial across cooperative yields and does not publish failed work', async () => {
+    const sourceLease = controllableLease()
+    let deliver!: (value: number) => Promise<void>
+    let now = 0
+    let active = 0
+    let maxActive = 0
+    let yields = 0
+    const scheduler: NatsailScheduler = {
+      now: () => now,
+      schedule: () => ({ cancel: () => undefined }),
+      yield: async () => {
+        yields += 1
+        await Promise.resolve()
+      },
+    }
+    const published: number[] = []
+    const reduced = createReducingSessionSource(
+      (accept) => {
+        deliver = accept
+        return sourceLease.lease
+      },
+      () => 0,
+      async (state, value) => {
+        active += 1
+        maxActive = Math.max(maxActive, active)
+        await Promise.resolve()
+        active -= 1
+        now += 3
+        if (value === 2) throw new Error('reducer failed')
+        return state + value
+      },
+      { workBudget: { yieldAfterMs: 3, scheduler } }
+    )
+    reduced(async (state) => {
+      published.push(state)
+    })
+
+    const first = deliver(1)
+    const failed = deliver(2)
+    const third = deliver(3)
+    await expect(failed).rejects.toThrow('reducer failed')
+    await Promise.all([first, third])
+
+    expect(maxActive).toBe(1)
+    expect(yields).toBe(2)
+    expect(published).toEqual([1, 4])
   })
 
   it('shares one source until the final caller releases it', async () => {

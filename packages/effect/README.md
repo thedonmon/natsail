@@ -167,8 +167,8 @@ const conversation = materializeJetStream(
   },
   {
     bufferSize: 256,
-    batchSize: 256,
-    batchWithin: '16 millis',
+    batchPolicy: { maxItems: 256, maxWaitMs: 16 },
+    workBudget: { yieldAfterMs: 4, scheduler },
   }
 )
 
@@ -176,6 +176,8 @@ const render = conversation.pipe(Stream.runForEach((snapshot) => updateConversat
 ```
 
 `reduceBatch` is a native Effect. Its typed error and service requirements remain in the returned Stream type. Package-owned recovery can resume admitted events while the current materialized state remains alive. A fresh materializer rebuilds from replay, so `resume` is rejected until a state store can commit the materialized state and cursor atomically.
+
+`batchSize` and `batchWithin` remain compatible aliases. The shared policy additionally supports byte bounds with `sizeOf`. Durable JetStream queues remain lossless: their only overflow modes are backpressure (`suspend`) or a typed `error`.
 
 ## Explicit-ack processing
 

@@ -9,20 +9,28 @@ import {
   Layer,
   Option,
   Queue,
+  Schedule,
+  Sink,
   Stream,
 } from 'effect'
 import type { Pull } from 'effect'
 
 import type {
   CoreRequestOptions,
+  NatsailBatchPolicy,
   CoreSubscriptionOptions,
   NatsConnection,
   NatsRuntime,
   NatsRuntimeEvent,
   NatsRuntimeReconnectOptions,
   NatsRuntimeStatusEvent,
+  NatsailWorkBudget,
 } from '@natsail/core'
-import { NATS_RUNTIME_ADAPTER } from '@natsail/core'
+import {
+  createNatsailWorkController,
+  defineNatsailBatchPolicy,
+  NATS_RUNTIME_ADAPTER,
+} from '@natsail/core'
 import {
   createJetStreamSessionSource,
   processJetStream,
@@ -145,11 +153,16 @@ export interface NatsailJetStreamMaterializer<Value, State, E = never, R = never
 /** A fresh materializer must rebuild state and therefore cannot resume only an event cursor. */
 export type NatsailJetStreamMaterializeSourceOptions<T> = ReducingJetStreamSessionOptions<T>
 
-export interface NatsailJetStreamMaterializeOptions extends NatsailJetStreamStreamOptions {
+export interface NatsailJetStreamMaterializeOptions<Value = unknown>
+  extends NatsailJetStreamStreamOptions {
   /** Maximum deliveries reduced in one application call. Defaults to 256. */
   readonly batchSize?: number
   /** Maximum wait before a partial live batch is reduced. Defaults to 16ms. */
   readonly batchWithin?: Duration.Input
+  /** Shared count/byte/time policy. Takes precedence over the legacy aliases above. */
+  readonly batchPolicy?: NatsailBatchPolicy<JetStreamDelivery<Value>>
+  /** Cooperative time slice between serial materializer calls. */
+  readonly workBudget?: NatsailWorkBudget
 }
 
 export interface NatsailJetStreamMaterializedState<State> {
@@ -221,7 +234,7 @@ export interface NatsailService {
   materializeJetStream<Value, State, E, R>(
     options: NatsailJetStreamMaterializeSourceOptions<Value>,
     materializer: NatsailJetStreamMaterializer<Value, State, E, R>,
-    streamOptions?: NatsailJetStreamMaterializeOptions
+    streamOptions?: NatsailJetStreamMaterializeOptions<Value>
   ): Stream.Stream<NatsailJetStreamMaterializedState<State>, NatsailJetStreamStreamError | E, R>
   /** Observes one registry-shared reducing JetStream definition. */
   jetStreamStates<State>(
@@ -588,19 +601,32 @@ function createJetStreamMaterializedStream<Value, State, E, R>(
   runtime: NatsRuntime,
   options: NatsailJetStreamMaterializeSourceOptions<Value>,
   materializer: NatsailJetStreamMaterializer<Value, State, E, R>,
-  streamOptions: NatsailJetStreamMaterializeOptions = {}
+  streamOptions: NatsailJetStreamMaterializeOptions<Value> = {}
 ): Stream.Stream<NatsailJetStreamMaterializedState<State>, NatsailJetStreamStreamError | E, R> {
-  const batchSize = streamOptions.batchSize ?? 256
-  const batchWithin = streamOptions.batchWithin ?? '16 millis'
+  const configuredPolicy = streamOptions.batchPolicy
+  const batchPolicy = defineNatsailBatchPolicy<JetStreamDelivery<Value>>({
+    ...configuredPolicy,
+    maxItems: configuredPolicy?.maxItems ?? streamOptions.batchSize ?? 256,
+    maxWaitMs:
+      configuredPolicy?.maxWaitMs ??
+      Duration.toMillis(Duration.fromInputUnsafe(streamOptions.batchWithin ?? '16 millis')),
+  })
+  const batchSize = batchPolicy.maxItems!
+  const batchWithin = batchPolicy.maxWaitMs!
 
   if (options.resume) {
     throw new TypeError(
       'A JetStream materializer cannot resume an event cursor without restoring matching materialized state'
     )
   }
-  if (!Number.isSafeInteger(batchSize) || batchSize <= 0) {
-    throw new TypeError('NATSail Effect JetStream batchSize must be a positive safe integer')
-  }
+  const work =
+    streamOptions.workBudget === undefined
+      ? undefined
+      : createNatsailWorkController(
+          streamOptions.workBudget,
+          runtime[NATS_RUNTIME_ADAPTER].telemetry,
+          'effect'
+        )
 
   return Stream.suspend(() => {
     const initial = materializer.initial()
@@ -615,7 +641,16 @@ function createJetStreamMaterializedStream<Value, State, E, R>(
       replay: { delivered: 0 },
     }
     const updates = createJetStreamEventStream(runtime, options, streamOptions).pipe(
-      Stream.groupedWithin(batchSize, batchWithin),
+      (events) =>
+        Stream.aggregateWithin(
+          events,
+          Sink.fold<Array<NatsailJetStreamEvent<Value>>, NatsailJetStreamEvent<Value>>(
+            () => [],
+            (batch) => batch.length < batchSize && batch[batch.length - 1]?.type !== 'caught-up',
+            (batch, event) => Effect.succeed([...batch, event])
+          ),
+          Schedule.spaced(batchWithin)
+        ),
       Stream.mapAccumEffect(
         () => initialAccumulator,
         (previous, events) =>
@@ -625,6 +660,7 @@ function createJetStreamMaterializedStream<Value, State, E, R>(
             let cursor = previous.cursor
             let replayDelivered = previous.replayDelivered
             let pending: Array<JetStreamDelivery<Value>> = []
+            let pendingBytes = 0
             const snapshots: Array<NatsailJetStreamMaterializedState<State>> = []
 
             const snapshot = (): NatsailJetStreamMaterializedState<State> => ({
@@ -639,6 +675,8 @@ function createJetStreamMaterializedStream<Value, State, E, R>(
 
               const deliveries = pending
               pending = []
+              pendingBytes = 0
+              work?.reset()
               return materializer.reduceBatch(data, deliveries).pipe(
                 Effect.tap((nextData) =>
                   Effect.sync(() => {
@@ -647,13 +685,41 @@ function createJetStreamMaterializedStream<Value, State, E, R>(
                     if (phase === 'replaying') replayDelivered += deliveries.length
                   })
                 ),
+                Effect.andThen(
+                  work === undefined ? Effect.void : Effect.promise(() => work.checkpoint())
+                ),
                 Effect.asVoid
               )
             }
 
             for (const event of events) {
               if (event.type === 'delivery') {
+                if (batchPolicy.maxBytes !== undefined) {
+                  const size = batchPolicy.sizeOf!(event.delivery)
+                  if (!Number.isFinite(size) || size < 0) {
+                    return yield* Effect.die(
+                      new TypeError('NATSail batch sizeOf must return a finite non-negative number')
+                    )
+                  }
+                  if (size > batchPolicy.maxBytes) {
+                    return yield* Effect.die(
+                      new RangeError(
+                        `NATSail Effect delivery size ${size} exceeds maxBytes ${batchPolicy.maxBytes}`
+                      )
+                    )
+                  }
+                  if (pending.length > 0 && pendingBytes + size > batchPolicy.maxBytes) {
+                    yield* reducePending()
+                  }
+                  pendingBytes += size
+                }
                 pending.push(event.delivery)
+                if (
+                  (batchPolicy.maxItems !== undefined && pending.length >= batchPolicy.maxItems) ||
+                  (batchPolicy.maxBytes !== undefined && pendingBytes >= batchPolicy.maxBytes)
+                ) {
+                  yield* reducePending()
+                }
                 continue
               }
 
@@ -1049,7 +1115,7 @@ export function jetStreamDeliveries<T>(
 export function materializeJetStream<Value, State, E, R>(
   options: NatsailJetStreamMaterializeSourceOptions<Value>,
   materializer: NatsailJetStreamMaterializer<Value, State, E, R>,
-  streamOptions?: NatsailJetStreamMaterializeOptions
+  streamOptions?: NatsailJetStreamMaterializeOptions<Value>
 ): Stream.Stream<
   NatsailJetStreamMaterializedState<State>,
   NatsailJetStreamStreamError | E,

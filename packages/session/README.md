@@ -40,6 +40,8 @@ const sessions = createSessionRegistry({
 
 The sink is synchronous and failure-isolated. It should enqueue measurements instead of performing blocking I/O. `telemetryClock` provides deterministic timestamps in tests.
 
+`createReducingSessionSource()` accepts an optional `workBudget`. Reducer calls remain strictly serial and ordered across yields. A failed reducer value is not published; later calls continue from the last successfully applied state.
+
 See the [NATSail README](https://github.com/thedonmon/natsail#shared-session-adapters) for the registry model.
 
 ## License

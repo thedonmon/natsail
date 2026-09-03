@@ -68,6 +68,12 @@ The sink runs inline. Enqueue work and avoid blocking I/O. Sink exceptions are i
 
 Use [`@natsail/opentelemetry`](../opentelemetry/README.md) to send the same events to OpenTelemetry.
 
+## Batching and cooperative work
+
+`NatsailBatchPolicy<T>` supplies optional `maxItems`, `maxBytes`, and `maxWaitMs` bounds; at least one bound is required and byte policies require a finite, non-negative `sizeOf` result. `createNatsailBatcher()` serializes count, byte, time, explicit, and normal-completion flushes. `cancel()` discards only the pending partial batch and never interrupts an already applying batch.
+
+`NatsailWorkBudget` combines `yieldAfterMs` with one injectable `NatsailScheduler` (`now`, `schedule`, and `yield`). `createNatsailWorkController()` lets serial reducer loops yield cooperatively without running reducer calls concurrently. The default scheduler uses the host monotonic clock and timers; tests can provide a manual scheduler.
+
 `runtime.request()` uses the shared connection with a response codec or raw-message decoder and optional timeout, headers, and abort signal. It does not replay a request whose outcome may be ambiguous.
 
 `runtime.connection()` exposes the runtime-owned nats.js connection for operations without a managed NATSail seam. Consumers must not close or drain that connection.

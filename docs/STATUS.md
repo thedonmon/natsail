@@ -93,6 +93,8 @@ The Effect adapter provides bounded Core and JetStream Streams. Sustained slow-c
 
 The local benchmark and browser labs now expose stable measurement fields, but the repository does not yet publish representative hardware baselines or NATS server throughput claims.
 
+Shared count/byte/time batching and cooperative work budgets are implemented in Core and used by reducing JetStream sessions plus the RxJS, React, and Effect cumulative-state seams. Replay hydration stays atomic, live state defaults to a 16ms bounded window, and ordered cursor/checkpoint commits remain behind successful batch application.
+
 ### Processor policy
 
 Named processors support explicit acknowledgements and redelivery. Progress heartbeats, confirmed acknowledgements, and higher-level `nak` or terminal-message policy are not packaged yet.

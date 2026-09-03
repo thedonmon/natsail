@@ -1,6 +1,11 @@
 import { type Subscription } from 'rxjs'
 
-import { natsCodecs, type NatsPayloadCodec, type NatsRuntime } from '@natsail/core'
+import {
+  natsailDefaultScheduler,
+  natsCodecs,
+  type NatsPayloadCodec,
+  type NatsRuntime,
+} from '@natsail/core'
 import {
   demoConversations,
   isDemoChatMessage,
@@ -149,6 +154,8 @@ export class RxjsChatController {
         maxBufferedMessages: 64,
         duplicateDeliveryPolicy: 'drop',
         recovery: { delayMs: 250 },
+        batchPolicy: { maxItems: 256, maxWaitMs: 16 },
+        workBudget: { yieldAfterMs: 4, scheduler: natsailDefaultScheduler },
         codec: chatCodec,
       },
       {
@@ -159,7 +166,7 @@ export class RxjsChatController {
     )
 
     this.activeSubscription = observeNatsJetStreamState(this.sessions, definition, {
-      liveBatchMs: 16,
+      batchPolicy: { maxItems: 256, maxWaitMs: 16 },
     }).subscribe({
       next: (snapshot) => {
         if (snapshot.phase !== 'live') return

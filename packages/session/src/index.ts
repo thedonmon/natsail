@@ -1,4 +1,4 @@
-import { createNatsailTelemetryReporter } from '@natsail/core'
+import { createNatsailTelemetryReporter, createNatsailWorkController } from '@natsail/core'
 import type {
   CoreSubscriptionOptions,
   NatsailTelemetryAttributes,
@@ -7,6 +7,7 @@ import type {
   NatsailTelemetryGaugeName,
   NatsailTelemetryReporter,
   NatsailTelemetrySink,
+  NatsailWorkBudget,
   NatsRuntime,
   SubscriptionLease,
 } from '@natsail/core'
@@ -27,6 +28,13 @@ export type SessionListener = () => void
 export type SessionSource<T> = (accept: (value: T) => Promise<void>) => SubscriptionLease
 
 export type SessionReducer<Value, State> = (state: State, value: Value) => State | Promise<State>
+
+export interface NatsailReducingSessionOptions {
+  /** Yields between serial reducer applications after this cooperative slice is consumed. */
+  readonly workBudget?: NatsailWorkBudget
+  /** Adapter-owned reporter used only for low-cardinality work-yield measurements. */
+  readonly telemetry?: NatsailTelemetryReporter
+}
 
 /** One validated logical source shared by every framework adapter. */
 export interface SessionDefinition<T> {
@@ -153,15 +161,21 @@ export function createCoreSessionSource<T>(
 export function createReducingSessionSource<Value, State>(
   source: SessionSource<Value>,
   initialState: () => State,
-  reducer: SessionReducer<Value, State>
+  reducer: SessionReducer<Value, State>,
+  options: NatsailReducingSessionOptions = {}
 ): SessionSource<State> {
   return (accept) => {
     let state = initialState()
     let pending = Promise.resolve()
+    const work =
+      options.workBudget === undefined
+        ? undefined
+        : createNatsailWorkController(options.workBudget, options.telemetry, 'session')
 
     return source((value) => {
       const update = pending.then(async () => {
         state = await reducer(state, value)
+        await work?.checkpoint()
         await accept(state)
       })
       pending = update.catch(() => undefined)
