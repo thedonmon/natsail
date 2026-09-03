@@ -1,6 +1,6 @@
 {
   "name": "@natsail/core",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Shared NATS runtime with bounded subscriptions, retries, cleanup, status, and diagnostics.",
   "keywords": [
     "nats",

@@ -1,5 +1,13 @@
 # @natsail/core
 
+## 0.3.0
+
+### Minor Changes
+
+- 8273c15: Add a protocol-v1 SharedWorker browser broker with SessionSource sharing, immutable tenant/auth identity, identity-scoped credential failure, brokered publish/request operations, ordered publishes, per-tab cursor acknowledgements, bounded transferable batches, retained reattach recovery, heartbeat and idle-runtime cleanup, fallback policy, and Stage 1 telemetry.
+- 8273c15: Add failure-isolated dependency-free runtime, session, JetStream, checkpoint, processor, and buffer telemetry with deterministic clocks, plus an optional OpenTelemetry metrics sink. Effect remains published on the `next` tag.
+- 8273c15: Add shared count/byte/time batching and cooperative work budgets, atomic bounded JetStream reducer hydration with fresh retry batches, 16ms cumulative live coalescing, a public Effect event-stream materializer, and deterministic adapter scheduling while preserving legacy adapter batch options.
+
 ## 0.2.1
 
 ### Patch Changes

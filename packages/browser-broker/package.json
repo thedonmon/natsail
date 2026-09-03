@@ -1,6 +1,6 @@
 {
   "name": "@natsail/browser-broker",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "SharedWorker source sharing, bounded tab delivery, and resume signaling for NATSail browser applications.",
   "keywords": [
     "nats",

@@ -1,5 +1,21 @@
 # @natsail/jetstream
 
+## 0.5.0
+
+### Minor Changes
+
+- 8273c15: Add ownership-aware durable processor administration with discriminated operation results, connection-aware management, surfaced cleanup failures, validated public modes, normalized drift reconciliation, rich cached inspection, safe acknowledgement/start-boundary recreation and rollback, and advanced consumer configuration.
+- 8273c15: Add failure-isolated dependency-free runtime, session, JetStream, checkpoint, processor, and buffer telemetry with deterministic clocks, plus an optional OpenTelemetry metrics sink. Effect remains published on the `next` tag.
+- 8273c15: Add shared count/byte/time batching and cooperative work budgets, atomic bounded JetStream reducer hydration with fresh retry batches, 16ms cumulative live coalescing, a public Effect event-stream materializer, and deterministic adapter scheduling while preserving legacy adapter batch options.
+
+### Patch Changes
+
+- Updated dependencies [8273c15]
+- Updated dependencies [8273c15]
+- Updated dependencies [8273c15]
+  - @natsail/core@0.3.0
+  - @natsail/session@0.4.0
+
 ## 0.4.0
 
 ### Minor Changes
