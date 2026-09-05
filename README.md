@@ -20,6 +20,8 @@ NATSail is useful when:
 
 The packages use version `0.x`. Interfaces can change before version `1.0.0`.
 
+For deployment, start with the [production guide](./docs/PRODUCTION.md): supported versions, shutdown deadlines, durable-worker tuning, bundle budgets, and the limits of the test evidence.
+
 ## Start with Core NATS
 
 Install the runtime and an official NATS transport:

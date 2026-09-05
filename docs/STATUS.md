@@ -1,6 +1,6 @@
 # Project status and roadmap
 
-NATSail is a public `0.x` package family. The repository builds nine packages under the `@natsail` npm scope; seven are currently published.
+NATSail is a public `0.x` package family. All nine packages are published under the `@natsail` npm scope. See the [production guide](./PRODUCTION.md) for the verification matrix and deployment requirements.
 
 The test suite uses NATS 2.14.4. Separate fixtures cover anonymous, token, user/password, NKey, operator JWT, and TLS connections.
 
@@ -11,6 +11,7 @@ The test suite uses NATS 2.14.4. Separate fixtures cover anonymous, token, user/
 - One runtime connection for many Core NATS subscriptions
 - Publish, live delivery, and request/reply
 - Bounded initial connection retry and cleanup
+- Bounded shutdown grace periods, cooperative cancellation, and event-buffer overflow reporting
 - Recovery after forced reconnect or permanent close
 - Forced reauthentication after credential changes
 - Structured status, diagnostics, and resource inspection
@@ -30,6 +31,7 @@ The test suite uses NATS 2.14.4. Separate fixtures cover anonymous, token, user/
 - Duplicate drop, deliver, and error policies
 - Retention-gap error and continue policies
 - Named explicit-ack processing with redelivery
+- Optional progress heartbeats, confirmed acknowledgements, and explicit retry/terminal outcomes
 - Package-owned infrastructure recovery for named explicit-ack processors
 - Bound, retained, and lease-owned processor lifecycles
 - Ownership-aware processor inspection, reconciliation, pause/resume, and guarded deletion
@@ -63,6 +65,8 @@ The test suite uses NATS 2.14.4. Separate fixtures cover anonymous, token, user/
 - Local Durable Object fan-out and restart replay
 - Package-ready SharedWorker browser broker with protocol-v1 validation, fallback policy, and two-tab acceptance coverage
 - Changesets, package checks, provenance, and trusted publishing
+- Packed-consumer bundle budgets and codec/runtime-only tree-shaking checks
+- Isolated three-node failure tests, process-crash redelivery, and a slow-handler load artifact
 - Machine-readable local RxJS/Effect public-path comparison for 1,000/5,000 replay and configurable live bursts
 
 ## Current limits
@@ -103,14 +107,14 @@ Shared count/byte/time batching and cooperative work budgets are implemented in 
 
 ### Processor policy
 
-Named processors support explicit acknowledgements, redelivery, rich cached inspection, and ownership-aware administration. Progress heartbeats, confirmed acknowledgements, and higher-level `nak` or terminal-message policy are not packaged yet.
+Named processors support progress heartbeats, optional confirmed acknowledgements, and explicit delayed-retry or terminal handler results. Thrown handler errors remain terminal. External side effects still need idempotency; terminal results do not create a dead-letter record automatically.
 
 ## Roadmap
 
 1. Measure a production migration that replaces application-owned NATS effects with shared definitions, reducers, and managed ownership.
 2. Publish Effect v4 buffer and batching guidance from slow-consumer, replay, processor-failure, and recovery tests.
 3. Prove a materialized-state store that commits reducer state and its JetStream cursor together.
-4. Add processor progress heartbeats and explicit terminal-message policy after their failure semantics are tested.
+4. Extend the isolated load scenarios with representative production traffic and longer-duration measurements.
 5. Prove an atomic catch-up-to-live handoff in the Durable Object gateway.
 6. Add gateway authentication, backpressure, eviction tests, and cost measurements.
 7. Run the Cloudflare examples against a remote NATS endpoint and test Workers VPC access.
@@ -120,4 +124,4 @@ Named processors support explicit acknowledgements, redelivery, rich cached insp
 
 All nine package tarballs pass repository checks. Routine releases use Changesets and GitHub trusted publishing.
 
-The browser-broker and OpenTelemetry packages still need their first publication and trusted-publisher configuration before routine OIDC releases can publish them.
+The browser-broker and OpenTelemetry packages have completed their first publication.

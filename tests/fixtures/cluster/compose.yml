@@ -1,0 +1,60 @@
+name: natsail-resilience
+services:
+  nats1:
+    image: nats:2.14.4-alpine
+    command:
+      [
+        '-js',
+        '-sd',
+        '/data',
+        '-n',
+        'nats1',
+        '--cluster_name',
+        'natsail',
+        '--cluster',
+        'nats://0.0.0.0:6222',
+        '--routes',
+        'nats://nats2:6222,nats://nats3:6222',
+      ]
+    ports: ['127.0.0.1:14223:4222']
+    volumes: ['nats1:/data']
+  nats2:
+    image: nats:2.14.4-alpine
+    command:
+      [
+        '-js',
+        '-sd',
+        '/data',
+        '-n',
+        'nats2',
+        '--cluster_name',
+        'natsail',
+        '--cluster',
+        'nats://0.0.0.0:6222',
+        '--routes',
+        'nats://nats1:6222,nats://nats3:6222',
+      ]
+    ports: ['127.0.0.1:14224:4222']
+    volumes: ['nats2:/data']
+  nats3:
+    image: nats:2.14.4-alpine
+    command:
+      [
+        '-js',
+        '-sd',
+        '/data',
+        '-n',
+        'nats3',
+        '--cluster_name',
+        'natsail',
+        '--cluster',
+        'nats://0.0.0.0:6222',
+        '--routes',
+        'nats://nats1:6222,nats://nats2:6222',
+      ]
+    ports: ['127.0.0.1:14225:4222']
+    volumes: ['nats3:/data']
+volumes:
+  nats1:
+  nats2:
+  nats3:

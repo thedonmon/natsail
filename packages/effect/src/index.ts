@@ -39,6 +39,7 @@ import {
   type JetStreamDelivery,
   type JetStreamLease,
   type JetStreamProcessingDelivery,
+  type JetStreamProcessorDisposition,
   type JetStreamProcessorOptions,
   type ReducingJetStreamSessionOptions,
   type JetStreamSessionSourceOptions,
@@ -246,7 +247,9 @@ export interface NatsailService {
   /** Runs an explicit-ack processor and acknowledges only after the Effect succeeds. */
   runJetStreamProcessor<T, E, R>(
     options: JetStreamProcessorOptions<T>,
-    handler: (delivery: JetStreamProcessingDelivery<T>) => Effect.Effect<void, E, R>
+    handler: (
+      delivery: JetStreamProcessingDelivery<T>
+    ) => Effect.Effect<void | JetStreamProcessorDisposition, E, R>
   ): Effect.Effect<void, NatsailJetStreamError | E, R>
   restartSession(key: string): Effect.Effect<void, NatsailOperationError>
   sessionSnapshots<T>(
@@ -772,7 +775,9 @@ function createJetStreamMaterializedStream<Value, State, E, R>(
 function runJetStreamProcessorEffect<T, E, R>(
   runtime: NatsRuntime,
   options: JetStreamProcessorOptions<T>,
-  handler: (delivery: JetStreamProcessingDelivery<T>) => Effect.Effect<void, E, R>
+  handler: (
+    delivery: JetStreamProcessingDelivery<T>
+  ) => Effect.Effect<void | JetStreamProcessorDisposition, E, R>
 ): Effect.Effect<void, NatsailJetStreamError | E, R> {
   return Effect.scoped(
     Effect.gen(function* () {
@@ -783,13 +788,16 @@ function runJetStreamProcessorEffect<T, E, R>(
       const lease = yield* Effect.acquireRelease(
         Effect.try({
           try: () =>
-            processJetStream(runtime, processorOptions, async (delivery) => {
-              const exit = await Effect.runPromiseExitWith(context)(handler(delivery), { signal })
+            processJetStream(runtime, processorOptions, async (delivery, handling) => {
+              const exit = await Effect.runPromiseExitWith(context)(handler(delivery), {
+                signal: AbortSignal.any([signal, handling.signal]),
+              })
               if (Exit.isFailure(exit)) {
                 const expected = Cause.findErrorOption(exit.cause)
                 if (Option.isSome(expected)) throw new JetStreamEffectFailure(expected.value)
                 throw new JetStreamEffectCause(exit.cause as Cause.Cause<never>)
               }
+              return exit.value
             }),
           catch: (cause) => jetStreamError(options, 'processor', cause),
         }),
@@ -1164,7 +1172,9 @@ export function jetStreamStates<State>(
  */
 export function runJetStreamProcessor<T, E, R>(
   options: JetStreamProcessorOptions<T>,
-  handler: (delivery: JetStreamProcessingDelivery<T>) => Effect.Effect<void, E, R>
+  handler: (
+    delivery: JetStreamProcessingDelivery<T>
+  ) => Effect.Effect<void | JetStreamProcessorDisposition, E, R>
 ): Effect.Effect<void, NatsailJetStreamError | E, Natsail | R> {
   return Natsail.use((service) => service.runJetStreamProcessor(options, handler))
 }

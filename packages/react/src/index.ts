@@ -409,8 +409,8 @@ export function useNatsJetStreamProcessor<T>(
       if (cancelled || optionsRef.current === null) return
 
       try {
-        lease = processJetStream(runtime, optionsRef.current, (delivery) =>
-          handlerRef.current(delivery)
+        lease = processJetStream(runtime, optionsRef.current, (delivery, context) =>
+          handlerRef.current(delivery, context)
         )
       } catch (error) {
         setActive({
