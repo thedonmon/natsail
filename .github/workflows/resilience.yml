@@ -1,0 +1,36 @@
+name: Resilience
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  cluster:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.34.5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.22.0
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter './packages/**' --recursive build
+      - run: docker compose -f tests/fixtures/cluster/compose.yml up --detach
+      - run: pnpm vitest run tests/integration/resilience.test.ts
+        env:
+          NATSAIL_CLUSTER_TEST: '1'
+      - run: node --expose-gc scripts/verify-sustained-load.mjs
+        env:
+          NATSAIL_CLUSTER_TEST: '1'
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sustained-load
+          path: .generated/sustained-load.json
+      - if: failure()
+        run: docker compose -f tests/fixtures/cluster/compose.yml logs
+      - if: always()
+        run: docker compose -f tests/fixtures/cluster/compose.yml down --volumes

@@ -80,6 +80,14 @@ Use [`@natsail/opentelemetry`](../opentelemetry/README.md) to send the same even
 
 See the [Core NATS example](https://github.com/thedonmon/natsail#core-nats-example) and the [delivery model](https://github.com/thedonmon/natsail/blob/main/docs/DELIVERY.md).
 
+## Shutdown and event buffering
+
+`shutdownTimeoutMs` bounds runtime close, including drain (default 30 seconds). Expiry requests cancellation, force-closes the connection, and rejects with `NatsRuntimeShutdownTimeoutError`. Resource cleanup failures reject with `AggregateError`. Core handlers receive a third `{ signal }` argument for cooperative cancellation; direct lease close still waits for in-flight handling.
+
+`maxBufferedEvents` bounds each runtime-event iterator (default 256). Slow iterators lose oldest events and receive an `event-buffer-overflow` diagnostic before retained events. `runtime.inspect()` supplies current state.
+
+See the [production guide](https://github.com/thedonmon/natsail/blob/main/docs/PRODUCTION.md) for supported versions, worker tuning, and deployment checks.
+
 ## License
 
 Apache-2.0

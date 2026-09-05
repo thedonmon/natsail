@@ -56,6 +56,10 @@ const broker = createBrowserBrokerWorker({
     await (await activeRuntime.connection()).flush()
   },
   request: async ({ operation, data }) => {
+    if (operation === 'terminate-test-worker') {
+      setTimeout(() => workerScope.close(), 50)
+      return new Uint8Array(0)
+    }
     const activeRuntime = runtimeForWorker()
     const connection = await activeRuntime.connection()
     const subject = mappedSubject(requestSubjects, operation)
@@ -78,6 +82,8 @@ const broker = createBrowserBrokerWorker({
     await activeRuntime?.close()
   },
   idleTeardownMs: 50,
+  clientTimeoutMs: 3_000,
+  sweepIntervalMs: 250,
 })
 
 const workerScope = self as unknown as SharedWorkerGlobalScope

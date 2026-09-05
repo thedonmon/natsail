@@ -32,9 +32,24 @@ import {
   type NatsailWorkBudget,
   type NatsRuntime,
   type NatsRuntimeDiagnostic,
+  type NatsHandlerContext,
   type SubscriptionLease,
 } from '@natsail/core'
 import { defineSession, type SessionDefinition, type SessionReducer } from '@natsail/session'
+import {
+  acknowledgeProcessorMessage,
+  startProcessorHeartbeat,
+  validateProgressInterval,
+  validateAcknowledgementPolicy,
+  validateProcessorDisposition,
+  type JetStreamProcessorDisposition,
+  type JetStreamAcknowledgementPolicy,
+} from './processor-policy.js'
+export {
+  JetStreamAcknowledgementError,
+  type JetStreamAcknowledgementPolicy,
+  type JetStreamProcessorDisposition,
+} from './processor-policy.js'
 
 import {
   createJetStreamProcessorController,
@@ -286,6 +301,10 @@ export interface JetStreamProcessingDelivery<T> {
 
 export interface JetStreamProcessorBaseOptions extends JetStreamProcessorAdminOptions {
   signal?: AbortSignal
+  /** Defaults to fire-and-forget acknowledgement after successful handling. */
+  acknowledgement?: JetStreamAcknowledgementPolicy
+  /** Sends in-progress acknowledgements during a handler; defaults the pull buffer to one message. */
+  progressIntervalMs?: number
   /** Reopens the named consumer after infrastructure failures. */
   recovery?: JetStreamProcessorRecoveryOptions
 }
@@ -294,8 +313,9 @@ export type JetStreamProcessorOptions<T> = JetStreamProcessorBaseOptions &
   JetStreamBufferOptions &
   JetStreamDecoding<T>
 export type JetStreamProcessorHandler<T> = (
-  delivery: JetStreamProcessingDelivery<T>
-) => void | Promise<void>
+  delivery: JetStreamProcessingDelivery<T>,
+  context: NatsHandlerContext
+) => void | JetStreamProcessorDisposition | Promise<void | JetStreamProcessorDisposition>
 
 export type JetStreamProcessorPhase = 'connecting' | 'live' | 'reconnecting' | 'closed' | 'error'
 
@@ -1030,6 +1050,9 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
 }
 
 class JetStreamProcessor<T> implements JetStreamProcessorLease {
+  private retryGap = false
+  private readonly cancellation = new AbortController()
+  private abandoned = false
   readonly ready: Promise<void>
   readonly closed: Promise<void>
 
@@ -1111,6 +1134,12 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
     return this.closed
   }
 
+  abort(reason: Error): void {
+    this.abandoned = true
+    this.cancellation.abort(reason)
+    void this.close().catch(() => undefined)
+  }
+
   private async start(runtime: NatsRuntime): Promise<void> {
     let abort: (() => void) | undefined
     let failure: unknown
@@ -1125,6 +1154,15 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
       if (managed.state !== undefined) this.consumerState = managed.state
       this.consumer = await client.consumers.get(this.options.stream, this.options.consumer.name)
       const consumerInfo = await this.consumer.info()
+      try {
+        validateProgressInterval(
+          this.options.progressIntervalMs,
+          (consumerInfo.config.backoff?.[0] ?? consumerInfo.config.ack_wait ?? 30_000_000_000) /
+            1_000_000
+        )
+      } catch (error) {
+        markApplicationDeliveryFailure(error)
+      }
       this.consumerState = inspectJetStreamProcessorConsumerState(consumerInfo)
       if (this.recoveryBoundary === undefined) {
         const active = managed.active
@@ -1150,11 +1188,16 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
 
       const consumeOptions =
         this.options.maxBufferedBytes === undefined
-          ? { max_messages: this.options.maxBufferedMessages ?? 32 }
+          ? {
+              max_messages:
+                this.options.maxBufferedMessages ??
+                (this.options.progressIntervalMs === undefined ? 32 : 1),
+            }
           : { max_bytes: this.options.maxBufferedBytes }
       this.messages = await this.consumer.consume(consumeOptions)
       void this.observeDiagnostics(runtime, this.messages)
       abort = () => {
+        this.cancellation.abort(this.options.signal?.reason)
         void this.close().catch(() => undefined)
       }
       this.options.signal?.addEventListener('abort', abort, { once: true })
@@ -1162,6 +1205,7 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
       this.resolveReady()
 
       for await (const message of this.messages) {
+        if (this.closeRequested) break
         this.consumerState = {
           ...this.consumerState,
           pendingAcknowledgements: this.consumerState.pendingAcknowledgements + 1,
@@ -1178,17 +1222,28 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
           source: 'jetstream',
         })
         const handlerStartedAt = this.telemetry.enabled ? this.telemetry.now() : 0
+        const stopHeartbeat = startProcessorHeartbeat(
+          message,
+          this.options.progressIntervalMs,
+          this.cancellation
+        )
+        let disposition: void | JetStreamProcessorDisposition
         try {
-          await this.handler({
-            value: decodeJetStreamPayload(this.options, message),
-            subject: message.subject,
-            cursor: {
-              stream: message.info.stream,
-              sequence: message.info.streamSequence,
+          disposition = await this.handler(
+            {
+              value: decodeJetStreamPayload(this.options, message),
+              subject: message.subject,
+              cursor: {
+                stream: message.info.stream,
+                sequence: message.info.streamSequence,
+              },
+              redelivered: message.redelivered,
+              deliveryAttempt: message.info.deliveryCount,
             },
-            redelivered: message.redelivered,
-            deliveryAttempt: message.info.deliveryCount,
-          })
+            { signal: this.cancellation.signal }
+          )
+          this.cancellation.signal.throwIfAborted()
+          validateProcessorDisposition(disposition)
         } catch (error) {
           this.handlerFailure = error
           this.notify()
@@ -1198,7 +1253,10 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
             redelivered: message.redelivered,
             source: 'jetstream',
           })
+          if (this.cancellation.signal.aborted) throw this.cancellation.signal.reason
           markApplicationDeliveryFailure(error)
+        } finally {
+          stopHeartbeat()
         }
         recordDuration(this.telemetry, 'natsail.jetstream.handler.duration', handlerStartedAt, {
           operation: 'processor-handler',
@@ -1207,7 +1265,14 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
           source: 'jetstream',
         })
         try {
-          message.ack()
+          if (disposition?.action === 'retry') {
+            this.retryGap = true
+            message.nak(disposition.delayMs)
+            continue
+          }
+          if (disposition?.action === 'term') message.term(disposition.reason)
+          else await acknowledgeProcessorMessage(message, this.options.acknowledgement)
+          this.cancellation.signal.throwIfAborted()
           this.consumerState = {
             ...this.consumerState,
             pendingAcknowledgements: Math.max(0, this.consumerState.pendingAcknowledgements - 1),
@@ -1216,9 +1281,10 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
               stream: message.info.streamSequence,
             },
           }
-          this.setRecoveryBoundary(message.info.streamSequence)
+          if (!this.retryGap) this.setRecoveryBoundary(message.info.streamSequence)
           this.notify()
           recordCounter(this.telemetry, 'natsail.jetstream.acknowledgements', 1, {
+            operation: disposition?.action ?? 'ack',
             outcome: 'success',
             redelivered: message.redelivered,
             source: 'jetstream',
@@ -1247,7 +1313,7 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
     } finally {
       if (abort) this.options.signal?.removeEventListener('abort', abort)
       if (this.messages) await this.messages.close().catch(() => undefined)
-      if (this.deleteOwnedOnClose) {
+      if (this.deleteOwnedOnClose && !this.abandoned) {
         try {
           await this.deleteOwnedConsumer()
         } catch (cleanupError) {
@@ -1341,6 +1407,7 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
 }
 
 class RecoveringJetStreamProcessor<T> implements JetStreamProcessorLease {
+  private abandoned = false
   readonly ready: Promise<void>
   readonly closed: Promise<void>
 
@@ -1409,6 +1476,12 @@ class RecoveringJetStreamProcessor<T> implements JetStreamProcessorLease {
       await this.active?.close().catch(() => undefined)
     }
     return this.closed
+  }
+
+  abort(reason: Error): void {
+    this.abandoned = true
+    this.active?.abort(reason)
+    void this.close().catch(() => undefined)
   }
 
   private async run(): Promise<void> {
@@ -1502,7 +1575,7 @@ class RecoveringJetStreamProcessor<T> implements JetStreamProcessorLease {
       }
     } finally {
       if (abort) this.options.signal?.removeEventListener('abort', abort)
-      if (this.options.consumer.mode === 'owned') {
+      if (this.options.consumer.mode === 'owned' && !this.abandoned) {
         try {
           await this.retained?.deleteOwnedConsumer()
         } catch (cleanupError) {
@@ -1629,7 +1702,12 @@ export function processJetStream<T>(
 ): JetStreamProcessorLease {
   validateProcessorOptions(options)
   const maxBufferedMessages =
-    options.maxBufferedMessages ?? (options.maxBufferedBytes === undefined ? 32 : 0)
+    options.maxBufferedMessages ??
+    (options.maxBufferedBytes === undefined
+      ? options.progressIntervalMs === undefined
+        ? 32
+        : 1
+      : 0)
   const maxBufferedBytes = options.maxBufferedBytes ?? 0
   return runtime[NATS_RUNTIME_ADAPTER].manage(
     () =>
@@ -1645,6 +1723,8 @@ export function processJetStream<T>(
 }
 
 function validateProcessorOptions<T>(options: JetStreamProcessorOptions<T>): void {
+  validateProgressInterval(options.progressIntervalMs, options.backoffMs?.[0] ?? options.ackWaitMs)
+  validateAcknowledgementPolicy(options.acknowledgement)
   validateJetStreamDecoder(options, 'JetStream processor')
   validateJetStreamProcessorAdminOptions(options)
   validateStart(options.start)

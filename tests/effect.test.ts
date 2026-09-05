@@ -138,7 +138,7 @@ function controllableSubscription<T>(telemetryEvents?: NatsailTelemetryEvent[]):
     }),
     subscribe,
     close,
-    deliver: async (value) => handler(value, {} as never),
+    deliver: async (value) => handler(value, {} as never, { signal: new AbortController().signal }),
     fail: failSubscription,
   }
 }

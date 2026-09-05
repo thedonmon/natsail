@@ -10,7 +10,16 @@ import type {
 
 export type { NatsConnection } from '@nats-io/nats-core'
 
-export type MessageHandler<T> = (value: T, message: Msg) => void | Promise<void>
+export interface NatsHandlerContext {
+  /** Aborted on explicit cancellation or expiry of the runtime shutdown grace period. */
+  readonly signal: AbortSignal
+}
+
+export type MessageHandler<T> = (
+  value: T,
+  message: Msg,
+  context: NatsHandlerContext
+) => void | Promise<void>
 
 /** Encodes and decodes one application payload without exposing text or byte plumbing. */
 export interface NatsPayloadCodec<T> {
@@ -96,6 +105,8 @@ export interface SubscriptionLease {
 export interface RuntimeResource {
   readonly closed: Promise<void>
   close(): Promise<void>
+  /** Cancels unfinished work when the runtime's shutdown grace period expires. */
+  abort?(reason: Error): void
 }
 
 export interface RuntimeResourceAllocation {
@@ -643,6 +654,10 @@ export interface NatsRuntimeInspection {
 export interface NatsRuntimeOptions {
   /** Creates the connection owned by this runtime. Called once per connection attempt. */
   connect: () => Promise<NatsConnection>
+  /** Shutdown grace period, including connection drain. Defaults to 30,000 ms. */
+  shutdownTimeoutMs?: number
+  /** Per-iterator event capacity. Oldest events are dropped with an overflow diagnostic. Defaults to 256. */
+  maxBufferedEvents?: number
   /** Optional bounded retry policy for each initial connection series. */
   initialConnectRetry?: NatsRuntimeInitialConnectRetryOptions
   /** Controls whether a permanently closed owned connection is replaced immediately. */
@@ -658,6 +673,14 @@ export interface NatsRuntimeOptions {
   telemetryAttributes?: NatsailTelemetryAttributes
   /** Monotonic telemetry clock override, primarily for deterministic hosts and tests. */
   telemetryClock?: NatsailTelemetryClock
+}
+
+export class NatsRuntimeShutdownTimeoutError extends Error {
+  readonly name = 'NatsRuntimeShutdownTimeoutError'
+
+  constructor(readonly timeoutMs: number) {
+    super(`NATS runtime shutdown exceeded ${timeoutMs} ms; unfinished work was abandoned`)
+  }
 }
 
 export interface NatsRuntimeConnectionRecoveryOptions {
@@ -747,14 +770,18 @@ type RuntimeEventSubscriber = {
   readonly queue: NatsRuntimeEvent[]
   waiting: Deferred<IteratorResult<NatsRuntimeEvent, undefined>> | undefined
   closed: boolean
+  dropped: number
 }
 
 class RuntimeEventStream implements AsyncIterable<NatsRuntimeEvent> {
+  constructor(private readonly capacity = 256) {}
+
   [Symbol.asyncIterator](): AsyncIterator<NatsRuntimeEvent> {
     const subscriber: RuntimeEventSubscriber = {
       queue: [this.currentStatus],
       waiting: undefined,
       closed: this.closed,
+      dropped: 0,
     }
     if (!subscriber.closed) {
       this.subscribers.add(subscriber)
@@ -762,6 +789,23 @@ class RuntimeEventStream implements AsyncIterable<NatsRuntimeEvent> {
 
     return {
       next: () => {
+        if (subscriber.dropped > 0) {
+          const dropped = subscriber.dropped
+          subscriber.dropped = 0
+          return Promise.resolve({
+            done: false,
+            value: {
+              type: 'diagnostic' as const,
+              source: 'runtime' as const,
+              code: 'event-buffer-overflow',
+              level: 'warning' as const,
+              message:
+                'A slow runtime event subscriber lost older events; inspect() returns current state',
+              at: Date.now(),
+              details: { dropped, capacity: this.capacity },
+            },
+          })
+        }
         const event = subscriber.queue.shift()
         if (event) {
           return Promise.resolve({ done: false, value: event })
@@ -831,6 +875,10 @@ class RuntimeEventStream implements AsyncIterable<NatsRuntimeEvent> {
         subscriber.waiting.resolve({ done: false, value: event })
         subscriber.waiting = undefined
       } else {
+        if (subscriber.queue.length === this.capacity) {
+          subscriber.queue.shift()
+          subscriber.dropped = Math.min(Number.MAX_SAFE_INTEGER, subscriber.dropped + 1)
+        }
         subscriber.queue.push(event)
       }
     }
@@ -838,6 +886,8 @@ class RuntimeEventStream implements AsyncIterable<NatsRuntimeEvent> {
 
   private remove(subscriber: RuntimeEventSubscriber): void {
     subscriber.closed = true
+    subscriber.queue.length = 0
+    subscriber.dropped = 0
     this.subscribers.delete(subscriber)
     subscriber.waiting?.resolve({ done: true, value: undefined })
     subscriber.waiting = undefined
@@ -853,6 +903,7 @@ class CoreSubscription<T> implements SubscriptionLease {
   private subscription?: Subscription
   private closeRequested = false
   private readySettled = false
+  private readonly cancellation = new AbortController()
 
   constructor(
     connection: Promise<NatsConnection>,
@@ -877,6 +928,11 @@ class CoreSubscription<T> implements SubscriptionLease {
     return this.closed
   }
 
+  abort(reason: Error): void {
+    this.cancellation.abort(reason)
+    void this.close().catch(() => undefined)
+  }
+
   private async start(connectionPromise: Promise<NatsConnection>): Promise<void> {
     let abort: (() => void) | undefined
 
@@ -894,13 +950,19 @@ class CoreSubscription<T> implements SubscriptionLease {
         : connection.subscribe(this.options.subject)
 
       abort = () => {
+        this.cancellation.abort(this.options.signal?.reason)
         void this.close().catch(() => undefined)
       }
       this.options.signal?.addEventListener('abort', abort, { once: true })
       this.resolveReady()
 
       for await (const message of this.subscription) {
-        await this.handler(await decodePayload(this.options, message), message)
+        if (this.closeRequested) break
+        const value = await decodePayload(this.options, message)
+        this.cancellation.signal.throwIfAborted()
+        if (this.closeRequested) break
+        await this.handler(value, message, { signal: this.cancellation.signal })
+        this.cancellation.signal.throwIfAborted()
       }
 
       const subscriptionError = await this.subscription.closed
@@ -916,6 +978,7 @@ class CoreSubscription<T> implements SubscriptionLease {
       }
       this.closedState.reject(error)
     } finally {
+      this.subscription?.unsubscribe()
       if (abort) {
         this.options.signal?.removeEventListener('abort', abort)
       }
@@ -934,7 +997,7 @@ class DefaultNatsRuntime implements NatsRuntime {
   readonly [NATS_RUNTIME_ADAPTER]: NatsRuntimeAdapter
   readonly events: AsyncIterable<NatsRuntimeEvent>
 
-  private readonly eventStream = new RuntimeEventStream()
+  private readonly eventStream: RuntimeEventStream
   private readonly telemetry: NatsailTelemetryReporter
   private connectionPromise: Promise<NatsConnection> | undefined
   private activeConnection: NatsConnection | undefined
@@ -949,6 +1012,7 @@ class DefaultNatsRuntime implements NatsRuntime {
   private disconnectedAt: number | undefined
 
   constructor(private readonly options: NatsRuntimeOptions) {
+    this.eventStream = new RuntimeEventStream(options.maxBufferedEvents)
     this.telemetry = createNatsailTelemetryReporter({
       ...(options.telemetry === undefined ? {} : { sink: options.telemetry }),
       ...(options.telemetryClock === undefined ? {} : { clock: options.telemetryClock }),
@@ -1158,16 +1222,55 @@ class DefaultNatsRuntime implements NatsRuntime {
 
   private async closeRuntime(): Promise<void> {
     const resources = [...this.resources]
-    await Promise.allSettled(resources.map((resource) => resource.close()))
+    const timeoutMs = this.options.shutdownTimeoutMs ?? 30_000
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const graceful = async () => {
+      const results = await Promise.allSettled(
+        resources.map((resource) => Promise.resolve().then(() => resource.close()))
+      )
+      if (this.connectionPromise) {
+        const connection = await this.connectionPromise.catch(() => undefined)
+        if (connection && !connection.isClosed()) await connection.drain()
+      }
+      const errors = results
+        .filter((result) => result.status === 'rejected')
+        .map((result) => result.reason)
+      if (errors.length) throw new AggregateError(errors, 'NATS runtime resource cleanup failed')
+    }
+    const expired = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        const error = new NatsRuntimeShutdownTimeoutError(timeoutMs)
+        for (const resource of resources) {
+          try {
+            resource.abort?.(error)
+          } catch {
+            /* Continue closing the other resources. */
+          }
+        }
+        this.forceCloseConnection()
+        reject(error)
+      }, timeoutMs)
+    })
+    try {
+      await Promise.race([graceful(), expired])
+    } catch (error) {
+      this.forceCloseConnection()
+      throw error
+    } finally {
+      clearTimeout(timer)
+      this.eventStream.setStatus('closed')
+    }
+  }
 
-    if (this.connectionPromise) {
-      const connection = await this.connectionPromise.catch(() => undefined)
-      if (connection && !connection.isClosed()) {
-        await connection.drain()
+  private forceCloseConnection(): void {
+    const connection = this.activeConnection
+    if (connection && !connection.isClosed()) {
+      try {
+        void connection.close().catch(() => undefined)
+      } catch {
+        /* Preserve the shutdown failure. */
       }
     }
-
-    this.eventStream.setStatus('closed')
   }
 
   private async connectWithRetry(): Promise<NatsConnection> {
@@ -1188,7 +1291,7 @@ class DefaultNatsRuntime implements NatsRuntime {
         }
         if (this.closeRequested) {
           if (!connection.isClosed()) {
-            await connection.drain()
+            await connection.close()
           }
           throw new Error('The NATS runtime is closed')
         }
@@ -1626,6 +1729,17 @@ class DefaultNatsRuntime implements NatsRuntime {
 }
 
 export function createNatsRuntime(options: NatsRuntimeOptions): NatsRuntime {
+  positiveSafeInteger(options.maxBufferedEvents, 'maxBufferedEvents')
+  if (
+    options.shutdownTimeoutMs !== undefined &&
+    (!Number.isSafeInteger(options.shutdownTimeoutMs) ||
+      options.shutdownTimeoutMs < 0 ||
+      options.shutdownTimeoutMs > 2_147_483_647)
+  ) {
+    throw new RangeError(
+      'NATS runtime shutdownTimeoutMs must be an integer between 0 and 2147483647'
+    )
+  }
   for (const [name, value] of Object.entries(options.limits ?? {})) {
     if (!Number.isSafeInteger(value) || value < 0) {
       throw new RangeError(`NATS runtime limit ${name} must be a non-negative integer`)

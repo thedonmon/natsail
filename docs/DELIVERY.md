@@ -34,6 +34,8 @@ Memory and IndexedDB stores reject sequence regressions. A stale writer cannot r
 
 `processJetStream()` uses a named pull consumer with `AckPolicy.Explicit`. It acknowledges a message after the handler succeeds.
 
+Handlers may explicitly return a delayed `retry` or a terminal `term` disposition instead of success. Thrown errors still stop the processor. Optional progress heartbeats cover active handlers, and confirmed acknowledgements wait for the server before advancing the local acknowledgement position. See the [production guide](./PRODUCTION.md) for tuning, cancellation, and idempotency requirements.
+
 A failed handler leaves the message unacknowledged for server redelivery. The application can configure acknowledgement wait/backoff, maximum deliveries, maximum pending acknowledgements, metadata, acknowledgement sampling, replicas, memory storage, replay policy, and start position.
 
 Consumer ownership has three modes:
@@ -87,6 +89,8 @@ Call `runtime.reconnect()` after an authenticator receives new credentials. The 
 A reconnect can interrupt in-flight messages and requests. The configured nats.js reconnect behavior still applies.
 
 ## Resource limits and buffering
+
+Runtime event iterators have a bounded oldest-drop queue (256 events by default), with an explicit overflow diagnostic. Runtime shutdown has a 30-second default grace period and reports unfinished work when it expires. These are independent of JetStream pull capacity; see the [shutdown contract](./PRODUCTION.md#runtime-shutdown-and-observation).
 
 The JetStream adapter bounds each nats.js pull loop to 32 buffered messages by default. Set `maxBufferedMessages` to change this bound.
 
