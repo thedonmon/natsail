@@ -37,7 +37,7 @@
     "prototype:chat:verify": "pnpm example:gateway-chat:verify",
     "prototype:cloudflare-gateway": "node prototypes/cloudflare-durable-object-gateway/run.mjs",
     "release": "pnpm release:check && pnpm release:publish",
-    "release:check": "pnpm build && node scripts/verify-package-tarballs.mjs",
+    "release:check": "pnpm test:release && pnpm build && node scripts/verify-package-tarballs.mjs",
     "release:plan": "node scripts/publish-packages.mjs --dry-run",
     "release:publish": "node scripts/publish-packages.mjs",
     "release:version": "changeset version",
@@ -45,6 +45,7 @@
     "typecheck:tests": "tsc -p tsconfig.tests.json",
     "test:browser": "playwright test",
     "test:browser-broker": "playwright test --config playwright.browser-broker.config.ts",
+    "test:release": "vitest run tests/release-versioning.test.ts",
     "test:watch": "vitest"
   },
   "devDependencies": {
