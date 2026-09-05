@@ -27,7 +27,9 @@ const runtime = createNatsRuntime({
 })
 ```
 
-`close()` first stops new delivery and lets in-flight work finish. Its grace period includes connection drain and defaults to 30 seconds. On expiry, the runtime requests cancellation, force-closes its connection, and rejects with `NatsRuntimeShutdownTimeoutError`. Treat this as incomplete shutdown, not successful processing. Cleanup failures reject with `AggregateError`.
+`close()` drains managed Core subscriptions, allowing buffered and already-in-flight messages to finish, then drains the connection to flush outbound messages. JetStream processors stop pulling new work and finish their active handler. The runtime grace period includes connection drain and defaults to 30 seconds. On expiry, the runtime requests cancellation, force-closes its connection, and rejects with `NatsRuntimeShutdownTimeoutError`. Treat this as incomplete shutdown, not successful processing. Cleanup failures reject with `AggregateError`.
+
+NATS distinguishes [draining from closing](https://docs.nats.io/learn/resilient-clients/drain-and-shutdown): normal shutdown drains; immediate close is the fallback for failed or timed-out shutdown. A connection drain cannot recover messages discarded by an earlier subscription unsubscribe. Core lease close therefore drains that subscription and waits for its handler loop; explicit cancellation stops further delivery instead.
 
 Core handlers receive a third `{ signal }` argument; processor handlers receive it as their second argument. The signal is aborted on explicit cancellation or expiry of the runtime grace period. Pass it to cancellable I/O. Effect processor execution receives the same interruption through Effect's native abort signal. Ordinary handler functions that ignore the extra argument remain valid; mocks that invoke these callback types manually must supply the context.
 

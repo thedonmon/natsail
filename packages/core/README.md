@@ -84,6 +84,10 @@ See the [Core NATS example](https://github.com/thedonmon/natsail#core-nats-examp
 
 `shutdownTimeoutMs` bounds runtime close, including drain (default 30 seconds). Expiry requests cancellation, force-closes the connection, and rejects with `NatsRuntimeShutdownTimeoutError`. Resource cleanup failures reject with `AggregateError`. Core handlers receive a third `{ signal }` argument for cooperative cancellation; direct lease close still waits for in-flight handling.
 
+Normal Core lease close drains its subscription: buffered messages and messages already in flight finish before the lease closes. Runtime close waits for those handlers, then drains the connection to flush outbound messages. Explicit `AbortSignal` cancellation stops further handler delivery; deadline expiry also force-closes the connection. Direct lease close has no deadline of its own.
+
+This distinction follows the [NATS drain and shutdown guide](https://docs.nats.io/learn/resilient-clients/drain-and-shutdown) and [nats.js connection API](https://nats-io.github.io/nats.js/core/interfaces/NatsConnection.html): `drain()` performs an ordered shutdown, whereas `close()` does not provide the same pending-message guarantees.
+
 `maxBufferedEvents` bounds each runtime-event iterator (default 256). Slow iterators lose oldest events and receive an `event-buffer-overflow` diagnostic before retained events. `runtime.inspect()` supplies current state.
 
 See the [production guide](https://github.com/thedonmon/natsail/blob/main/docs/PRODUCTION.md) for supported versions, worker tuning, and deployment checks.

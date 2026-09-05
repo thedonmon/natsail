@@ -922,15 +922,17 @@ class CoreSubscription<T> implements SubscriptionLease {
   async close(): Promise<void> {
     if (!this.closeRequested) {
       this.closeRequested = true
-      this.subscription?.unsubscribe()
+      // Drain stops server delivery without discarding the iterator's buffered messages.
+      if (this.subscription && !this.subscription.isClosed()) await this.subscription.drain()
     }
 
     return this.closed
   }
 
   abort(reason: Error): void {
+    this.closeRequested = true
     this.cancellation.abort(reason)
-    void this.close().catch(() => undefined)
+    this.subscription?.unsubscribe()
   }
 
   private async start(connectionPromise: Promise<NatsConnection>): Promise<void> {
@@ -950,17 +952,15 @@ class CoreSubscription<T> implements SubscriptionLease {
         : connection.subscribe(this.options.subject)
 
       abort = () => {
-        this.cancellation.abort(this.options.signal?.reason)
-        void this.close().catch(() => undefined)
+        this.abort(this.options.signal?.reason)
       }
       this.options.signal?.addEventListener('abort', abort, { once: true })
       this.resolveReady()
 
       for await (const message of this.subscription) {
-        if (this.closeRequested) break
+        this.cancellation.signal.throwIfAborted()
         const value = await decodePayload(this.options, message)
         this.cancellation.signal.throwIfAborted()
-        if (this.closeRequested) break
         await this.handler(value, message, { signal: this.cancellation.signal })
         this.cancellation.signal.throwIfAborted()
       }
