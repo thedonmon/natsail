@@ -68,6 +68,8 @@ await worker.ready
 - `term` is an explicit discard decision, not a dead-letter queue. Store any required failure record before returning it. NAK and terminal commands are not server-confirmed by the acknowledgement option.
 - A retry creates an acknowledgement gap. Recovery must not skip that unfinished delivery merely because later messages succeed; conservative replay can produce duplicates.
 
+Processors request idle pull heartbeats every five seconds so the NATS client can detect a stalled pull even when its connection stays open during a consumer leader change. These server-to-client heartbeats are separate from `progressIntervalMs`, which extends the acknowledgement window of an active handler. Detection and recovery still depend on event-loop responsiveness and cluster availability; this is not a failover-time guarantee.
+
 Neither confirmed acknowledgements nor progress heartbeats make external side effects exactly once. Use stable job IDs and application-level idempotency. Use retained consumers (`ensure` or administrator-managed `bind`) for jobs that must survive worker lifecycle changes.
 
 ## What CI proves

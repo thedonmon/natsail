@@ -165,6 +165,57 @@ function runtime(telemetryEvents?: NatsailTelemetryEvent[], shutdownTimeoutMs?: 
 }
 
 describe('recovering explicit-ack JetStream processor', () => {
+  it.each([{ maxBufferedMessages: 8 }, { maxBufferedBytes: 4_096 }])(
+    'requests five-second idle heartbeats with buffer %j',
+    async (buffer) => {
+      const active = consumer([], undefined, true)
+      jetStreamMocks.getConsumer.mockResolvedValue(active)
+      const nats = runtime()
+      const lease = processJetStream(
+        nats,
+        {
+          stream,
+          consumer: { mode: 'ensure', name: 'processor' },
+          filter: subject,
+          start: 'all',
+          codec: natsCodecs.text,
+          ...buffer,
+        },
+        () => undefined
+      )
+      try {
+        await lease.ready
+        expect(active.consume).toHaveBeenCalledWith({
+          ...('maxBufferedMessages' in buffer
+            ? { max_messages: buffer.maxBufferedMessages }
+            : { max_bytes: buffer.maxBufferedBytes }),
+          idle_heartbeat: 5_000,
+        })
+      } finally {
+        await nats.close()
+      }
+    }
+  )
+  it('reports owned-consumer cleanup failures from runtime shutdown', async () => {
+    const failure = new Error('delete denied')
+    jetStreamMocks.deleteConsumer.mockRejectedValue(failure)
+    jetStreamMocks.getConsumer.mockResolvedValue(consumer([], undefined, true))
+    const nats = runtime()
+    const lease = processJetStream(
+      nats,
+      {
+        stream,
+        consumer: { mode: 'owned', name: 'processor' },
+        filter: subject,
+        start: 'all',
+        codec: natsCodecs.text,
+      },
+      () => undefined
+    )
+    await lease.ready
+    await expect(nats.close()).rejects.toMatchObject({ name: 'AggregateError', errors: [failure] })
+    expect(nats.inspect().connection.state).toBe('closed')
+  })
   it.each([0, -1, 1.5, Number.POSITIVE_INFINITY, 100])(
     'rejects unsafe progress interval %s before connecting',
     (progressIntervalMs) => {
@@ -400,7 +451,7 @@ describe('recovering explicit-ack JetStream processor', () => {
       await vi.advanceTimersByTimeAsync(75)
       expect(delivery.working).toHaveBeenCalledTimes(3)
       expect(delivery.ack).not.toHaveBeenCalled()
-      expect(active.consume).toHaveBeenCalledWith({ max_messages: 1 })
+      expect(active.consume).toHaveBeenCalledWith({ max_messages: 1, idle_heartbeat: 5_000 })
       release()
       await vi.advanceTimersByTimeAsync(0)
       await lease.close()

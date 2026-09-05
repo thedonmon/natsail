@@ -1,6 +1,6 @@
 import { connect } from '@nats-io/transport-node'
-import { createNatsRuntime, natsCodecs } from '@natsail/core'
-import { processJetStream } from '@natsail/jetstream'
+import { createNatsRuntime, natsCodecs } from '../../../packages/core/dist/index.js'
+import { processJetStream } from '../../../packages/jetstream/dist/index.js'
 
 const [stream, subject, consumer] = process.argv.slice(2)
 const runtime = createNatsRuntime({

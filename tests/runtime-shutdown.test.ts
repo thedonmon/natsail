@@ -12,18 +12,20 @@ function deferred<T>() {
 
 function transport() {
   const disconnected = deferred<void>()
+  const unsubscribed = deferred<void>()
   let stopped = false
   const subscription = {
     async *[Symbol.asyncIterator]() {
       yield { data: natsCodecs.text.encode('work') } as Msg
-      await disconnected.promise
+      await unsubscribed.promise
     },
-    unsubscribe: () => undefined,
+    unsubscribe: () => unsubscribed.resolve(),
     closed: Promise.resolve(undefined),
   } as unknown as Subscription
   const close = vi.fn(async () => {
     stopped = true
     disconnected.resolve()
+    unsubscribed.resolve()
   })
   const connection = {
     subscribe: () => subscription,
@@ -58,10 +60,18 @@ describe('bounded runtime shutdown', () => {
   it('still drains successfully when a handler finishes within the grace period', async () => {
     const network = transport()
     const runtime = createNatsRuntime({ connect: async () => network.connection })
-    const lease = runtime.subscribe({ subject: 'work', codec: natsCodecs.text }, () => undefined)
-    await lease.ready
-    await network.close()
-    await expect(runtime.close()).resolves.toBeUndefined()
+    const started = deferred<void>()
+    const release = deferred<void>()
+    const lease = runtime.subscribe({ subject: 'work', codec: natsCodecs.text }, async () => {
+      started.resolve()
+      await release.promise
+    })
+    await started.promise
+    const closing = runtime.close()
+    expect(network.close).not.toHaveBeenCalled()
+    release.resolve()
+    await expect(closing).resolves.toBeUndefined()
+    expect(network.close).toHaveBeenCalledOnce()
     await expect(lease.closed).resolves.toBeUndefined()
   })
 

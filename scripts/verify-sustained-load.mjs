@@ -3,8 +3,8 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { monitorEventLoopDelay, performance } from 'node:perf_hooks'
 import { connect } from '@nats-io/transport-node'
 import { jetstream, jetstreamManager, StorageType } from '@nats-io/jetstream'
-import { createNatsRuntime, natsCodecs } from '@natsail/core'
-import { processJetStream } from '@natsail/jetstream'
+import { createNatsRuntime, natsCodecs } from '../packages/core/dist/index.js'
+import { processJetStream } from '../packages/jetstream/dist/index.js'
 
 const seconds = Number(process.env.NATSAIL_LOAD_SECONDS ?? 10)
 assert(

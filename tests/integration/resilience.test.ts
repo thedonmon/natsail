@@ -122,7 +122,14 @@ describe.skipIf(process.env.NATSAIL_CLUSTER_TEST !== '1')('isolated three-node r
         )
         .toBe(true)
       await f.client.publish(f.subject, 'after')
-      await expect.poll(() => received.has('after'), { timeout: 20_000 }).toBe(true)
+      try {
+        await expect.poll(() => received.has('after'), { timeout: 20_000 }).toBe(true)
+      } catch (cause) {
+        throw new Error(
+          `Failover stalled: ${JSON.stringify({ runtime: f.runtime.inspect(), processor: lease.inspect(), consumer: await f.manager.consumers.info(f.stream, 'resilient') })}`,
+          { cause }
+        )
+      }
       await expect.poll(() => lease.inspect().acknowledged.stream, { timeout: 20_000 }).toBe(2)
       expect(received).toEqual(new Set(['before', 'after']))
     } finally {
@@ -137,11 +144,16 @@ describe.skipIf(process.env.NATSAIL_CLUSTER_TEST !== '1')('isolated three-node r
     const child = fork(
       fileURLToPath(new URL('../fixtures/cluster/crash-worker.mjs', import.meta.url)),
       [f.stream, f.subject, 'crash-worker'],
-      { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] }
+      { stdio: ['ignore', 'ignore', 'inherit', 'ipc'], execArgv: [] }
     )
     const exited = once(child, 'exit')
     try {
-      const handling = once(child, 'message', { signal: AbortSignal.timeout(15_000) })
+      const handling = Promise.race([
+        once(child, 'message', { signal: AbortSignal.timeout(15_000) }),
+        exited.then(([code, signal]) => {
+          throw new Error(`Worker exited before handling: code=${code}, signal=${signal}`)
+        }),
+      ])
       await f.client.publish(f.subject, 'unfinished')
       expect((await handling)[0]).toBe('handling')
       child.kill('SIGKILL')

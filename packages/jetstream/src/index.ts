@@ -1194,7 +1194,9 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
                 (this.options.progressIntervalMs === undefined ? 32 : 1),
             }
           : { max_bytes: this.options.maxBufferedBytes }
-      this.messages = await this.consumer.consume(consumeOptions)
+      // A leader can disappear without disconnecting this client's server. Detect
+      // that stalled pull via the SDK's heartbeat recovery, not only reconnects.
+      this.messages = await this.consumer.consume({ ...consumeOptions, idle_heartbeat: 5_000 })
       void this.observeDiagnostics(runtime, this.messages)
       abort = () => {
         this.cancellation.abort(this.options.signal?.reason)
