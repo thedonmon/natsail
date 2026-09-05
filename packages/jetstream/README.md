@@ -87,6 +87,14 @@ The checkpoint scope includes normalized filters. Set `resume.scope` when a code
 
 See the [NATSail README](https://github.com/thedonmon/natsail#explicit-ack-processing-example) for the explicit-ack example and the separate ordered-consumer acknowledgement boundary.
 
+## Long-running and failure-aware processors
+
+Set `progressIntervalMs` below the effective acknowledgement wait to send in-progress updates during a handler. With heartbeats enabled, the default pull buffer is one message. Use `acknowledgement: { mode: 'confirmed', timeoutMs: 5_000 }` to wait for acknowledgement receipt before advancing the local acknowledged position.
+
+Handlers receive a second `{ signal }` argument for cancellation. Returning nothing acknowledges success; returning `{ action: 'retry', delayMs: 500 }` requests delayed redelivery; `{ action: 'term', reason: 'unsupported schema' }` explicitly stops redelivery. Thrown errors remain terminal for the processor. Confirmed acknowledgement does not apply to retry or terminal commands, and external side effects still require idempotency.
+
+Forced runtime shutdown preserves owned consumers and prevents late handler results from being acknowledged. See the [production guide](https://github.com/thedonmon/natsail/blob/main/docs/PRODUCTION.md) for the full shutdown contract and configuration examples.
+
 ## License
 
 Apache-2.0

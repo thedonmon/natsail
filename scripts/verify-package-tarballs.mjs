@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { verifyConsumerBundles } from './verify-consumer-bundles.mjs'
 
 const repositoryRoot = fileURLToPath(new URL('..', import.meta.url))
 const packages = [
@@ -126,6 +127,7 @@ try {
 
   run('pnpm', ['install', '--ignore-scripts'], consumerRoot)
   process.stdout.write(run('node', ['smoke.mjs'], consumerRoot))
+  await verifyConsumerBundles(consumerRoot)
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true })
 }

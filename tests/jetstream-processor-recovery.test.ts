@@ -142,7 +142,7 @@ function consumerInfo(config: Partial<ConsumerConfig>): ConsumerInfo {
   }
 }
 
-function runtime(telemetryEvents?: NatsailTelemetryEvent[]) {
+function runtime(telemetryEvents?: NatsailTelemetryEvent[], shutdownTimeoutMs?: number) {
   let closeConnection!: () => void
   const closed = new Promise<void>((resolve) => {
     closeConnection = resolve
@@ -150,12 +150,14 @@ function runtime(telemetryEvents?: NatsailTelemetryEvent[]) {
   const connection = {
     closed: () => closed,
     drain: vi.fn(async () => closeConnection()),
+    close: vi.fn(async () => closeConnection()),
     getServer: vi.fn(() => 'mock:4222'),
     isClosed: vi.fn(() => false),
     status: async function* () {},
   } as unknown as NatsConnection
   return createNatsRuntime({
     connect: async () => connection,
+    ...(shutdownTimeoutMs === undefined ? {} : { shutdownTimeoutMs }),
     ...(telemetryEvents === undefined
       ? {}
       : { telemetry: { record: (event) => telemetryEvents.push(event) } }),
@@ -163,6 +165,342 @@ function runtime(telemetryEvents?: NatsailTelemetryEvent[]) {
 }
 
 describe('recovering explicit-ack JetStream processor', () => {
+  it.each([{ maxBufferedMessages: 8 }, { maxBufferedBytes: 4_096 }])(
+    'requests five-second idle heartbeats with buffer %j',
+    async (buffer) => {
+      const active = consumer([], undefined, true)
+      jetStreamMocks.getConsumer.mockResolvedValue(active)
+      const nats = runtime()
+      const lease = processJetStream(
+        nats,
+        {
+          stream,
+          consumer: { mode: 'ensure', name: 'processor' },
+          filter: subject,
+          start: 'all',
+          codec: natsCodecs.text,
+          ...buffer,
+        },
+        () => undefined
+      )
+      try {
+        await lease.ready
+        expect(active.consume).toHaveBeenCalledWith({
+          ...('maxBufferedMessages' in buffer
+            ? { max_messages: buffer.maxBufferedMessages }
+            : { max_bytes: buffer.maxBufferedBytes }),
+          idle_heartbeat: 5_000,
+        })
+      } finally {
+        await nats.close()
+      }
+    }
+  )
+  it('reports owned-consumer cleanup failures from runtime shutdown', async () => {
+    const failure = new Error('delete denied')
+    jetStreamMocks.deleteConsumer.mockRejectedValue(failure)
+    jetStreamMocks.getConsumer.mockResolvedValue(consumer([], undefined, true))
+    const nats = runtime()
+    const lease = processJetStream(
+      nats,
+      {
+        stream,
+        consumer: { mode: 'owned', name: 'processor' },
+        filter: subject,
+        start: 'all',
+        codec: natsCodecs.text,
+      },
+      () => undefined
+    )
+    await lease.ready
+    await expect(nats.close()).rejects.toMatchObject({ name: 'AggregateError', errors: [failure] })
+    expect(nats.inspect().connection.state).toBe('closed')
+  })
+  it.each([0, -1, 1.5, Number.POSITIVE_INFINITY, 100])(
+    'rejects unsafe progress interval %s before connecting',
+    (progressIntervalMs) => {
+      const nats = runtime()
+      expect(() =>
+        processJetStream(
+          nats,
+          {
+            stream,
+            consumer: { mode: 'ensure', name: 'processor' },
+            filter: subject,
+            start: 'all',
+            codec: natsCodecs.text,
+            ackWaitMs: 100,
+            progressIntervalMs,
+          },
+          () => undefined
+        )
+      ).toThrow('progressIntervalMs')
+      expect(jetStreamMocks.getConsumer).not.toHaveBeenCalled()
+    }
+  )
+
+  it('retains an earlier retry boundary when later work succeeds before recovery', async () => {
+    const first = message(1, 'retry')
+    first.nak = vi.fn()
+    const second = message(2, 'success')
+    const starting = consumerInfo({ deliver_policy: DeliverPolicy.New })
+    let active: ConsumerInfo | undefined
+    jetStreamMocks.addConsumer.mockImplementation(async (_stream, config) => {
+      active = consumerInfo(config)
+      return active
+    })
+    jetStreamMocks.infoConsumer.mockImplementation(async () => {
+      if (!active) throw { code: 404 }
+      return active
+    })
+    jetStreamMocks.getConsumer
+      .mockResolvedValueOnce(consumer([first, second], new Error('lost consumer'), false, starting))
+      .mockResolvedValue(consumer([], undefined, true, starting))
+    const nats = runtime()
+    const lease = processJetStream(
+      nats,
+      {
+        stream,
+        consumer: { mode: 'owned', name: 'processor' },
+        filter: subject,
+        start: 'new',
+        codec: natsCodecs.text,
+        recovery: { maxAttempts: 2, delayMs: 0 },
+      },
+      ({ value }) => {
+        if (value === 'retry') return { action: 'retry', delayMs: 250 }
+        active = undefined
+      }
+    )
+    try {
+      await lease.ready
+      await vi.waitFor(() => expect(jetStreamMocks.addConsumer).toHaveBeenCalledTimes(2))
+      expect(jetStreamMocks.addConsumer).toHaveBeenLastCalledWith(
+        stream,
+        expect.objectContaining({ deliver_policy: DeliverPolicy.StartSequence, opt_start_seq: 1 })
+      )
+    } finally {
+      await lease.close().catch(() => undefined)
+      await nats.close().catch(() => undefined)
+    }
+  })
+  it.each([false, true])(
+    'does not ack late work or delete its consumer after forced shutdown (recovery=%s)',
+    async (recovering) => {
+      vi.useFakeTimers()
+      const delivery = message(1, 'one')
+      delivery.working = vi.fn()
+      jetStreamMocks.getConsumer.mockResolvedValue(consumer([delivery], undefined, true))
+      const nats = runtime(undefined, 50)
+      let release!: () => void
+      let started!: () => void
+      const handling = new Promise<void>((resolve) => {
+        started = resolve
+      })
+      const pending = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      let signal: AbortSignal | undefined
+      const lease = processJetStream(
+        nats,
+        {
+          stream,
+          consumer: { mode: 'owned', name: 'processor' },
+          filter: subject,
+          start: 'all',
+          codec: natsCodecs.text,
+          progressIntervalMs: 10,
+          ...(recovering ? { recovery: { delayMs: 0 } } : {}),
+        },
+        async (_delivery, context) => {
+          signal = context.signal
+          started()
+          await pending
+        }
+      )
+      try {
+        await handling
+        const closing = nats.close().catch((error: unknown) => error)
+        await vi.advanceTimersByTimeAsync(50)
+        await expect(closing).resolves.toMatchObject({ name: 'NatsRuntimeShutdownTimeoutError' })
+        expect(signal?.aborted).toBe(true)
+        const progressBefore = vi.mocked(delivery.working).mock.calls.length
+        await vi.advanceTimersByTimeAsync(100)
+        expect(delivery.working).toHaveBeenCalledTimes(progressBefore)
+        release()
+        await lease.closed.catch(() => undefined)
+        expect(delivery.ack).not.toHaveBeenCalled()
+        expect(jetStreamMocks.deleteConsumer).not.toHaveBeenCalled()
+      } finally {
+        release()
+        await lease.close().catch(() => undefined)
+        vi.useRealTimers()
+      }
+    }
+  )
+
+  it('keeps unconfirmed work out of the acknowledged position', async () => {
+    const delivery = message(1, 'one')
+    delivery.ackAck = vi.fn(async () => false)
+    jetStreamMocks.getConsumer.mockResolvedValue(consumer([delivery]))
+    const nats = runtime()
+    const lease = processJetStream(
+      nats,
+      {
+        stream,
+        consumer: { mode: 'ensure', name: 'processor' },
+        filter: subject,
+        start: 'all',
+        codec: natsCodecs.text,
+        acknowledgement: { mode: 'confirmed' },
+      },
+      () => undefined
+    )
+    await expect(lease.closed).rejects.toMatchObject({ name: 'JetStreamAcknowledgementError' })
+    expect(lease.inspect().acknowledged.stream).toBe(0)
+    await nats.close()
+  })
+  it('terminates a poison message only on an explicit handler decision', async () => {
+    const first = message(1, 'poison')
+    first.term = vi.fn()
+    const second = message(2, 'success')
+    jetStreamMocks.getConsumer.mockResolvedValue(consumer([first, second], undefined, true))
+    const nats = runtime()
+    const lease = processJetStream(
+      nats,
+      {
+        stream,
+        consumer: { mode: 'ensure', name: 'processor' },
+        filter: subject,
+        start: 'all',
+        codec: natsCodecs.text,
+      },
+      ({ value }) =>
+        value === 'poison' ? { action: 'term', reason: 'unsupported job schema' } : undefined
+    )
+    try {
+      await lease.ready
+      await vi.waitFor(() => expect(second.ack).toHaveBeenCalledOnce())
+      expect(first.term).toHaveBeenCalledWith('unsupported job schema')
+      expect(first.ack).not.toHaveBeenCalled()
+    } finally {
+      await lease.close().catch(() => undefined)
+      await nats.close().catch(() => undefined)
+    }
+  })
+  it('allows an explicit delayed retry without acknowledging the failed delivery', async () => {
+    const first = message(1, 'retry')
+    first.nak = vi.fn()
+    const second = message(2, 'success')
+    jetStreamMocks.getConsumer.mockResolvedValue(consumer([first, second], undefined, true))
+    const nats = runtime()
+    const lease = processJetStream(
+      nats,
+      {
+        stream,
+        consumer: { mode: 'ensure', name: 'processor' },
+        filter: subject,
+        start: 'all',
+        codec: natsCodecs.text,
+      },
+      ({ value }) => (value === 'retry' ? { action: 'retry', delayMs: 250 } : undefined)
+    )
+    try {
+      await lease.ready
+      await vi.waitFor(() => expect(second.ack).toHaveBeenCalledOnce())
+      expect(first.nak).toHaveBeenCalledWith(250)
+      expect(first.ack).not.toHaveBeenCalled()
+    } finally {
+      await lease.close()
+      await nats.close()
+    }
+  })
+  it('keeps a slow handler alive and stops progress updates after processing', async () => {
+    vi.useFakeTimers()
+    const delivery = message(1, 'one')
+    delivery.working = vi.fn()
+    const active = consumer([delivery], undefined, true)
+    jetStreamMocks.getConsumer.mockResolvedValue(active)
+    const nats = runtime()
+    let release!: () => void
+    let started!: () => void
+    const handling = new Promise<void>((resolve) => {
+      started = resolve
+    })
+    const pending = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const lease = processJetStream(
+      nats,
+      {
+        stream,
+        consumer: { mode: 'ensure', name: 'processor' },
+        filter: subject,
+        start: 'all',
+        codec: natsCodecs.text,
+        ackWaitMs: 100,
+        progressIntervalMs: 25,
+      },
+      async () => {
+        started()
+        await pending
+      }
+    )
+    try {
+      await handling
+      await vi.advanceTimersByTimeAsync(75)
+      expect(delivery.working).toHaveBeenCalledTimes(3)
+      expect(delivery.ack).not.toHaveBeenCalled()
+      expect(active.consume).toHaveBeenCalledWith({ max_messages: 1, idle_heartbeat: 5_000 })
+      release()
+      await vi.advanceTimersByTimeAsync(0)
+      await lease.close()
+      await vi.advanceTimersByTimeAsync(100)
+      expect(delivery.working).toHaveBeenCalledTimes(3)
+      expect(delivery.ack).toHaveBeenCalledOnce()
+    } finally {
+      release()
+      await lease.close().catch(() => undefined)
+      await nats.close()
+      vi.useRealTimers()
+    }
+  })
+  it('does not advance the acknowledgement boundary before server confirmation', async () => {
+    let confirm!: (accepted: boolean) => void
+    const delivery = message(1, 'one')
+    delivery.ackAck = vi.fn(
+      () =>
+        new Promise<boolean>((resolve) => {
+          confirm = resolve
+        })
+    )
+    jetStreamMocks.getConsumer.mockResolvedValue(consumer([delivery], undefined, true))
+    const nats = runtime()
+    const lease = processJetStream(
+      nats,
+      {
+        stream,
+        consumer: { mode: 'ensure', name: 'processor' },
+        filter: subject,
+        start: 'all',
+        codec: natsCodecs.text,
+        acknowledgement: { mode: 'confirmed', timeoutMs: 500 },
+      },
+      () => undefined
+    )
+    try {
+      await lease.ready
+      await vi.waitFor(() => expect(delivery.ackAck).toHaveBeenCalledWith({ timeout: 500 }))
+      expect(lease.inspect().acknowledged.stream).toBe(0)
+      confirm(true)
+      await vi.waitFor(() => expect(lease.inspect().acknowledged.stream).toBe(1))
+      expect(delivery.ack).not.toHaveBeenCalled()
+    } finally {
+      confirm?.(true)
+      await lease.close()
+      await nats.close()
+    }
+  })
   beforeEach(() => {
     let active: ConsumerInfo | undefined
     jetStreamMocks.addConsumer.mockReset().mockImplementation(async (_stream, config) => {

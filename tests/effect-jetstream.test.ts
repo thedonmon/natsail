@@ -414,61 +414,67 @@ describe('Effect JetStream adapter', () => {
     expect(controlled.close).toHaveBeenCalledOnce()
   })
 
-  it('does not complete a processor handler until its Effect succeeds', async () => {
-    let processorHandler!: JetStreamProcessorHandler<number>
-    const closed = deferred<void>()
-    const close = vi.fn(async () => closed.resolve())
-    const lease: SubscriptionLease = {
-      ready: Promise.resolve(),
-      closed: closed.promise,
-      close,
-    }
-    jetStreamMocks.processJetStream.mockImplementation(
-      (
-        _runtime: NatsRuntime,
-        _options: JetStreamProcessorOptions<number>,
-        handler: JetStreamProcessorHandler<number>
-      ) => {
-        processorHandler = handler
-        return lease
+  it.each([undefined, { action: 'retry' as const, delayMs: 250 }])(
+    'returns a processor disposition only after its Effect succeeds (%j)',
+    async (disposition) => {
+      let processorHandler!: JetStreamProcessorHandler<number>
+      const closed = deferred<void>()
+      const close = vi.fn(async () => closed.resolve())
+      const lease: SubscriptionLease = {
+        ready: Promise.resolve(),
+        closed: closed.promise,
+        close,
       }
-    )
-    let releaseHandler!: () => void
-    const handlerMayFinish = new Promise<void>((resolve) => {
-      releaseHandler = resolve
-    })
-    const service = makeNatsail({
-      runtime: runtimeStub(),
-      sessions: createSessionRegistry(),
-    })
-    const processor = Effect.runFork(
-      service.runJetStreamProcessor(
-        {
-          stream: 'ORDERS',
-          consumer: { mode: 'ensure', name: 'effect-orders' },
-          filter: 'jobs.orders',
-          start: 'all',
-          decode: () => 0,
-        },
-        () => Effect.promise(() => handlerMayFinish)
+      jetStreamMocks.processJetStream.mockImplementation(
+        (
+          _runtime: NatsRuntime,
+          _options: JetStreamProcessorOptions<number>,
+          handler: JetStreamProcessorHandler<number>
+        ) => {
+          processorHandler = handler
+          return lease
+        }
       )
-    )
+      let releaseHandler!: () => void
+      const handlerMayFinish = new Promise<void>((resolve) => {
+        releaseHandler = resolve
+      })
+      const service = makeNatsail({
+        runtime: runtimeStub(),
+        sessions: createSessionRegistry(),
+      })
+      const processor = Effect.runFork(
+        service.runJetStreamProcessor(
+          {
+            stream: 'ORDERS',
+            consumer: { mode: 'ensure', name: 'effect-orders' },
+            filter: 'jobs.orders',
+            start: 'all',
+            decode: () => 0,
+          },
+          () => Effect.promise(() => handlerMayFinish).pipe(Effect.as(disposition))
+        )
+      )
 
-    await vi.waitFor(() => expect(jetStreamMocks.processJetStream).toHaveBeenCalledOnce())
-    let accepted = false
-    const processing = Promise.resolve(processorHandler(processingDelivery(42, 1))).then(() => {
-      accepted = true
-    })
-    await new Promise((resolve) => setTimeout(resolve, 10))
-    expect(accepted).toBe(false)
+      await vi.waitFor(() => expect(jetStreamMocks.processJetStream).toHaveBeenCalledOnce())
+      let accepted = false
+      const processing = Promise.resolve(
+        processorHandler(processingDelivery(42, 1), { signal: new AbortController().signal })
+      ).then((result) => {
+        accepted = true
+        return result
+      })
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      expect(accepted).toBe(false)
 
-    releaseHandler()
-    await processing
-    expect(accepted).toBe(true)
-    closed.resolve()
-    await Effect.runPromise(Fiber.join(processor))
-    expect(close).toHaveBeenCalledOnce()
-  })
+      releaseHandler()
+      expect(await processing).toEqual(disposition)
+      expect(accepted).toBe(true)
+      closed.resolve()
+      await Effect.runPromise(Fiber.join(processor))
+      expect(close).toHaveBeenCalledOnce()
+    }
+  )
 
   it('preserves a processor Effect typed failure', async () => {
     let processorHandler!: JetStreamProcessorHandler<number>
@@ -508,7 +514,9 @@ describe('Effect JetStream adapter', () => {
     )
 
     await vi.waitFor(() => expect(jetStreamMocks.processJetStream).toHaveBeenCalledOnce())
-    const rejected = processorHandler(processingDelivery(42, 1))
+    const rejected = processorHandler(processingDelivery(42, 1), {
+      signal: new AbortController().signal,
+    })
     await expect(rejected).rejects.toBeDefined()
     try {
       await rejected

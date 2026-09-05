@@ -4,6 +4,38 @@ import type { NatsConnection, Status } from '@nats-io/nats-core'
 import { createNatsRuntime } from '@natsail/core'
 
 describe('runtime initial connection retry', () => {
+  it.each([0, -1, 1.5, Number.POSITIVE_INFINITY])(
+    'rejects invalid event capacity %s',
+    (maxBufferedEvents) => {
+      expect(() =>
+        createNatsRuntime({ connect: async () => fakeConnection(), maxBufferedEvents })
+      ).toThrow('maxBufferedEvents')
+    }
+  )
+  it('bounds a stalled event subscriber and reports the gap before retained events', async () => {
+    const controlled = controllableConnection('nats://test')
+    const runtime = createNatsRuntime({
+      connect: async () => controlled.connection,
+      maxBufferedEvents: 2,
+    })
+    await runtime.connection()
+    const stalled = runtime.events[Symbol.asyncIterator]()
+    for (let attempt = 0; attempt < 5; attempt += 1) await runtime.reconnect()
+    await runtime.close()
+    const retained = []
+    for (;;) {
+      const result = await stalled.next()
+      if (result.done) break
+      retained.push(result.value)
+    }
+    expect(retained).toHaveLength(3)
+    expect(retained[0]).toMatchObject({
+      type: 'diagnostic',
+      code: 'event-buffer-overflow',
+      details: { capacity: 2 },
+    })
+    expect(retained.at(-1)).toMatchObject({ type: 'status', state: 'closed' })
+  })
   it('retries a bounded number of times and shares the successful connection', async () => {
     vi.useFakeTimers()
     try {

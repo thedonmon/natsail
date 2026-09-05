@@ -59,6 +59,8 @@ void (async () => {
         type: 'module',
       }).port,
     strict: true,
+    heartbeatIntervalMs: 250,
+    requestTimeoutMs: 2_000,
   })
 
   window.natsailBrowserBroker = {
@@ -68,6 +70,7 @@ void (async () => {
       await client.close()
     },
     nextMessage,
+    reconnect: () => client.reconnect(),
     publish: (subject, value) => client.publish(subject, encoder.encode(value)),
     request: async (subject, value) =>
       decoder.decode(await client.request(subject, encoder.encode(value))),
@@ -88,6 +91,7 @@ declare global {
     natsailBrowserBroker: {
       close(): Promise<void>
       nextMessage(subject: string): Promise<string>
+      reconnect(): Promise<void>
       publish(subject: string, value: string): Promise<void>
       request(subject: string, value: string): Promise<string>
       stats(): Promise<BrowserBrokerStats>
