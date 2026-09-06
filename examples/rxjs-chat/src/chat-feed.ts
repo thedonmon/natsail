@@ -1,5 +1,3 @@
-import { type Subscription } from 'rxjs'
-
 import {
   natsailDefaultScheduler,
   natsCodecs,
@@ -89,8 +87,8 @@ const reduceConversation = (
 
 export class RxjsChatController {
   private readonly listeners = new Set<() => void>()
-  private activeSubscription?: Subscription
-  private notificationSubscription?: Subscription
+  private activeController?: AbortController
+  private notificationController?: AbortController
   private loadStartedAt = performance.now()
   private previousEntryCount = 0
   private closed = false
@@ -123,7 +121,8 @@ export class RxjsChatController {
 
   selectConversation = (conversationId: string, updateUrl = true): void => {
     if (!demoConversations.some((conversation) => conversation.id === conversationId)) return
-    this.activeSubscription?.unsubscribe()
+    this.activeController?.abort()
+    this.activeController = new AbortController()
     resetPerformanceTelemetry()
     this.loadStartedAt = performance.now()
     this.previousEntryCount = 0
@@ -165,45 +164,48 @@ export class RxjsChatController {
       }
     )
 
-    this.activeSubscription = observeNatsJetStreamState(this.sessions, definition, {
+    observeNatsJetStreamState(this.sessions, definition, {
       batchPolicy: { maxItems: 256, maxWaitMs: 16 },
-    }).subscribe({
-      next: (snapshot) => {
-        if (snapshot.phase !== 'live') return
-        const batchSize = Math.max(0, snapshot.data.entries.length - this.previousEntryCount)
-        this.previousEntryCount = snapshot.data.entries.length
-        const firstLive = this.state.phase !== 'live'
-        const last = snapshot.data.entries.at(-1)?.message
-        this.patch({
-          entries: snapshot.data.entries,
-          phase: 'live',
-          metrics: {
-            ...this.state.metrics,
-            historyEvents: snapshot.replay.delivered,
-            ...(firstLive ? { historyReadyMs: performance.now() - this.loadStartedAt } : {}),
-            stateUpdates: this.state.metrics.stateUpdates + 1,
-            lastBatchSize: batchSize,
-            largestBatchSize: firstLive
-              ? 0
-              : Math.max(this.state.metrics.largestBatchSize, batchSize),
-            ...readPerformanceTelemetry(),
-          },
-          ...(last
-            ? {
-                activity: {
-                  ...this.state.activity,
-                  [conversationId]: {
-                    preview: last.body,
-                    updatedAt: last.sentAt,
-                    unread: 0,
+    }).subscribe(
+      {
+        next: (snapshot) => {
+          if (snapshot.phase !== 'live') return
+          const batchSize = Math.max(0, snapshot.data.entries.length - this.previousEntryCount)
+          this.previousEntryCount = snapshot.data.entries.length
+          const firstLive = this.state.phase !== 'live'
+          const last = snapshot.data.entries.at(-1)?.message
+          this.patch({
+            entries: snapshot.data.entries,
+            phase: 'live',
+            metrics: {
+              ...this.state.metrics,
+              historyEvents: snapshot.replay.delivered,
+              ...(firstLive ? { historyReadyMs: performance.now() - this.loadStartedAt } : {}),
+              stateUpdates: this.state.metrics.stateUpdates + 1,
+              lastBatchSize: batchSize,
+              largestBatchSize: firstLive
+                ? 0
+                : Math.max(this.state.metrics.largestBatchSize, batchSize),
+              ...readPerformanceTelemetry(),
+            },
+            ...(last
+              ? {
+                  activity: {
+                    ...this.state.activity,
+                    [conversationId]: {
+                      preview: last.body,
+                      updatedAt: last.sentAt,
+                      unread: 0,
+                    },
                   },
-                },
-              }
-            : {}),
-        })
+                }
+              : {}),
+          })
+        },
+        error: () => this.patch({ phase: 'error' }),
       },
-      error: () => this.patch({ phase: 'error' }),
-    })
+      { signal: this.activeController.signal }
+    )
   }
 
   send = async (body: string): Promise<void> => {
@@ -297,12 +299,13 @@ export class RxjsChatController {
   async close(): Promise<void> {
     if (this.closed) return
     this.closed = true
-    this.activeSubscription?.unsubscribe()
-    this.notificationSubscription?.unsubscribe()
+    this.activeController?.abort()
+    this.notificationController?.abort()
   }
 
   private startNotifications(): void {
-    this.notificationSubscription = observeNatsCoreSubscription(
+    this.notificationController = new AbortController()
+    observeNatsCoreSubscription(
       this.sessions,
       this.runtime,
       'rxjs-performance-chat:notifications',
@@ -310,7 +313,12 @@ export class RxjsChatController {
         subject: `${chatSubjectPrefix}.>`,
         codec: chatCodec,
       }
-    ).subscribe({ next: (message) => this.receiveNotification(message) })
+    ).subscribe(
+      { next: (message) => this.receiveNotification(message) },
+      {
+        signal: this.notificationController.signal,
+      }
+    )
   }
 
   private receiveNotification(message: DemoChatMessage): void {

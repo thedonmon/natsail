@@ -242,6 +242,8 @@ The selector can coalesce React notifications without dropping JetStream deliver
 
 ### RxJS
 
+This branch evaluates RxJS `9.0.0-beta.0`; it isn't ready for production. See the [RxJS package guide](packages/rxjs/README.md) for the branch-only API, cancellation changes, and known beta limitations. Released NATSail packages still use RxJS 7.
+
 RxJS can observe the same reducing definition. Initial history arrives as one state, and live state can be limited to one emission per frame.
 
 ```ts

@@ -129,17 +129,21 @@ async function runRxjsScenario(kind, messages) {
     const completed = new Promise((resolve, reject) => {
       complete = { resolve, reject }
     })
-    const subscription = observeNatsJetStreamState(registry, definition, {
+    const controller = new AbortController()
+    observeNatsJetStreamState(registry, definition, {
       batchPolicy: { maxItems: batchSize, maxWaitMs: 16 },
-    }).subscribe({
-      next: (snapshot) => {
-        emissions += 1
-        observedChecksum = snapshot.data
-        observedCommit = snapshot.cursor?.sequence ?? observedCommit
+    }).subscribe(
+      {
+        next: (snapshot) => {
+          emissions += 1
+          observedChecksum = snapshot.data
+          observedCommit = snapshot.cursor?.sequence ?? observedCommit
+        },
+        error: complete.reject,
+        complete: complete.resolve,
       },
-      error: complete.reject,
-      complete: complete.resolve,
-    })
+      { signal: controller.signal }
+    )
     await Promise.resolve()
 
     const startedAt = performance.now()
@@ -195,7 +199,7 @@ async function runRxjsScenario(kind, messages) {
     controlled.finish()
     await completed
     samples.push(performance.now() - startedAt)
-    subscription.unsubscribe()
+    controller.abort()
     await registry.close()
 
     if (observedChecksum !== state || observedCommit !== messages) {

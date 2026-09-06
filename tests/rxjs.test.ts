@@ -49,6 +49,42 @@ function controllableSource<T>(): {
 }
 
 describe('RxJS session adapter', () => {
+  it('does not acquire a session for an already-aborted subscription', async () => {
+    const registry = createSessionRegistry()
+    const controlled = controllableSource<string>()
+    const controller = new AbortController()
+    controller.abort('already disposed')
+    const received: string[] = []
+    const result = observeNatsSessionValues(registry, 'aborted', controlled.source).subscribe(
+      (value) => received.push(value),
+      { signal: controller.signal }
+    )
+    await Promise.resolve()
+    expect(result).toBeUndefined()
+    expect(received).toEqual([])
+    expect(controlled.starts).not.toHaveBeenCalled()
+    expect(registry.inspect().activeSessions).toBe(0)
+    await registry.close()
+  })
+
+  it('releases its handle when cancelled inside the initial snapshot callback', async () => {
+    const registry = createSessionRegistry()
+    const controlled = controllableSource<string>()
+    const controller = new AbortController()
+    const phases: string[] = []
+    observeNatsSession(registry, 'cancel-during-setup', controlled.source).subscribe(
+      (snapshot) => {
+        phases.push(snapshot.phase)
+        controller.abort('view disposed')
+      },
+      { signal: controller.signal }
+    )
+    await vi.waitFor(() => expect(controlled.close).toHaveBeenCalledOnce())
+    expect(phases).toEqual(['connecting'])
+    expect(registry.inspect().activeSessions).toBe(0)
+    await registry.close()
+  })
+
   it('opens one registry-shared Core NATS subscription for multiple subscribers', async () => {
     let accept!: (value: string) => Promise<void>
     let closeSession!: () => void
@@ -71,8 +107,10 @@ describe('RxJS session adapter', () => {
     const first: string[] = []
     const second: string[] = []
 
-    const firstSubscription = values.subscribe((value) => first.push(value))
-    const secondSubscription = values.subscribe((value) => second.push(value))
+    const firstController = new AbortController()
+    values.subscribe((value) => first.push(value), { signal: firstController.signal })
+    const secondController = new AbortController()
+    values.subscribe((value) => second.push(value), { signal: secondController.signal })
     await Promise.resolve()
     expect(subscribe).toHaveBeenCalledOnce()
 
@@ -80,9 +118,9 @@ describe('RxJS session adapter', () => {
     expect(first).toEqual(['created'])
     expect(second).toEqual(['created'])
 
-    firstSubscription.unsubscribe()
+    firstController.abort()
     expect(close).not.toHaveBeenCalled()
-    secondSubscription.unsubscribe()
+    secondController.abort()
     await Promise.resolve()
     expect(close).toHaveBeenCalledOnce()
   })
@@ -94,12 +132,20 @@ describe('RxJS session adapter', () => {
     const first: string[] = []
     const second: string[] = []
 
-    const firstSubscription = snapshots.subscribe((snapshot) => {
-      first.push(`${snapshot.phase}:${snapshot.value ?? ''}`)
-    })
-    const secondSubscription = snapshots.subscribe((snapshot) => {
-      second.push(`${snapshot.phase}:${snapshot.value ?? ''}`)
-    })
+    const firstController = new AbortController()
+    snapshots.subscribe(
+      (snapshot) => {
+        first.push(`${snapshot.phase}:${snapshot.value ?? ''}`)
+      },
+      { signal: firstController.signal }
+    )
+    const secondController = new AbortController()
+    snapshots.subscribe(
+      (snapshot) => {
+        second.push(`${snapshot.phase}:${snapshot.value ?? ''}`)
+      },
+      { signal: secondController.signal }
+    )
     await Promise.resolve()
 
     expect(controlled.starts).toHaveBeenCalledOnce()
@@ -107,12 +153,72 @@ describe('RxJS session adapter', () => {
     expect(first.at(-1)).toBe('live:hello')
     expect(second.at(-1)).toBe('live:hello')
 
-    firstSubscription.unsubscribe()
+    firstController.abort()
     expect(controlled.close).not.toHaveBeenCalled()
 
-    secondSubscription.unsubscribe()
+    secondController.abort()
     await Promise.resolve()
     expect(controlled.close).toHaveBeenCalledOnce()
+  })
+
+  it('gives a late subscriber its own handle and the latest value without replaying to others', async () => {
+    const registry = createSessionRegistry()
+    const controlled = controllableSource<string>()
+    const values = observeNatsSessionValues(registry, 'late-join', controlled.source)
+    const first: string[] = []
+    const second: string[] = []
+    const firstController = new AbortController()
+    values.subscribe((value) => first.push(value), { signal: firstController.signal })
+    await Promise.resolve()
+    await controlled.deliver('before')
+
+    const secondController = new AbortController()
+    values.subscribe((value) => second.push(value), { signal: secondController.signal })
+    expect(registry.inspect().sessions[0]?.references).toBe(2)
+    expect(first).toEqual(['before'])
+    expect(second).toEqual(['before'])
+
+    firstController.abort()
+    expect(registry.inspect().sessions[0]?.references).toBe(1)
+    await controlled.deliver('after')
+    expect(first).toEqual(['before'])
+    expect(second).toEqual(['before', 'after'])
+    secondController.abort()
+    await vi.waitFor(() => expect(registry.inspect().activeSessions).toBe(0))
+    await registry.close()
+  })
+
+  it('starts a fresh source when subscribing again after the last handle is released', async () => {
+    const registry = createSessionRegistry()
+    const deliveries: Array<(value: string) => Promise<void>> = []
+    const source: SessionSource<string> = (accept) => {
+      deliveries.push(accept)
+      let finish!: () => void
+      const closed = new Promise<void>((resolve) => {
+        finish = resolve
+      })
+      return { ready: Promise.resolve(), closed, close: async () => finish() }
+    }
+    const values = observeNatsSessionValues(registry, 'restart', source)
+    const first: string[] = []
+    const firstController = new AbortController()
+    values.subscribe((value) => first.push(value), { signal: firstController.signal })
+    await Promise.resolve()
+    await deliveries[0]!('first run')
+    firstController.abort()
+    await vi.waitFor(() => expect(registry.inspect().activeSessions).toBe(0))
+
+    const second: string[] = []
+    const secondController = new AbortController()
+    values.subscribe((value) => second.push(value), { signal: secondController.signal })
+    await Promise.resolve()
+    expect(deliveries).toHaveLength(2)
+    expect(second).toEqual([])
+    await deliveries[1]!('second run')
+    expect(first).toEqual(['first run'])
+    expect(second).toEqual(['second run'])
+    secondController.abort()
+    await registry.close()
   })
 
   it('emits each delivered value once and completes with the session', async () => {
@@ -142,9 +248,13 @@ describe('RxJS session adapter', () => {
     const registry = createSessionRegistry()
     const controlled = controllableSource<string>()
     const types: string[] = []
-    const subscription = observeNatsSessionEvents(registry).subscribe((event) => {
-      types.push(event.type)
-    })
+    const controller = new AbortController()
+    observeNatsSessionEvents(registry).subscribe(
+      (event) => {
+        types.push(event.type)
+      },
+      { signal: controller.signal }
+    )
 
     const handle = registry.acquire('conversation:events', controlled.source)
     await handle.ready
@@ -152,7 +262,7 @@ describe('RxJS session adapter', () => {
     await Promise.resolve()
 
     expect(types).toEqual(expect.arrayContaining(['opened', 'retained', 'released', 'closed']))
-    subscription.unsubscribe()
+    controller.abort()
     await registry.close()
   })
 
@@ -166,11 +276,15 @@ describe('RxJS session adapter', () => {
     })
     const phases: string[] = []
     const values: string[][] = []
-    const subscription = observeNatsJetStreamReducer(registry, definition).subscribe((snapshot) => {
-      if (!snapshot.value) return
-      phases.push(snapshot.value.phase)
-      values.push(snapshot.value.data)
-    })
+    const controller = new AbortController()
+    observeNatsJetStreamReducer(registry, definition).subscribe(
+      (snapshot) => {
+        if (!snapshot.value) return
+        phases.push(snapshot.value.phase)
+        values.push(snapshot.value.data)
+      },
+      { signal: controller.signal }
+    )
     await Promise.resolve()
 
     await controlled.deliver({
@@ -190,7 +304,7 @@ describe('RxJS session adapter', () => {
     expect(values).toEqual([[], ['one', 'two']])
     expect(registry.inspect().activeSessions).toBe(1)
 
-    subscription.unsubscribe()
+    controller.abort()
     await registry.close()
   })
 
@@ -316,9 +430,12 @@ describe('RxJS session adapter', () => {
         source: controlled.source,
       })
       const states: Array<{ phase: string; data: number }> = []
-      const subscription = observeNatsJetStreamState(registry, definition, {
+      const controller = new AbortController()
+      observeNatsJetStreamState(registry, definition, {
         liveBatchMs: 16,
-      }).subscribe((state) => states.push({ phase: state.phase, data: state.data }))
+      }).subscribe((state) => states.push({ phase: state.phase, data: state.data }), {
+        signal: controller.signal,
+      })
       await Promise.resolve()
 
       await controlled.deliver({
@@ -352,7 +469,7 @@ describe('RxJS session adapter', () => {
         { phase: 'reconnecting', data: 2 },
         { phase: 'live', data: 3 },
       ])
-      subscription.unsubscribe()
+      controller.abort()
       await Promise.resolve()
       expect(controlled.close).toHaveBeenCalledOnce()
       await registry.close()
@@ -372,9 +489,10 @@ describe('RxJS session adapter', () => {
         source: controlled.source,
       })
       const rendered: number[] = []
-      const subscription = observeNatsJetStreamState(registry, definition, {
+      const controller = new AbortController()
+      observeNatsJetStreamState(registry, definition, {
         liveBatchMs: 16,
-      }).subscribe((state) => rendered.push(state.data))
+      }).subscribe((state) => rendered.push(state.data), { signal: controller.signal })
       await Promise.resolve()
 
       await controlled.deliver({
@@ -402,7 +520,7 @@ describe('RxJS session adapter', () => {
       await vi.advanceTimersByTimeAsync(16)
       expect(rendered).toEqual([0, 217, 434])
 
-      subscription.unsubscribe()
+      controller.abort()
       await registry.close()
     } finally {
       vi.useRealTimers()
@@ -418,9 +536,10 @@ describe('RxJS session adapter', () => {
       source: controlled.source,
     })
     const states: number[] = []
-    const subscription = observeNatsJetStreamState(registry, definition, {
+    const controller = new AbortController()
+    observeNatsJetStreamState(registry, definition, {
       batchPolicy: { maxItems: 2, maxBytes: 2, sizeOf: () => 1 },
-    }).subscribe((state) => states.push(state.data))
+    }).subscribe((state) => states.push(state.data), { signal: controller.signal })
     await Promise.resolve()
 
     for (const data of [1, 2, 3]) {
@@ -433,8 +552,67 @@ describe('RxJS session adapter', () => {
     }
 
     expect(states).toEqual([1, 3])
-    subscription.unsubscribe()
+    controller.abort()
     await registry.close()
+  })
+
+  it('supports a synchronous NATSail batching scheduler without retaining a stale task', async () => {
+    const registry = createSessionRegistry()
+    const controlled = controllableSource<JetStreamStateSnapshot<number>>()
+    const definition = defineSession({
+      key: 'sync-clock',
+      contract: 'state',
+      source: controlled.source,
+    })
+    const states: number[] = []
+    const controller = new AbortController()
+    observeNatsJetStreamState(registry, definition, {
+      liveBatchMs: 16,
+      scheduler: {
+        schedule: (task) => {
+          task()
+          return { cancel() {} }
+        },
+      },
+    }).subscribe((state) => states.push(state.data), { signal: controller.signal })
+    await Promise.resolve()
+    for (const data of [1, 2, 3]) {
+      await controlled.deliver({ phase: 'live', data, restarts: 0, replay: { delivered: 0 } })
+    }
+    expect(states).toEqual([1, 2, 3])
+    controller.abort()
+    await registry.close()
+  })
+
+  it('discards pending live state and releases the source when cancelled before the timer fires', async () => {
+    vi.useFakeTimers()
+    const registry = createSessionRegistry()
+    try {
+      const controlled = controllableSource<JetStreamStateSnapshot<number>>()
+      const definition = defineSession({
+        key: 'cancel-pending',
+        contract: 'state',
+        source: controlled.source,
+      })
+      const states: number[] = []
+      const controller = new AbortController()
+      observeNatsJetStreamState(registry, definition, { liveBatchMs: 16 }).subscribe(
+        (state) => states.push(state.data),
+        { signal: controller.signal }
+      )
+      await Promise.resolve()
+      for (const data of [1, 2]) {
+        await controlled.deliver({ phase: 'live', data, restarts: 0, replay: { delivered: 0 } })
+      }
+      controller.abort()
+      await vi.advanceTimersByTimeAsync(32)
+      expect(states).toEqual([1])
+      expect(registry.inspect().activeSessions).toBe(0)
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      await registry.close()
+      vi.useRealTimers()
+    }
   })
 
   it('discards a pending live partial when the source fails', async () => {
@@ -499,12 +677,20 @@ describe('RxJS session adapter', () => {
     const runtime = { events: events.iterable } as NatsRuntime
     const allEvents: NatsRuntimeEvent[] = []
     const states: string[] = []
-    const eventSubscription = observeNatsRuntimeEvents(runtime).subscribe((event) => {
-      allEvents.push(event)
-    })
-    const statusSubscription = observeNatsRuntimeStatus(runtime).subscribe((status) => {
-      states.push(status.state)
-    })
+    const eventController = new AbortController()
+    observeNatsRuntimeEvents(runtime).subscribe(
+      (event) => {
+        allEvents.push(event)
+      },
+      { signal: eventController.signal }
+    )
+    const statusController = new AbortController()
+    observeNatsRuntimeStatus(runtime).subscribe(
+      (status) => {
+        states.push(status.state)
+      },
+      { signal: statusController.signal }
+    )
 
     events.push({ type: 'status', state: 'reconnecting', at: 1 })
     events.push({
@@ -520,8 +706,8 @@ describe('RxJS session adapter', () => {
     await vi.waitFor(() => expect(allEvents).toHaveLength(4))
     await vi.waitFor(() => expect(states).toEqual(['reconnecting', 'connected']))
 
-    eventSubscription.unsubscribe()
-    statusSubscription.unsubscribe()
+    eventController.abort()
+    statusController.abort()
     await vi.waitFor(() => expect(events.activeIterators()).toBe(0))
   })
 })

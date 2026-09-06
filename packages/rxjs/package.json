@@ -47,6 +47,6 @@
     "@natsail/session": "workspace:^"
   },
   "peerDependencies": {
-    "rxjs": "^7.8.0"
+    "rxjs": "9.0.0-beta.0"
   }
 }

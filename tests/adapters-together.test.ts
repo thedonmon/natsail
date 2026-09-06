@@ -40,9 +40,10 @@ describe('Effect, React, and RxJS adapter composition', () => {
       contract: 'subject=events.shared;decoder=test',
       source: createCoreSessionSource(runtime, options),
     })
-    const rxSubscription = observeNatsSessionValues(registry, definition).subscribe((value) =>
-      rxValues.push(value)
-    )
+    const rxController = new AbortController()
+    observeNatsSessionValues(registry, definition).subscribe((value) => rxValues.push(value), {
+      signal: rxController.signal,
+    })
     const effectFiber = Effect.runFork(
       makeNatsail({ runtime, sessions: registry })
         .sessionValues(definition)
@@ -70,7 +71,7 @@ describe('Effect, React, and RxJS adapter composition', () => {
     expect(rxValues).toEqual(['hello'])
     expect(await Effect.runPromise(Fiber.join(effectFiber))).toEqual(['hello'])
 
-    rxSubscription.unsubscribe()
+    rxController.abort()
     expect(close).not.toHaveBeenCalled()
 
     await act(async () => root.unmount())

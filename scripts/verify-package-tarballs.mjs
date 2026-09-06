@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtemp, mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -107,7 +107,7 @@ try {
           '@opentelemetry/api': '^1.9.0',
           effect: '4.0.0-rc.112',
           react: '^19.0.0',
-          rxjs: '^7.8.0',
+          rxjs: '9.0.0-beta.0',
         },
         pnpm: { overrides: localPackages },
       },

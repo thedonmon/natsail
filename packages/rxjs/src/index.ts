@@ -1,5 +1,6 @@
-import { asyncScheduler, distinctUntilChanged, filter, Observable } from 'rxjs'
-import type { SchedulerLike, Subscription } from 'rxjs'
+import { ColdObservable } from 'rxjs'
+import { distinctUntilChanged } from 'rxjs/distinct-until-changed'
+import { filter } from 'rxjs/filter'
 
 import type {
   CoreSubscriptionOptions,
@@ -7,8 +8,10 @@ import type {
   NatsRuntime,
   NatsRuntimeEvent,
   NatsRuntimeStatusEvent,
+  NatsailScheduledTask,
+  NatsailScheduler,
 } from '@natsail/core'
-import { defineNatsailBatchPolicy } from '@natsail/core'
+import { defineNatsailBatchPolicy, natsailDefaultScheduler } from '@natsail/core'
 import {
   createJetStreamSessionSource,
   type JetStreamDelivery,
@@ -27,10 +30,15 @@ import type {
 /** Converts registry lifecycle and reference-count diagnostics into a cancellable Observable. */
 export function observeNatsSessionEvents(
   registry: SessionRegistry
-): Observable<SessionRegistryEvent> {
-  return new Observable((subscriber) => {
+): ColdObservable<SessionRegistryEvent> {
+  return new ColdObservable((subscriber) => {
+    if (!subscriber.active) return
     const iterator = registry.events[Symbol.asyncIterator]()
     let cancelled = false
+    subscriber.addTeardown(() => {
+      cancelled = true
+      void iterator.return?.()
+    })
 
     void (async () => {
       try {
@@ -48,19 +56,19 @@ export function observeNatsSessionEvents(
         await iterator.return?.()
       }
     })()
-
-    return () => {
-      cancelled = true
-      void iterator.return?.()
-    }
   })
 }
 
 /** Converts the runtime event iterable into a cancellable Observable. */
-export function observeNatsRuntimeEvents(runtime: NatsRuntime): Observable<NatsRuntimeEvent> {
-  return new Observable((subscriber) => {
+export function observeNatsRuntimeEvents(runtime: NatsRuntime): ColdObservable<NatsRuntimeEvent> {
+  return new ColdObservable((subscriber) => {
+    if (!subscriber.active) return
     const iterator = runtime.events[Symbol.asyncIterator]()
     let cancelled = false
+    subscriber.addTeardown(() => {
+      cancelled = true
+      void iterator.return?.()
+    })
 
     void (async () => {
       try {
@@ -78,22 +86,16 @@ export function observeNatsRuntimeEvents(runtime: NatsRuntime): Observable<NatsR
         await iterator.return?.()
       }
     })()
-
-    return () => {
-      cancelled = true
-      void iterator.return?.()
-    }
   })
 }
 
 /** Emits distinct runtime connection states and omits diagnostic events. */
 export function observeNatsRuntimeStatus(runtime: NatsRuntime): Observable<NatsRuntimeStatusEvent> {
-  return observeNatsRuntimeEvents(runtime).pipe(
-    filter((event): event is NatsRuntimeStatusEvent => event.type === 'status'),
-    distinctUntilChanged(
+  return observeNatsRuntimeEvents(runtime)
+    [filter]((event): event is NatsRuntimeStatusEvent => event.type === 'status')
+    [distinctUntilChanged](
       (previous, next) => previous.state === next.state && previous.server === next.server
     )
-  )
 }
 
 /** Emits values from one keyed, registry-shared Core NATS subscription. */
@@ -102,7 +104,7 @@ export function observeNatsCoreSubscription<T>(
   runtime: NatsRuntime,
   key: string,
   options: CoreSubscriptionOptions<T>
-): Observable<T> {
+): ColdObservable<T> {
   return observeNatsSessionValues(registry, key, createCoreSessionSource(runtime, options))
 }
 
@@ -112,7 +114,7 @@ export function observeNatsJetStreamSubscription<T>(
   runtime: NatsRuntime,
   key: string,
   options: JetStreamSessionSourceOptions<T>
-): Observable<JetStreamDelivery<T>> {
+): ColdObservable<JetStreamDelivery<T>> {
   return observeNatsSessionValues(registry, key, createJetStreamSessionSource(runtime, options))
 }
 
@@ -120,7 +122,7 @@ export function observeNatsJetStreamSubscription<T>(
 export function observeNatsJetStreamReducer<State>(
   registry: SessionRegistry,
   definition: SessionDefinition<JetStreamStateSnapshot<State>>
-): Observable<SessionSnapshot<JetStreamStateSnapshot<State>>> {
+): ColdObservable<SessionSnapshot<JetStreamStateSnapshot<State>>> {
   return observeNatsSession(registry, definition)
 }
 
@@ -133,8 +135,8 @@ export interface NatsailJetStreamStateOptions<State = unknown> {
   readonly liveBatchMs?: number
   /** Shared count/byte/time bounds for cumulative live presentation. */
   readonly batchPolicy?: NatsailBatchPolicy<JetStreamStateSnapshot<State>>
-  /** Overrides the RxJS async scheduler, primarily for tests or custom hosts. */
-  readonly scheduler?: SchedulerLike
+  /** Overrides host timers using NATSail's cancellable task contract. */
+  readonly scheduler?: Pick<NatsailScheduler, 'schedule'>
 }
 
 /**
@@ -146,7 +148,7 @@ export function observeNatsJetStreamState<State>(
   registry: SessionRegistry,
   definition: SessionDefinition<JetStreamStateSnapshot<State>>,
   options: NatsailJetStreamStateOptions<State> = {}
-): Observable<JetStreamStateSnapshot<State>> {
+): ColdObservable<JetStreamStateSnapshot<State>> {
   const liveBatchMs = options.liveBatchMs ?? options.batchPolicy?.maxWaitMs ?? 16
   if (!Number.isFinite(liveBatchMs) || liveBatchMs < 0) {
     throw new TypeError('NATSail RxJS liveBatchMs must be a finite non-negative number')
@@ -165,14 +167,15 @@ export function observeNatsJetStreamState<State>(
   )
   const values = observeNatsSessionValues(registry, definition)
   if (liveBatchMs === 0) return values
-  const scheduler = options.scheduler ?? asyncScheduler
+  const scheduler = options.scheduler ?? natsailDefaultScheduler
 
-  return new Observable((subscriber) => {
+  return new ColdObservable((subscriber) => {
+    if (!subscriber.active) return
     let seenLive = false
     let pendingLive: JetStreamStateSnapshot<State> | undefined
     let pendingCount = 0
     let pendingBytes = 0
-    let scheduledFlush: Subscription | undefined
+    let scheduledFlush: NatsailScheduledTask | undefined
 
     const flush = () => {
       scheduledFlush = undefined
@@ -184,7 +187,7 @@ export function observeNatsJetStreamState<State>(
       subscriber.next(value)
     }
     const cancelFlush = () => {
-      scheduledFlush?.unsubscribe()
+      scheduledFlush?.cancel()
       scheduledFlush = undefined
     }
     const scheduleFlush = () => {
@@ -196,78 +199,81 @@ export function observeNatsJetStreamState<State>(
       }, policy.maxWaitMs ?? 0)
       if (!ranSynchronously) scheduledFlush = scheduled
     }
-    const source = values.subscribe({
-      next: (value) => {
-        if (value.phase !== 'live') {
-          cancelFlush()
-          flush()
-          seenLive = false
-          subscriber.next(value)
-          return
-        }
-        if (!seenLive) {
-          seenLive = true
-          subscriber.next(value)
-          return
-        }
-
-        let size = 0
-        if (policy.maxBytes !== undefined) {
-          try {
-            size = policy.sizeOf!(value)
-          } catch (error) {
-            cancelFlush()
-            subscriber.error(error)
-            return
-          }
-          if (!Number.isFinite(size) || size < 0) {
-            cancelFlush()
-            subscriber.error(
-              new TypeError('NATSail batch sizeOf must return a finite non-negative number')
-            )
-            return
-          }
-          if (size > policy.maxBytes) {
-            cancelFlush()
-            subscriber.error(
-              new RangeError(`NATSail live state size ${size} exceeds maxBytes ${policy.maxBytes}`)
-            )
-            return
-          }
-          if (pendingLive !== undefined && pendingBytes + size > policy.maxBytes) flush()
-        }
-
-        pendingLive = value
-        pendingCount += 1
-        pendingBytes += size
-        const countReached = policy.maxItems !== undefined && pendingCount >= policy.maxItems
-        const bytesReached = policy.maxBytes !== undefined && pendingBytes >= policy.maxBytes
-        if (countReached || bytesReached) {
-          cancelFlush()
-          flush()
-        } else if (policy.maxWaitMs !== undefined) {
-          scheduleFlush()
-        }
-      },
-      error: (error) => {
-        cancelFlush()
-        pendingLive = undefined
-        pendingCount = 0
-        pendingBytes = 0
-        subscriber.error(error)
-      },
-      complete: () => {
-        cancelFlush()
-        flush()
-        subscriber.complete()
-      },
-    })
-
-    return () => {
+    subscriber.addTeardown(() => {
       cancelFlush()
       pendingLive = undefined
-      source.unsubscribe()
-    }
+    })
+    values.subscribe(
+      {
+        next: (value) => {
+          if (value.phase !== 'live') {
+            cancelFlush()
+            flush()
+            seenLive = false
+            subscriber.next(value)
+            return
+          }
+          if (!seenLive) {
+            seenLive = true
+            subscriber.next(value)
+            return
+          }
+
+          let size = 0
+          if (policy.maxBytes !== undefined) {
+            try {
+              size = policy.sizeOf!(value)
+            } catch (error) {
+              cancelFlush()
+              subscriber.error(error)
+              return
+            }
+            if (!Number.isFinite(size) || size < 0) {
+              cancelFlush()
+              subscriber.error(
+                new TypeError('NATSail batch sizeOf must return a finite non-negative number')
+              )
+              return
+            }
+            if (size > policy.maxBytes) {
+              cancelFlush()
+              subscriber.error(
+                new RangeError(
+                  `NATSail live state size ${size} exceeds maxBytes ${policy.maxBytes}`
+                )
+              )
+              return
+            }
+            if (pendingLive !== undefined && pendingBytes + size > policy.maxBytes) flush()
+          }
+
+          pendingLive = value
+          pendingCount += 1
+          pendingBytes += size
+          const countReached = policy.maxItems !== undefined && pendingCount >= policy.maxItems
+          const bytesReached = policy.maxBytes !== undefined && pendingBytes >= policy.maxBytes
+          if (countReached || bytesReached) {
+            cancelFlush()
+            flush()
+          } else if (policy.maxWaitMs !== undefined) {
+            scheduleFlush()
+          }
+        },
+        error: (error) => {
+          cancelFlush()
+          pendingLive = undefined
+          pendingCount = 0
+          pendingBytes = 0
+          subscriber.error(error)
+        },
+        complete: () => {
+          cancelFlush()
+          flush()
+          subscriber.complete()
+        },
+      },
+      { signal: subscriber.signal }
+    )
   })
 }
 
@@ -280,18 +286,19 @@ export function observeNatsJetStreamState<State>(
 export function observeNatsSession<T>(
   registry: SessionRegistry,
   definition: SessionDefinition<T>
-): Observable<SessionSnapshot<T>>
+): ColdObservable<SessionSnapshot<T>>
 export function observeNatsSession<T>(
   registry: SessionRegistry,
   key: string,
   source: SessionSource<T>
-): Observable<SessionSnapshot<T>>
+): ColdObservable<SessionSnapshot<T>>
 export function observeNatsSession<T>(
   registry: SessionRegistry,
   definitionOrKey: SessionDefinition<T> | string,
   source?: SessionSource<T>
-): Observable<SessionSnapshot<T>> {
-  return new Observable((subscriber) => {
+): ColdObservable<SessionSnapshot<T>> {
+  return new ColdObservable((subscriber) => {
+    if (!subscriber.active) return
     const handle =
       typeof definitionOrKey === 'string'
         ? registry.acquire(definitionOrKey, source!)
@@ -304,12 +311,11 @@ export function observeNatsSession<T>(
       }
     }
     const unsubscribe = handle.subscribe(emit)
-    emit()
-
-    return () => {
+    subscriber.addTeardown(() => {
       unsubscribe()
       void handle.release().catch(() => undefined)
-    }
+    })
+    emit()
   })
 }
 
@@ -322,43 +328,45 @@ export function observeNatsSession<T>(
 export function observeNatsSessionValues<T>(
   registry: SessionRegistry,
   definition: SessionDefinition<T>
-): Observable<T>
+): ColdObservable<T>
 export function observeNatsSessionValues<T>(
   registry: SessionRegistry,
   key: string,
   source: SessionSource<T>
-): Observable<T>
+): ColdObservable<T>
 export function observeNatsSessionValues<T>(
   registry: SessionRegistry,
   definitionOrKey: SessionDefinition<T> | string,
   source?: SessionSource<T>
-): Observable<T> {
-  return new Observable((subscriber) => {
+): ColdObservable<T> {
+  return new ColdObservable((subscriber) => {
+    if (!subscriber.active) return
     let valueRevision = -1
     const snapshots =
       typeof definitionOrKey === 'string'
         ? observeNatsSession(registry, definitionOrKey, source!)
         : observeNatsSession(registry, definitionOrKey)
-    const subscription = snapshots.subscribe({
-      next: (snapshot) => {
-        if (
-          snapshot.valueRevision !== valueRevision &&
-          Object.prototype.hasOwnProperty.call(snapshot, 'value')
-        ) {
-          valueRevision = snapshot.valueRevision
-          subscriber.next(snapshot.value as T)
-        }
+    snapshots.subscribe(
+      {
+        next: (snapshot) => {
+          if (
+            snapshot.valueRevision !== valueRevision &&
+            Object.prototype.hasOwnProperty.call(snapshot, 'value')
+          ) {
+            valueRevision = snapshot.valueRevision
+            subscriber.next(snapshot.value as T)
+          }
 
-        if (snapshot.phase === 'error') {
-          subscriber.error(snapshot.error)
-        } else if (snapshot.phase === 'closed') {
-          subscriber.complete()
-        }
+          if (snapshot.phase === 'error') {
+            subscriber.error(snapshot.error)
+          } else if (snapshot.phase === 'closed') {
+            subscriber.complete()
+          }
+        },
+        error: (error) => subscriber.error(error),
+        complete: () => subscriber.complete(),
       },
-      error: (error) => subscriber.error(error),
-      complete: () => subscriber.complete(),
-    })
-
-    return () => subscription.unsubscribe()
+      { signal: subscriber.signal }
+    )
   })
 }
