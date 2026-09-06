@@ -1,5 +1,12 @@
 # @natsail/session
 
+## 0.4.1
+
+### Patch Changes
+
+- Updated dependencies [ca0e5c3]
+  - @natsail/core@0.4.0
+
 ## 0.4.0
 
 ### Minor Changes

@@ -1,5 +1,22 @@
 # @natsail/effect
 
+## 0.5.0
+
+### Minor Changes
+
+- ca0e5c3: Bound runtime shutdown and event buffering; add cooperative handler cancellation, optional processor progress heartbeats and confirmed acknowledgements, and explicit retry/terminal handler outcomes. Forward cancellation and outcomes through framework adapters.
+
+  Runtime close now defaults to a 30-second grace period and rejects on timeout or resource cleanup failure. Slow event observers receive an overflow diagnostic after exceeding their configured capacity. Callback mocks that manually invoke Core or processor handlers must supply the new cancellation context. Default processor acknowledgement and thrown-handler-error behavior remain unchanged.
+
+  Normal Core lease close drains buffered and already-in-flight messages before closing the subscription. Runtime shutdown waits for these handlers before draining the connection; explicit cancellation and deadline expiry stop further delivery instead.
+
+### Patch Changes
+
+- Updated dependencies [ca0e5c3]
+  - @natsail/core@0.4.0
+  - @natsail/jetstream@0.6.0
+  - @natsail/session@0.4.1
+
 ## 0.4.0
 
 ### Minor Changes
