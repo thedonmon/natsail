@@ -41,6 +41,7 @@ jobs:
       - run: pnpm build
       - run: pnpm typecheck:tests
       - run: pnpm test
+      - run: pnpm test:browser-rxjs
       - run: pnpm test:browser-broker
       - run: node scripts/verify-package-tarballs.mjs
 

@@ -57,7 +57,7 @@ Create one runtime per application or JavaScript realm. Create one registry besi
 
 - Direct Core subscriptions and JetStream consumers or processors return leases. Await `ready`, observe `closed`, and call the idempotent `close()` when the owner is done. Use `caughtUp` when initial replay completion matters.
 - Session callers release their handles. Application-owned registries are closed before their runtime.
-- Prefer `NatsManagedProvider` in React and `makeNatsailScopedLayer` in Effect when those integrations should own cleanup. RxJS consumers release ownership by unsubscribing.
+- Prefer `NatsManagedProvider` in React and `makeNatsailScopedLayer` in Effect when those integrations should own cleanup. RxJS consumers follow the version-specific cancellation contract in the RxJS skill.
 - The runtime owns the nats.js connection. Never close or drain the object returned by `runtime.connection()`.
 - Use exactly one `codec` or metadata-aware `decode` function at each payload boundary.
 - Use package-owned recovery. Decoder, configuration, contract, and application-handler failures remain terminal instead of being hidden by retry loops.

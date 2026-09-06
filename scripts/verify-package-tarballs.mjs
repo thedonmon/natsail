@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtemp, mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { copyFile, mkdtemp, mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -109,6 +109,7 @@ try {
           react: '^19.0.0',
           rxjs: '9.0.0-beta.0',
         },
+        devDependencies: { '@types/node': '^24.10.0' },
         pnpm: { overrides: localPackages },
       },
       null,
@@ -127,6 +128,33 @@ try {
 
   run('pnpm', ['install', '--ignore-scripts'], consumerRoot)
   process.stdout.write(run('node', ['smoke.mjs'], consumerRoot))
+  await copyFile(
+    new URL('../tests/fixtures/rxjs-consumer.ts', import.meta.url),
+    join(consumerRoot, 'rxjs-consumer.ts')
+  )
+  await writeFile(
+    join(consumerRoot, 'tsconfig.json'),
+    JSON.stringify({
+      compilerOptions: {
+        strict: true,
+        skipLibCheck: false,
+        noEmitOnError: true,
+        target: 'ES2022',
+        module: 'NodeNext',
+        moduleResolution: 'NodeNext',
+        lib: ['ES2022', 'DOM', 'DOM.Iterable'],
+        types: ['node'],
+        outDir: 'dist',
+      },
+      files: ['rxjs-consumer.ts'],
+    })
+  )
+  run(
+    'node',
+    [join(repositoryRoot, 'node_modules/typescript/bin/tsc'), '-p', 'tsconfig.json'],
+    consumerRoot
+  )
+  process.stdout.write(run('node', ['dist/rxjs-consumer.js'], consumerRoot))
   await verifyConsumerBundles(consumerRoot)
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true })

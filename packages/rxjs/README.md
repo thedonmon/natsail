@@ -60,7 +60,33 @@ Direct probes of the beta's `ColdObservable` found lifecycle differences that st
 - An already-aborted signal still starts the producer, and its newly registered teardown doesn't run. NATSail checks `subscriber.active` before acquiring resources.
 - Teardowns run in registration order, and a teardown added after completion doesn't run. The guide describes platform cleanup in reverse order and immediate cleanup for an already-inactive subscriber. NATSail registers its cleanup before emitting the first value; it doesn't patch the RxJS runtime.
 
-Passing adapter tests doesn't settle those upstream differences. Before a production migration, recheck them against the intended RC or stable build and run the native-browser and real-NATS integration suites. This evaluation doesn't claim those suites passed, and it doesn't provide dual RxJS 7/9 compatibility.
+The browser acceptance suite runs the built public package and its exact Symbol operators in isolated Chromium realms, once with native Observable and once with the global removed so RxJS installs its fallback. It checks independent handles, shared sources, late joins, restart, terminal delivery, host-timer batching, and cancellation. The fixture bundles RxJS and the polyfill without external imports; it doesn't use a dev server or NATS server. The tarball verifier separately compiles and runs a Node consumer against shipped declarations, without workspace source aliases or a direct RxJS import.
+
+```sh
+pnpm --filter @natsail/rxjs... build
+pnpm exec playwright install chromium
+pnpm test:browser-rxjs
+pnpm typecheck:tests
+pnpm vitest run --exclude 'tests/integration/**'
+pnpm release:check
+```
+
+The [unsupported-surface catalog](https://github.com/ReactiveX/rxjs/blob/master/packages/rxjs/docs/UNSUPPORTED_RXJS_7_SURFACES.md) and [migration evidence ledger](https://github.com/ReactiveX/rxjs/blob/master/packages/rxjs/docs/MIGRATION_EVIDENCE_LEDGER.md) inform the scope audit. This adapter doesn't use RxJS Subjects, marble schedulers, custom Observable inputs, legacy interop, deep imports, or foreign-realm Observable bridging. Those features don't need substitute implementations. The migration tool isn't a runtime dependency, and its bounded pipe-expression transform has no remaining work in the migrated source.
+
+| Adapter surface                                                               | Lifecycle contract                                                                                                                                                                                   | Evidence                                                                          |
+| ----------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| Session snapshots/values, Core/JetStream subscriptions, and reducer snapshots | A direct subscriber owns one handle; the registry shares the source by key. Final release closes it, and a later subscriber can start fresh.                                                         | Public adapter tests, Symbol-composed browser fixture, packed Node consumer       |
+| Registry events and runtime events/status                                     | Each direct subscriber owns an iterator; abort or termination closes it once. Iteration failures reach the error handler; cleanup rejection after termination doesn't create an unhandled rejection. | Event/status and cleanup-failure tests                                            |
+| Reduced JetStream state presentation                                          | Each subscriber owns its pending state and cancellable host task. Completion flushes; abort/error discard. Scheduler creation failure errors the output and releases its handle.                     | Fake-time and injected-scheduler tests, native/fallback browser host-timer checks |
+
+### Before merging for release
+
+- Select the actual supported RC or stable artifact, update the exact peer/dev/example/smoke-test pins and lockfile, then rerun the same gates. Don't replace an exact beta pin with a broad range as a substitute for verification.
+- Recheck the upstream `ColdObservable` differences above against that artifact. Passing NATSail's guarded cases isn't proof that all upstream lifecycle differences have resolved.
+- Run the complete CI suite, including NATS-backed integration and browser-broker coverage, on the final release commit. The no-server RxJS browser suite doesn't replace transport tests.
+- Add the breaking-change Changeset and consumer migration notes, and remove evaluation-only warnings only after accepting the target version. Update the reusable RxJS skill with the final supported version too.
+
+This branch doesn't provide dual RxJS 7/9 compatibility and isn't approval to publish a stable NATSail release against the beta.
 
 ## License
 

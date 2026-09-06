@@ -12,7 +12,7 @@
     "benchmark": "pnpm --silent --filter @natsail/rxjs... --filter @natsail/effect... build && node benchmarks/replay-burst.mjs",
     "build": "pnpm --recursive --stream build",
     "changeset": "changeset",
-    "check": "pnpm format:check && pnpm lint && pnpm build && pnpm typecheck:tests && pnpm test && pnpm test:browser",
+    "check": "pnpm format:check && pnpm lint && pnpm build && pnpm typecheck:tests && pnpm test && pnpm test:browser-rxjs && pnpm test:browser",
     "format": "oxfmt --write packages",
     "format:check": "oxfmt --check packages",
     "lint": "oxlint packages",
@@ -45,6 +45,7 @@
     "typecheck:tests": "tsc -p tsconfig.tests.json",
     "test:browser": "playwright test",
     "test:browser-broker": "playwright test --config playwright.browser-broker.config.ts",
+    "test:browser-rxjs": "playwright test --config playwright.rxjs.config.ts",
     "test:watch": "vitest"
   },
   "devDependencies": {
@@ -53,6 +54,9 @@
     "@nats-io/nats-core": "3.4.0",
     "@nats-io/nkeys": "2.0.3",
     "@nats-io/transport-node": "3.4.0",
+    "@natsail/jetstream": "workspace:*",
+    "@natsail/rxjs": "workspace:*",
+    "@natsail/session": "workspace:*",
     "@opentelemetry/api": "1.9.0",
     "@playwright/test": "1.62.1",
     "@types/node": "^24.10.0",
