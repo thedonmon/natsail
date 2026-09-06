@@ -1,5 +1,14 @@
 # @natsail/rxjs
 
+## 0.5.1
+
+### Patch Changes
+
+- Updated dependencies [ca0e5c3]
+  - @natsail/core@0.4.0
+  - @natsail/jetstream@0.6.0
+  - @natsail/session@0.4.1
+
 ## 0.5.0
 
 ### Minor Changes

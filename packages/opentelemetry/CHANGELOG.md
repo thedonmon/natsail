@@ -1,5 +1,12 @@
 # @natsail/opentelemetry
 
+## 0.1.1
+
+### Patch Changes
+
+- Updated dependencies [ca0e5c3]
+  - @natsail/core@0.4.0
+
 ## 0.1.0
 
 ### Minor Changes
