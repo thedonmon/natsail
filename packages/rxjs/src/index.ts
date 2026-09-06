@@ -35,9 +35,11 @@ export function observeNatsSessionEvents(
     if (!subscriber.active) return
     const iterator = registry.events[Symbol.asyncIterator]()
     let cancelled = false
+    let closePromise: Promise<unknown> | undefined
+    const closeIterator = () => (closePromise ??= Promise.resolve().then(() => iterator.return?.()))
     subscriber.addTeardown(() => {
       cancelled = true
-      void iterator.return?.()
+      void closeIterator().catch(() => undefined)
     })
 
     void (async () => {
@@ -53,7 +55,7 @@ export function observeNatsSessionEvents(
       } catch (error) {
         if (!cancelled) subscriber.error(error)
       } finally {
-        await iterator.return?.()
+        await closeIterator().catch(() => undefined)
       }
     })()
   })
@@ -65,9 +67,11 @@ export function observeNatsRuntimeEvents(runtime: NatsRuntime): ColdObservable<N
     if (!subscriber.active) return
     const iterator = runtime.events[Symbol.asyncIterator]()
     let cancelled = false
+    let closePromise: Promise<unknown> | undefined
+    const closeIterator = () => (closePromise ??= Promise.resolve().then(() => iterator.return?.()))
     subscriber.addTeardown(() => {
       cancelled = true
-      void iterator.return?.()
+      void closeIterator().catch(() => undefined)
     })
 
     void (async () => {
@@ -83,7 +87,7 @@ export function observeNatsRuntimeEvents(runtime: NatsRuntime): ColdObservable<N
       } catch (error) {
         if (!cancelled) subscriber.error(error)
       } finally {
-        await iterator.return?.()
+        await closeIterator().catch(() => undefined)
       }
     })()
   })
@@ -193,11 +197,15 @@ export function observeNatsJetStreamState<State>(
     const scheduleFlush = () => {
       if (scheduledFlush !== undefined) return
       let ranSynchronously = false
-      const scheduled = scheduler.schedule(() => {
-        ranSynchronously = true
-        flush()
-      }, policy.maxWaitMs ?? 0)
-      if (!ranSynchronously) scheduledFlush = scheduled
+      try {
+        const scheduled = scheduler.schedule(() => {
+          ranSynchronously = true
+          flush()
+        }, policy.maxWaitMs ?? 0)
+        if (!ranSynchronously) scheduledFlush = scheduled
+      } catch (error) {
+        subscriber.error(error)
+      }
     }
     subscriber.addTeardown(() => {
       cancelFlush()

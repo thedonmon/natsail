@@ -584,6 +584,36 @@ describe('RxJS session adapter', () => {
     await registry.close()
   })
 
+  it('errors and releases the source when the batching scheduler fails', async () => {
+    const registry = createSessionRegistry()
+    const controlled = controllableSource<JetStreamStateSnapshot<number>>()
+    const definition = defineSession({
+      key: 'failed-scheduler',
+      contract: 'state',
+      source: controlled.source,
+    })
+    const expected = new Error('scheduler failed')
+    let failure: unknown
+    observeNatsJetStreamState(registry, definition, {
+      liveBatchMs: 16,
+      scheduler: {
+        schedule: () => {
+          throw expected
+        },
+      },
+    }).subscribe({ error: (error) => (failure = error) })
+    await Promise.resolve()
+
+    for (const data of [1, 2]) {
+      await controlled.deliver({ phase: 'live', data, restarts: 0, replay: { delivered: 0 } })
+    }
+
+    await vi.waitFor(() => expect(failure).toBe(expected))
+    await vi.waitFor(() => expect(registry.inspect().activeSessions).toBe(0))
+    expect(controlled.close).toHaveBeenCalledOnce()
+    await registry.close()
+  })
+
   it('discards pending live state and releases the source when cancelled before the timer fires', async () => {
     vi.useFakeTimers()
     const registry = createSessionRegistry()
@@ -710,13 +740,65 @@ describe('RxJS session adapter', () => {
     statusController.abort()
     await vi.waitFor(() => expect(events.activeIterators()).toBe(0))
   })
+
+  it('closes a runtime event iterator exactly once when cancelled', async () => {
+    const events = controllableEvents()
+    const controller = new AbortController()
+    observeNatsRuntimeEvents({ events: events.iterable } as NatsRuntime).subscribe(() => undefined, {
+      signal: controller.signal,
+    })
+
+    controller.abort()
+
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(events.returnCalls()).toBe(1)
+  })
+
+  it('suppresses runtime event iterator cleanup failure after cancellation', async () => {
+    const expected = new Error('cleanup failed')
+    const events = controllableEvents({ returnFailure: expected })
+    const controller = new AbortController()
+    const errors: unknown[] = []
+    observeNatsRuntimeEvents({ events: events.iterable } as NatsRuntime).subscribe(
+      { error: (error) => errors.push(error) },
+      { signal: controller.signal }
+    )
+
+    controller.abort()
+
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(events.returnCalls()).toBe(1)
+    expect(errors).toEqual([])
+  })
+
+  it('reports iteration failure while suppressing cleanup failure after termination', async () => {
+    const iterationFailure = new Error('iteration failed')
+    const events = controllableEvents({
+      nextFailure: iterationFailure,
+      returnFailure: new Error('cleanup failed'),
+    })
+    let failure: unknown
+    observeNatsRuntimeEvents({ events: events.iterable } as NatsRuntime).subscribe({
+      error: (error) => (failure = error),
+    })
+
+    await vi.waitFor(() => expect(failure).toBe(iterationFailure))
+    expect(events.returnCalls()).toBe(1)
+  })
 })
 
-function controllableEvents(): {
+function controllableEvents(
+  options: { nextFailure?: unknown; returnFailure?: unknown } = {}
+): {
   iterable: AsyncIterable<NatsRuntimeEvent>
   push(event: NatsRuntimeEvent): void
   activeIterators(): number
+  returnCalls(): number
 } {
+  let returnCalls = 0
   const subscribers = new Set<{
     queue: NatsRuntimeEvent[]
     resume?: () => void
@@ -735,6 +817,7 @@ function controllableEvents(): {
 
         return {
           async next(): Promise<IteratorResult<NatsRuntimeEvent>> {
+            if (options.nextFailure !== undefined) throw options.nextFailure
             while (subscriber.queue.length === 0 && !subscriber.closed) {
               await new Promise<void>((resolve) => {
                 subscriber.resume = resolve
@@ -746,9 +829,11 @@ function controllableEvents(): {
             return { done: false, value: subscriber.queue.shift()! }
           },
           async return(): Promise<IteratorResult<NatsRuntimeEvent>> {
+            returnCalls += 1
             subscriber.closed = true
             subscribers.delete(subscriber)
             subscriber.resume?.()
+            if (options.returnFailure !== undefined) throw options.returnFailure
             return { done: true, value: undefined }
           },
         }
@@ -762,5 +847,6 @@ function controllableEvents(): {
       }
     },
     activeIterators: () => subscribers.size,
+    returnCalls: () => returnCalls,
   }
 }
