@@ -8,6 +8,8 @@ pnpm add react @natsail/core @natsail/session @natsail/jetstream @natsail/react
 
 `NatsProvider` owns neither the runtime nor the session registry. The application closes both objects. `NatsManagedProvider` is the ownership-safe alternative: it creates both after commit, reuses the resource during React Strict Mode effect replay, and closes it after final unmount.
 
+Default managed cleanup uses `closeNatsResources({ runtime, sessions })` from `@natsail/session` to start registry and runtime shutdown together so a pending session cannot postpone the runtime's deadline. Identity changes permit temporary overlap: the replacement starts without waiting for the previous resource to drain. A custom resource `close()` overrides this behavior and remains responsible for both lifetimes; it can delegate to the same helper. See the [lifecycle upgrade notes](https://github.com/thedonmon/natsail/blob/main/docs/UPGRADING-LIFECYCLE.md).
+
 ```tsx
 <NatsManagedProvider
   identity={accountId}

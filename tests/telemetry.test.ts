@@ -184,10 +184,14 @@ describe('NATSail telemetry', () => {
       runtimeEvents.next(),
       runtimeEvents.next(),
       runtimeEvents.next(),
+      runtimeEvents.next(),
+      runtimeEvents.next(),
     ])
     expect(lowFrequencyEvents.map((entry) => entry.value?.type)).toEqual([
       'status',
       'status',
+      'diagnostic',
+      'diagnostic',
       'status',
     ])
 

@@ -653,7 +653,7 @@ export interface NatsRuntimeInspection {
 
 export interface NatsRuntimeOptions {
   /** Creates the connection owned by this runtime. Called once per connection attempt. */
-  connect: () => Promise<NatsConnection>
+  connect: (() => Promise<NatsConnection>) | NatsRuntimeConnectFactory
   /** Shutdown grace period, including connection drain. Defaults to 30,000 ms. */
   shutdownTimeoutMs?: number
   /** Per-iterator event capacity. Oldest events are dropped with an overflow diagnostic. Defaults to 256. */
@@ -673,6 +673,20 @@ export interface NatsRuntimeOptions {
   telemetryAttributes?: NatsailTelemetryAttributes
   /** Monotonic telemetry clock override, primarily for deterministic hosts and tests. */
   telemetryClock?: NatsailTelemetryClock
+}
+
+export interface NatsRuntimeConnectContext {
+  /** Aborted on disposal only while this factory is pending. Cooperation is optional; this does not itself abort a WebSocket. */
+  readonly signal: AbortSignal
+  /** One-based attempt within the current initial-connect retry series. */
+  readonly attempt: number
+  /** Monotonically increasing attempt identifier within this runtime. */
+  readonly attemptId: number
+}
+
+/** Opt-in context form; legacy function factories are always invoked without arguments. */
+export interface NatsRuntimeConnectFactory {
+  create(context: NatsRuntimeConnectContext): Promise<NatsConnection>
 }
 
 export class NatsRuntimeShutdownTimeoutError extends Error {
@@ -718,6 +732,28 @@ type Deferred<T> = {
   reject: (reason?: unknown) => void
 }
 
+function connectionFailureCategory(error: unknown, disposed: boolean): string {
+  if (disposed) return 'cancelled'
+  try {
+    if (error instanceof Error) {
+      switch (error.name) {
+        case 'AuthorizationError':
+        case 'UserAuthenticationExpiredError':
+          return 'authentication'
+        case 'TimeoutError':
+          return 'timeout'
+        case 'ConnectionError':
+        case 'ProtocolError':
+        case 'ClosedConnectionError':
+          return 'connection'
+      }
+    }
+  } catch {
+    // An application error's name getter must not replace the original failure.
+  }
+  return 'unknown'
+}
+
 function deferred<T>(): Deferred<T> {
   let resolve!: Deferred<T>['resolve']
   let reject!: Deferred<T>['reject']
@@ -752,13 +788,18 @@ function decodePayload<T, Message extends { data: Uint8Array }>(
   return options.codec ? options.codec.decode(message.data) : options.decode!(message)
 }
 
-function rejectWhenAborted<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+function rejectWhenAborted<T>(
+  operation: Promise<T>,
+  signal: AbortSignal,
+  error: () => Error = () => new NatsRuntimeRequestAbortedError()
+): Promise<T> {
   if (signal.aborted) {
-    return Promise.reject(new NatsRuntimeRequestAbortedError())
+    void operation.catch(() => undefined)
+    return Promise.reject(error())
   }
 
   return new Promise<T>((resolve, reject) => {
-    const onAbort = () => reject(new NatsRuntimeRequestAbortedError())
+    const onAbort = () => reject(error())
     signal.addEventListener('abort', onAbort, { once: true })
     void operation.then(resolve, reject).finally(() => {
       signal.removeEventListener('abort', onAbort)
@@ -913,8 +954,9 @@ class CoreSubscription<T> implements SubscriptionLease {
     this.ready = this.readyState.promise
     this.closed = this.closedState.promise
 
-    // Callers can observe the original promise. This handler only prevents an
-    // ignored processing error from becoming an unhandled rejection.
+    // Callers still observe the original promises; ignored startup/processing
+    // errors must not become unhandled rejections during disposal.
+    void this.ready.catch(() => undefined)
     void this.closed.catch(() => undefined)
     void this.start(connection)
   }
@@ -939,7 +981,11 @@ class CoreSubscription<T> implements SubscriptionLease {
     let abort: (() => void) | undefined
 
     try {
-      const connection = await connectionPromise
+      const connection = await rejectWhenAborted(
+        connectionPromise,
+        this.cancellation.signal,
+        () => this.cancellation.signal.reason
+      )
 
       if (this.closeRequested || this.options.signal?.aborted) {
         this.resolveReady()
@@ -972,6 +1018,11 @@ class CoreSubscription<T> implements SubscriptionLease {
 
       this.closedState.resolve()
     } catch (error) {
+      if (this.closeRequested && !this.subscription && !this.cancellation.signal.aborted) {
+        this.resolveReady()
+        this.closedState.resolve()
+        return
+      }
       if (!this.readySettled) {
         this.readySettled = true
         this.readyState.reject(error)
@@ -1000,8 +1051,13 @@ class DefaultNatsRuntime implements NatsRuntime {
   private readonly eventStream: RuntimeEventStream
   private readonly telemetry: NatsailTelemetryReporter
   private connectionPromise: Promise<NatsConnection> | undefined
+  private reconnectPromise: Promise<NatsConnection> | undefined
+  private reconnectId = 0
   private activeConnection: NatsConnection | undefined
   private connectionGeneration = 0
+  private connectionAttemptId = 0
+  private pendingFactoryCancellation: AbortController | undefined
+  private lateConnectionCleanup: Promise<void> | undefined
   private readonly resources = new Set<RuntimeResource>()
   private usedJetStreamConsumers = 0
   private usedBufferedMessages = 0
@@ -1043,55 +1099,119 @@ class DefaultNatsRuntime implements NatsRuntime {
     }
 
     if (!this.connectionPromise) {
-      const connectionPromise = this.connectWithRetry()
+      const pending = deferred<NatsConnection>()
+      const connectionPromise = pending.promise
+      // Publish the shared promise before invoking user factory/telemetry code.
       this.connectionPromise = connectionPromise
       void connectionPromise.catch(() => {
         if (this.connectionPromise === connectionPromise) {
           this.connectionPromise = undefined
         }
       })
+      void this.connectWithRetry().then(pending.resolve, pending.reject)
     }
     return this.connectionPromise
   }
 
-  async reconnect(options: NatsRuntimeReconnectOptions = {}): Promise<NatsConnection> {
+  reconnect(options: NatsRuntimeReconnectOptions = {}): Promise<NatsConnection> {
     if (this.closeRequested) {
-      throw new Error('The NATS runtime is closed')
+      return Promise.reject(new Error('The NATS runtime is closed'))
     }
+    if (!this.reconnectPromise) {
+      const reconnectId = ++this.reconnectId
+      const reconnecting = Promise.resolve()
+        .then(() => this.reconnectConnection())
+        .then((connection) => {
+          this.assertOpen()
+          this.reportLifecycle({
+            source: 'connection',
+            code: 'reconnect-completed',
+            level: 'info',
+            message: 'The explicit NATS reconnect completed',
+            details: { reconnectId },
+          })
+          return connection
+        })
+        .catch((error: unknown) => {
+          this.reportLifecycle({
+            source: 'connection',
+            code: 'reconnect-failed',
+            level: 'warning',
+            message: 'The explicit NATS reconnect did not complete',
+            details: {
+              reconnectId,
+              disposed: this.closeRequested,
+              failureCategory: connectionFailureCategory(error, this.closeRequested),
+            },
+          })
+          throw error
+        })
+      this.reconnectPromise = reconnecting
+      this.reportLifecycle({
+        source: 'connection',
+        code: 'reconnect-requested',
+        level: 'info',
+        message: 'The NATS runtime was asked to reconnect',
+        details: {
+          reconnectId,
+          ...(options.reason === undefined ? {} : { reason: options.reason }),
+        },
+      })
+      void reconnecting
+        .finally(() => {
+          if (this.reconnectPromise === reconnecting) this.reconnectPromise = undefined
+        })
+        .catch(() => undefined)
+    }
+    return this.reconnectPromise
+  }
 
-    let connection = await this.connection()
-    this.eventStream.diagnostic({
-      source: 'connection',
-      code: 'reconnect-requested',
-      level: 'info',
-      message: 'The NATS runtime was asked to reconnect',
-      details: {
-        generation: this.connectionGeneration,
-        ...(options.reason === undefined ? {} : { reason: options.reason }),
-      },
-    })
+  private async reconnectConnection(): Promise<NatsConnection> {
+    this.assertOpen()
+    let connection = await this.whileOpen(this.connection())
+    this.assertOpen()
 
     if (connection.isClosed()) {
       this.clearConnection(connection)
-      connection = await this.connection()
+      connection = await this.whileOpen(this.connection())
       return connection
     }
 
     const reconnectCycle = this.observeReconnectCycle()
     try {
-      await connection.reconnect()
-      await reconnectCycle.completed
+      await this.whileOpen(
+        Promise.race([
+          Promise.all([connection.reconnect(), reconnectCycle.completed]),
+          connection.closed().then(() => {
+            throw new Error('The NATS connection closed during reconnect')
+          }),
+        ])
+      )
     } catch (error) {
+      this.assertOpen()
       if (!connection.isClosed()) throw error
     } finally {
       await reconnectCycle.cancel()
     }
 
+    this.assertOpen()
     if (connection.isClosed()) {
       this.clearConnection(connection)
-      return this.connection()
+      return this.whileOpen(this.connection())
     }
     return connection
+  }
+
+  private assertOpen(): void {
+    if (this.closeRequested) throw new Error('The NATS runtime is closed')
+  }
+
+  private whileOpen<T>(operation: Promise<T>): Promise<T> {
+    return rejectWhenAborted(
+      operation,
+      this.retryAbortController.signal,
+      () => new Error('The NATS runtime is closed')
+    )
   }
 
   private observeReconnectCycle(): { completed: Promise<void>; cancel(): Promise<void> } {
@@ -1214,9 +1334,18 @@ class DefaultNatsRuntime implements NatsRuntime {
   }
 
   close(): Promise<void> {
+    if (this.closePromise) return this.closePromise
     this.closeRequested = true
+    this.closePromise = Promise.resolve().then(() => this.closeRuntime())
+    this.reportLifecycle({
+      source: 'runtime',
+      code: 'disposal-requested',
+      level: 'info',
+      message: 'The NATS runtime shutdown was requested',
+      details: { timeoutMs: this.options.shutdownTimeoutMs ?? 30_000 },
+    })
     this.retryAbortController.abort()
-    this.closePromise ??= this.closeRuntime()
+    this.pendingFactoryCancellation?.abort(new Error('The NATS runtime is closed'))
     return this.closePromise
   }
 
@@ -1229,9 +1358,13 @@ class DefaultNatsRuntime implements NatsRuntime {
         resources.map((resource) => Promise.resolve().then(() => resource.close()))
       )
       if (this.connectionPromise) {
-        const connection = await this.connectionPromise.catch(() => undefined)
-        if (connection && !connection.isClosed()) await connection.drain()
+        await this.connectionPromise.catch(() => undefined)
       }
+      const connection = this.activeConnection
+      if (connection && !connection.isClosed()) await connection.drain()
+      // Factory failure/cancellation needs no connection cleanup. A returned
+      // connection whose cleanup failed must not count as graceful disposal.
+      await this.lateConnectionCleanup
       const errors = results
         .filter((result) => result.status === 'rejected')
         .map((result) => result.reason)
@@ -1247,13 +1380,28 @@ class DefaultNatsRuntime implements NatsRuntime {
             /* Continue closing the other resources. */
           }
         }
-        this.forceCloseConnection()
         reject(error)
       }, timeoutMs)
     })
     try {
       await Promise.race([graceful(), expired])
+      this.reportLifecycle({
+        source: 'runtime',
+        code: 'disposal-completed',
+        level: 'info',
+        message: 'The NATS runtime completed graceful shutdown',
+      })
     } catch (error) {
+      this.reportLifecycle({
+        source: 'runtime',
+        code:
+          error instanceof NatsRuntimeShutdownTimeoutError
+            ? 'disposal-timed-out'
+            : 'disposal-failed',
+        level: 'error',
+        message: 'The NATS runtime could not finish graceful shutdown',
+        details: { timeoutMs },
+      })
       this.forceCloseConnection()
       throw error
     } finally {
@@ -1277,37 +1425,68 @@ class DefaultNatsRuntime implements NatsRuntime {
     const maxAttempts = this.options.initialConnectRetry?.maxAttempts ?? 1
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      if (this.closeRequested) {
-        throw new Error('The NATS runtime is closed')
-      }
+      this.assertOpen()
 
       const startedAt = this.telemetry.enabled ? this.telemetry.now() : 0
+      this.assertOpen()
       this.recordCounter('natsail.connection.attempts', 1, { source: 'runtime' })
+      this.assertOpen()
       this.eventStream.setStatus('connecting')
+      const cancellation = new AbortController()
+      const attemptId = ++this.connectionAttemptId
+      this.pendingFactoryCancellation = cancellation
+      this.reportLifecycle({
+        source: 'connection',
+        code: 'connection-attempt-started',
+        level: 'info',
+        message: 'A NATS connection factory attempt started',
+        details: { attempt, attemptId },
+      })
+      let connection: NatsConnection
       try {
-        const connection = await this.options.connect()
+        this.assertOpen()
+        connection = await (typeof this.options.connect === 'function'
+          ? this.options.connect()
+          : this.options.connect.create({ signal: cancellation.signal, attempt, attemptId }))
+        this.pendingFactoryCancellation = undefined
         if (connection.isClosed()) {
           throw new Error('The NATS connection factory returned a closed connection')
         }
         if (this.closeRequested) {
+          this.reportLifecycle({
+            source: 'connection',
+            code: 'late-connection-discarded',
+            level: 'info',
+            message: 'Discarding a connection returned after disposal',
+            details: { attempt, attemptId },
+          })
           if (!connection.isClosed()) {
-            await connection.close()
+            this.lateConnectionCleanup = Promise.resolve().then(() => connection.close())
+            try {
+              await this.lateConnectionCleanup
+            } catch (error) {
+              this.reportLifecycle({
+                source: 'connection',
+                code: 'late-connection-cleanup-failed',
+                level: 'error',
+                message: 'Late connection cleanup failed',
+                details: { attempt, attemptId },
+              })
+              throw error
+            }
           }
           throw new Error('The NATS runtime is closed')
         }
-
-        this.activeConnection = connection
-        this.connectionGeneration += 1
-        this.recordDuration('natsail.connection.attempt.duration', startedAt, {
-          outcome: 'success',
-          source: 'runtime',
-        })
-        this.eventStream.setStatus('connected', connection.getServer())
-        this.markRecovered()
-        void this.observeConnection(connection, this.connectionGeneration)
-        void this.observePermanentClose(connection)
-        return connection
       } catch (error) {
+        this.pendingFactoryCancellation = undefined
+        const failureCategory = connectionFailureCategory(error, this.closeRequested)
+        this.reportLifecycle({
+          source: 'connection',
+          code: 'connection-attempt-failed',
+          level: 'warning',
+          message: 'The NATS connection attempt failed or was cancelled',
+          details: { attempt, attemptId, disposed: this.closeRequested, failureCategory },
+        })
         this.recordDuration('natsail.connection.attempt.duration', startedAt, {
           outcome: 'failure',
           source: 'runtime',
@@ -1320,35 +1499,67 @@ class DefaultNatsRuntime implements NatsRuntime {
         const retryAllowed =
           attempt < maxAttempts &&
           (this.options.initialConnectRetry?.shouldRetry?.(context) ?? true)
+        this.assertOpen()
 
         if (!retryAllowed) {
-          this.eventStream.diagnostic({
+          this.reportLifecycle({
             source: 'connection',
             code: 'connection-failed',
             level: 'error',
             message: `The NATS connection failed after ${attempt} attempt${attempt === 1 ? '' : 's'}`,
-            ...(error instanceof Error ? { error } : {}),
-            details: { attempt, maxAttempts, retryAllowed },
+            details: { attempt, attemptId, maxAttempts, retryAllowed, failureCategory },
           })
+          this.assertOpen()
           this.eventStream.setStatus('disconnected')
           this.markDisconnected()
           throw error
         }
 
         const delayMs = this.retryDelay(context)
+        this.assertOpen()
 
-        this.eventStream.diagnostic({
+        this.reportLifecycle({
           source: 'connection',
           code: 'connection-retry-scheduled',
           level: 'warning',
           message: 'The NATS connection attempt failed; another attempt is scheduled',
-          ...(error instanceof Error ? { error } : {}),
-          details: { attempt, nextAttempt: attempt + 1, maxAttempts, delayMs },
+          details: {
+            attempt,
+            attemptId,
+            nextAttempt: attempt + 1,
+            maxAttempts,
+            delayMs,
+            failureCategory,
+          },
         })
+        this.assertOpen()
         this.eventStream.setStatus('disconnected')
         this.markDisconnected()
         await this.waitForRetry(delayMs)
+        continue
       }
+
+      this.activeConnection = connection
+      this.connectionGeneration += 1
+      this.reportLifecycle({
+        source: 'connection',
+        code: 'connection-attempt-succeeded',
+        level: 'info',
+        message: 'A NATS connection factory attempt was adopted',
+        details: { attempt, attemptId },
+      })
+      this.assertOpen()
+      this.recordDuration('natsail.connection.attempt.duration', startedAt, {
+        outcome: 'success',
+        source: 'runtime',
+      })
+      this.assertOpen()
+      this.eventStream.setStatus('connected', connection.getServer())
+      this.markRecovered()
+      this.assertOpen()
+      void this.observeConnection(connection, this.connectionGeneration)
+      void this.observePermanentClose(connection)
+      return connection
     }
 
     throw new Error('The NATS connection retry series ended unexpectedly')
@@ -1361,6 +1572,20 @@ class DefaultNatsRuntime implements NatsRuntime {
       throw new RangeError('NATS runtime retry delay must be a non-negative integer')
     }
     return delayMs
+  }
+
+  private reportLifecycle(diagnostic: NatsRuntimeDiagnostic): void {
+    const failureCategory = diagnostic.details?.failureCategory as string | undefined
+    this.eventStream.diagnostic({
+      ...diagnostic,
+      details: { generation: this.connectionGeneration, ...diagnostic.details },
+    })
+    // The event stream terminates at shutdown. Telemetry can still report a late factory result.
+    this.recordCounter('natsail.connection.transitions', 1, {
+      source: diagnostic.source,
+      state: diagnostic.code,
+      ...(failureCategory === undefined ? {} : { failureCategory }),
+    })
   }
 
   private waitForRetry(delayMs: number): Promise<void> {
@@ -1387,7 +1612,11 @@ class DefaultNatsRuntime implements NatsRuntime {
   private async observeConnection(connection: NatsConnection, generation: number): Promise<void> {
     try {
       for await (const status of connection.status()) {
-        if (generation !== this.connectionGeneration || connection !== this.activeConnection) {
+        if (
+          this.closeRequested ||
+          generation !== this.connectionGeneration ||
+          connection !== this.activeConnection
+        ) {
           return
         }
         this.reportConnectionStatus(connection, status)

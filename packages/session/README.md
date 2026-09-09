@@ -26,6 +26,8 @@ Call `handle.restart()` or `registry.restart(key)` to reopen a terminal source. 
 
 A restart rejects deliveries from the prior source generation. A restart does not occur automatically after an application handler fails.
 
+Graceful session close accepts the draining source's final values until its lease finishes, then marks the snapshot closed. Use `await closeNatsResources({ runtime, sessions })` from `@natsail/session` when disposing both lifetimes. It starts both close operations even if one throws synchronously, so registry cleanup cannot postpone the runtime shutdown deadline. Both rejections are observed; the first failure rejects the helper. See the [lifecycle upgrade notes](https://github.com/thedonmon/natsail/blob/main/docs/UPGRADING-LIFECYCLE.md); explicit cancellation does not promise buffered delivery.
+
 `registry.inspect()` reports active keys, contracts, phases, reference counts, revisions, and idle state. `registry.events` emits lifecycle and reference-count changes so applications can detect leaks and unexpected restarts without reaching into an adapter.
 
 Pass `telemetry` to `createSessionRegistry()` to report active session and reference gauges plus open, retain, release, restart, and close counters. Session keys and contracts remain available through explicit inspection/events but are never included in default telemetry attributes:

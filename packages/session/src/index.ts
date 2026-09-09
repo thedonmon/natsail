@@ -250,11 +250,11 @@ class SharedSession<T> {
 
   close(): Promise<void> {
     this.closeRequested = true
-    this.generation += 1
     this.closePromise ??= (async () => {
       try {
         await (this.lease?.close() ?? Promise.resolve())
       } finally {
+        this.generation += 1
         if (this.snapshot.phase !== 'closed') {
           this.update({
             ...this.snapshot,
@@ -684,6 +684,20 @@ class DefaultSessionRegistry implements SessionRegistry {
       source: 'session',
     })
   }
+}
+
+/** Starts both lifetimes' cleanup; the runtime owns the shutdown deadline. */
+export async function closeNatsResources({
+  runtime,
+  sessions,
+}: {
+  readonly runtime: Pick<NatsRuntime, 'close'>
+  readonly sessions: Pick<SessionRegistry, 'close'>
+}): Promise<void> {
+  await Promise.all([
+    Promise.resolve().then(() => sessions.close()),
+    Promise.resolve().then(() => runtime.close()),
+  ])
 }
 
 export function createSessionRegistry(options: SessionRegistryOptions = {}): SessionRegistry {

@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import type { NatsConnection, Status } from '@nats-io/nats-core'
-import { createNatsRuntime } from '@natsail/core'
+import { errors } from '@nats-io/nats-core'
+import { createNatsRuntime, type NatsRuntimeEvent } from '@natsail/core'
 
 describe('runtime initial connection retry', () => {
   it.each([0, -1, 1.5, Number.POSITIVE_INFINITY])(
@@ -260,6 +261,205 @@ describe('runtime initial connection retry', () => {
 
     await runtime.close()
   })
+
+  it('coalesces concurrent explicit reconnects, including during startup', async () => {
+    const controlled = controllableConnection('nats://test')
+    let resolveFactory!: (connection: NatsConnection) => void
+    const connect = vi.fn(
+      () =>
+        new Promise<NatsConnection>((resolve) => {
+          resolveFactory = resolve
+        })
+    )
+    const runtime = createNatsRuntime({ connect })
+    const events: NatsRuntimeEvent[] = []
+    const watching = (async () => {
+      for await (const event of runtime.events) events.push(event)
+    })()
+    const initial = runtime.connection()
+    const first = runtime.reconnect()
+    const second = runtime.reconnect()
+    expect(connect).toHaveBeenCalledOnce()
+    resolveFactory(controlled.connection)
+    await expect(initial).resolves.toBe(controlled.connection)
+    await expect(first).resolves.toBe(controlled.connection)
+    await expect(second).resolves.toBe(controlled.connection)
+    expect(controlled.reconnect).toHaveBeenCalledOnce()
+    await runtime.close()
+    await watching
+    expect(
+      events
+        .filter((event) => event.type === 'diagnostic')
+        .map((event) => event.code)
+        .filter((code) => code.startsWith('reconnect-'))
+    ).toEqual(['reconnect-requested', 'reconnect-completed'])
+  })
+
+  it('settles a stalled native reconnect when shutdown starts', async () => {
+    vi.useFakeTimers()
+    const controlled = controllableConnection('nats://test')
+    let finishReconnect!: () => void
+    controlled.reconnect.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          finishReconnect = resolve
+        })
+    )
+    const runtime = createNatsRuntime({ connect: async () => controlled.connection })
+    await runtime.connection()
+    let failure: unknown
+    const reconnecting = runtime.reconnect().catch((error: unknown) => {
+      failure = error
+    })
+    await vi.advanceTimersByTimeAsync(0)
+    await runtime.close()
+    await vi.advanceTimersByTimeAsync(0)
+    try {
+      expect(failure).toBeInstanceOf(Error)
+      expect(String(failure)).toContain('closed')
+    } finally {
+      finishReconnect()
+      await reconnecting
+      vi.useRealTimers()
+    }
+  })
+
+  it('replaces a permanently closed connection even when its native reconnect never settles', async () => {
+    vi.useFakeTimers()
+    const first = controllableConnection('nats://first')
+    const second = controllableConnection('nats://second')
+    let finish!: () => void
+    first.reconnect.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve
+        })
+    )
+    const connect = vi
+      .fn<() => Promise<NatsConnection>>()
+      .mockResolvedValueOnce(first.connection)
+      .mockResolvedValueOnce(second.connection)
+    const runtime = createNatsRuntime({ connect })
+    await runtime.connection()
+    let result: NatsConnection | undefined
+    const reconnecting = runtime.reconnect().then((connection) => {
+      result = connection
+    })
+    await vi.advanceTimersByTimeAsync(0)
+    first.closePermanently()
+    await vi.advanceTimersByTimeAsync(0)
+    try {
+      expect(result).toBe(second.connection)
+      expect(connect).toHaveBeenCalledTimes(2)
+    } finally {
+      finish()
+      await reconnecting
+      await runtime.close()
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not publish a queued connected status once disposal has started', async () => {
+    vi.useFakeTimers()
+    const controlled = controllableConnection('nats://test')
+    let finishDrain!: () => void
+    vi.spyOn(controlled.connection, 'drain').mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          finishDrain = resolve
+        })
+    )
+    const runtime = createNatsRuntime({ connect: async () => controlled.connection })
+    await runtime.connection()
+    controlled.emitStatus({ type: 'disconnect', server: 'nats://test' })
+    await vi.advanceTimersByTimeAsync(0)
+    const closing = runtime.close()
+    await vi.advanceTimersByTimeAsync(0)
+    controlled.emitStatus({ type: 'reconnect', server: 'nats://test' })
+    await vi.advanceTimersByTimeAsync(0)
+    try {
+      expect(runtime.inspect().connection.state).toBe('disconnected')
+    } finally {
+      controlled.closePermanently()
+      finishDrain()
+      await closing
+      vi.useRealTimers()
+    }
+  })
+
+  it('rejects startup reconnect promptly on disposal and never forces the late connection', async () => {
+    vi.useFakeTimers()
+    const controlled = controllableConnection('nats://test')
+    let resolveFactory!: (connection: NatsConnection) => void
+    const connect = vi.fn(
+      () =>
+        new Promise<NatsConnection>((resolve) => {
+          resolveFactory = resolve
+        })
+    )
+    const runtime = createNatsRuntime({ connect, shutdownTimeoutMs: 10 })
+    const initial = runtime.connection().catch((error: unknown) => error)
+    const reconnecting = runtime.reconnect().catch((error: unknown) => error)
+    await vi.advanceTimersByTimeAsync(0)
+    const closing = runtime.close().catch((error: unknown) => error)
+    expect(await reconnecting).toBeInstanceOf(Error)
+    await vi.advanceTimersByTimeAsync(10)
+    expect(await closing).toMatchObject({ name: 'NatsRuntimeShutdownTimeoutError' })
+    resolveFactory(controlled.connection)
+    await initial
+    expect(controlled.reconnect).not.toHaveBeenCalled()
+    expect(connect).toHaveBeenCalledOnce()
+    expect(runtime.inspect().connectionGeneration).toBe(0)
+    await expect(runtime.reconnect()).rejects.toThrow('closed')
+    vi.useRealTimers()
+  })
+
+  it('does not start a factory when reconnect is immediately followed by disposal', async () => {
+    const connect = vi.fn(async () => fakeConnection())
+    const runtime = createNatsRuntime({ connect })
+    const reconnecting = runtime.reconnect().catch((error: unknown) => error)
+    await runtime.close()
+    expect(await reconnecting).toBeInstanceOf(Error)
+    expect(connect).not.toHaveBeenCalled()
+  })
+
+  it('shares native reconnect failure and permits a later explicit retry', async () => {
+    const controlled = controllableConnection('nats://test')
+    const error = new errors.TimeoutError()
+    controlled.reconnect.mockRejectedValueOnce(error)
+    const runtime = createNatsRuntime({ connect: async () => controlled.connection })
+    const events: NatsRuntimeEvent[] = []
+    const watching = (async () => {
+      for await (const event of runtime.events) events.push(event)
+    })()
+    await runtime.connection()
+    const first = runtime.reconnect()
+    const second = runtime.reconnect()
+    expect(first).toBe(second)
+    await expect(first).rejects.toBe(error)
+    await expect(second).rejects.toBe(error)
+    await expect(runtime.reconnect()).resolves.toBe(controlled.connection)
+    expect(controlled.reconnect).toHaveBeenCalledTimes(2)
+    await runtime.close()
+    await watching
+    expect(
+      events
+        .filter((event) => event.type === 'diagnostic')
+        .map((event) => event.code)
+        .filter((code) => code.startsWith('reconnect-'))
+    ).toEqual([
+      'reconnect-requested',
+      'reconnect-failed',
+      'reconnect-requested',
+      'reconnect-completed',
+    ])
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        code: 'reconnect-failed',
+        details: expect.objectContaining({ failureCategory: 'timeout' }),
+      })
+    )
+  })
 })
 
 function fakeConnection(): NatsConnection {
@@ -330,6 +530,12 @@ function controllableConnection(server: string): {
     isClosed: () => closed,
     closed: () => closedPromise,
     reconnect,
+    close: async () => {
+      closed = true
+      resolveClosed()
+      waiting?.({ done: true, value: undefined })
+      waiting = undefined
+    },
     drain: async () => {
       closed = true
       resolveClosed()

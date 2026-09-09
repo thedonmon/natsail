@@ -1,63 +1,38 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { Msg, NatsConnection } from '@nats-io/nats-core'
-import { SubscriptionImpl, Subscriptions, type ProtocolHandler } from '@nats-io/nats-core/internal'
+import type { NatsConnection } from '@nats-io/nats-core'
 import { createNatsRuntime, natsCodecs } from '@natsail/core'
-
-function deferred<T>() {
-  let resolve!: (value: T) => void
-  const promise = new Promise<T>((done) => {
-    resolve = done
-  })
-  return { promise, resolve }
-}
-
-function transport(values: readonly string[] = ['work']) {
-  const disconnected = deferred<void>()
-  let stopped = false
-  const subscriptions = new Subscriptions()
-  const flush = vi.fn<() => Promise<void>>(async () => undefined)
-  const protocol = {
-    options: {},
-    isClosed: () => stopped,
-    subscriptions,
-    unsub: vi.fn(),
-    unsubscribe: (subscription: SubscriptionImpl) => subscriptions.cancel(subscription),
-    flush,
-  } as unknown as ProtocolHandler
-  const subscription = subscriptions.add(new SubscriptionImpl(protocol, 'work'))
-  const deliver = (value: string) => {
-    if (subscriptions.get(subscription.sid)) {
-      subscription.callback(null, { subject: 'work', data: natsCodecs.text.encode(value) } as Msg)
-    }
-  }
-  const disconnect = () => {
-    stopped = true
-    subscriptions.close()
-    disconnected.resolve()
-  }
-  const close = vi.fn(async () => disconnect())
-  const drain = vi.fn(async () => {
-    await Promise.all(subscriptions.all().map((active) => active.drain()))
-    disconnect()
-  })
-  const connection = {
-    subscribe: () => {
-      values.forEach(deliver)
-      return subscription
-    },
-    getServer: () => 'mock:4222',
-    status: async function* () {},
-    isClosed: () => stopped,
-    closed: () => disconnected.promise,
-    close,
-    drain,
-  } as unknown as NatsConnection
-  return { connection, close, drain, flush, deliver }
-}
+import { deferred, transport } from './fixtures/lifecycle'
 
 afterEach(() => vi.useRealTimers())
 
 describe('bounded runtime shutdown', () => {
+  it('signals a shared pending factory at disposal without pretending to abort its transport', async () => {
+    vi.useFakeTimers()
+    const network = transport()
+    const connecting = deferred<NatsConnection>()
+    let signal: AbortSignal | undefined
+    const connect = vi.fn((context?: { signal: AbortSignal }) => {
+      signal = context?.signal
+      return connecting.promise
+    })
+    const runtime = createNatsRuntime({ connect: { create: connect }, shutdownTimeoutMs: 10 })
+    const first = runtime.connection()
+    const second = runtime.connection()
+    void first.catch(() => undefined)
+    expect(first).toBe(second)
+    expect(connect).toHaveBeenCalledOnce()
+    expect(signal?.aborted).toBe(false)
+    const closing = runtime.close().catch((error: unknown) => error)
+    expect(signal?.aborted).toBe(true)
+    expect(network.close).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(10)
+    expect(await closing).toMatchObject({ name: 'NatsRuntimeShutdownTimeoutError' })
+    connecting.resolve(network.connection)
+    await expect(first).rejects.toThrow('closed')
+    expect(network.close).toHaveBeenCalledOnce()
+    expect(runtime.inspect().connectionGeneration).toBe(0)
+  })
+
   it('closes a connection factory result that arrives after the deadline', async () => {
     vi.useFakeTimers()
     const network = transport()

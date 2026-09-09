@@ -31,7 +31,11 @@ import {
   type JetStreamSessionSourceOptions,
   type JetStreamStateSnapshot,
 } from '@natsail/jetstream'
-import { createCoreSessionSource, createReducingSessionSource } from '@natsail/session'
+import {
+  closeNatsResources,
+  createCoreSessionSource,
+  createReducingSessionSource,
+} from '@natsail/session'
 import type {
   SessionReducer,
   SessionDefinition,
@@ -67,13 +71,13 @@ export interface NatsProviderProps {
 export interface NatsManagedResource {
   readonly runtime: NatsRuntime
   readonly sessions: SessionRegistry
-  /** Defaults to closing the registry and then the runtime. */
+  /** Overrides coordinated registry/runtime shutdown; custom cleanup owns both lifetimes. */
   close?(): Promise<void>
 }
 
 export interface NatsManagedProviderProps {
   children?: ReactNode
-  /** Remounts and replaces the managed resource when its connection identity changes. */
+  /** Replaces the resource on change. The replacement may connect while its predecessor drains. */
   identity: string
   create(): NatsManagedResource
   fallback?: ReactNode
@@ -154,10 +158,10 @@ function ManagedProviderInstance({
     return () => {
       queueMicrotask(() => {
         if (effectRun.current !== run || resourceRef.current !== active) return
-        const close = active.close
-          ? () => active.close!()
-          : () => active.sessions.close().then(() => active.runtime.close())
-        void close().catch((error) => closeErrorRef.current?.(error))
+        const close = active.close ? () => active.close!() : () => closeNatsResources(active)
+        void Promise.resolve()
+          .then(close)
+          .catch((error) => closeErrorRef.current?.(error))
       })
     }
   }, [])
