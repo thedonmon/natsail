@@ -1,6 +1,6 @@
 {
   "name": "@natsail/session",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Keyed lifecycle and shared state for NATSail subscription sources.",
   "keywords": [
     "nats",
