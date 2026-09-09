@@ -38,6 +38,10 @@ Call `runtime.reconnect()` after an authenticator receives new credentials. A li
 
 The reconnect can interrupt in-flight messages and requests. Normal NATS reconnect settings still apply.
 
+Concurrent `reconnect()` callers share one operation. During startup it waits for the shared factory, then forces a fresh handshake; disposal rejects reconnect callers without starting another attempt. The optional `connect: { create({ signal, attempt, attemptId }) { … } }` form supports cooperative pending-factory cancellation. Function factories still receive no arguments. A signal does not automatically abort a WebSocket.
+
+See the [connection lifecycle upgrade notes](https://github.com/thedonmon/natsail/blob/main/docs/UPGRADING-LIFECYCLE.md) for shutdown races, diagnostic codes, and factory compatibility.
+
 The retry policy accepts fixed or computed delays. It also accepts `shouldRetry` for error-specific retry decisions.
 
 Call `runtime.inspect()` to read the current connection generation, resource reservations, and configured limits.

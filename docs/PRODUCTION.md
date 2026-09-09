@@ -18,6 +18,8 @@ The package manifests are authoritative for installable dependency ranges. Packa
 
 ## Runtime shutdown and observation
 
+Read the [connection lifecycle upgrade notes](./UPGRADING-LIFECYCLE.md) when moving from older Core/React packages: pending factory cancellation, coordinated provider shutdown, reconnect coalescing, and graceful session delivery all affect disposal behavior.
+
 ```ts
 const runtime = createNatsRuntime({
   connect: () => connect({ servers: process.env.NATS_URL }),
