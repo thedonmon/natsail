@@ -2,10 +2,10 @@
 
 `@natsail/effect` gives Effect v4 programs scoped Core NATS and JetStream Streams, typed operations and failures, and optional shared-session Streams over one NATSail runtime.
 
-The current v4 adapter targets `effect@4.0.0-rc.112`. Install the matching Effect release candidate while this version is published under NATSail's prerelease tag.
+The v4 adapter supports stable Effect releases starting at `effect@4.0.0` and is published under the default `latest` tag.
 
 ```sh
-pnpm add effect@4.0.0-rc.112 @natsail/core @natsail/jetstream @natsail/session @natsail/effect
+pnpm add effect@^4.0.0 @natsail/core @natsail/jetstream @natsail/session @natsail/effect
 ```
 
 ## Core subject Streams

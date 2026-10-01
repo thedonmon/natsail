@@ -55,7 +55,6 @@ describe('package publishing', () => {
     expect(manifest.publishConfig).toEqual({
       access: 'public',
       registry: 'https://registry.npmjs.org/',
-      ...(directory === 'effect' ? { tag: 'next' } : {}),
     })
     expect(manifest.scripts?.prepack).toBe('pnpm build')
     await expect(readFile(new URL('README.md', packageRoot), 'utf8')).resolves.toContain(

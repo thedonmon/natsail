@@ -35,8 +35,7 @@
   },
   "publishConfig": {
     "access": "public",
-    "registry": "https://registry.npmjs.org/",
-    "tag": "next"
+    "registry": "https://registry.npmjs.org/"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -48,6 +47,6 @@
     "@natsail/session": "workspace:^"
   },
   "peerDependencies": {
-    "effect": "4.0.0-rc.112"
+    "effect": "^4.0.0"
   }
 }

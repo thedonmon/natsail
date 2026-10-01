@@ -5,10 +5,10 @@ description: Use @natsail/effect to expose a NATSail runtime through an Effect s
 
 # Use @natsail/effect
 
-The adapter currently targets the exact Effect v4 release candidate documented by NATSail and is published under the `next` tag:
+The adapter supports stable Effect v4 releases starting at `4.0.0` and is published under the default `latest` tag:
 
 ```sh
-pnpm add effect@4.0.0-rc.112 @natsail/core @natsail/jetstream @natsail/session @natsail/effect@next
+pnpm add effect@^4.0.0 @natsail/core @natsail/jetstream @natsail/session @natsail/effect
 ```
 
 Keep the installed Effect peer compatible with the version declared by `@natsail/effect`.
