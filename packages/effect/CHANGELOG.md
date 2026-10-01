@@ -1,5 +1,11 @@
 # @natsail/effect
 
+## 0.6.0
+
+### Minor Changes
+
+- 75263c6: Support stable Effect v4 with an `effect@^4.0.0` peer dependency and publish the adapter under the default `latest` tag. Update the workspace, chat example, and package smoke check to Effect 4.0.0.
+
 ## 0.5.1
 
 ### Patch Changes
