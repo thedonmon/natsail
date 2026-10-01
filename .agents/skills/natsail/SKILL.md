@@ -31,7 +31,7 @@ Do not use Core NATS when missed messages are unacceptable. Do not treat an orde
 | `@natsail/browser-broker` | Same-origin tabs must share worker-owned sources and operations          | [natsail-browser-broker](../natsail-browser-broker/SKILL.md) |
 | `@natsail/opentelemetry`  | NATSail measurements should feed an OpenTelemetry MeterProvider          | [natsail-opentelemetry](../natsail-opentelemetry/SKILL.md)   |
 
-Install every package imported by application code instead of relying on transitive dependency hoisting. NATSail package versions are independent; do not assume every package has the same version number. For Effect, follow the exact peer version and npm tag in the Effect skill.
+Install every package imported by application code instead of relying on transitive dependency hoisting. NATSail package versions are independent; do not assume every package has the same version number. For Effect, follow the peer version range and npm tag in the Effect skill.
 
 ## Create shared application resources
 

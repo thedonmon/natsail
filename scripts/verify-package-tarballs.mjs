@@ -68,10 +68,7 @@ try {
     assert.notEqual(manifest.private, true)
     assert.equal(manifest.publishConfig?.access, 'public')
     assert.equal(manifest.publishConfig?.registry, 'https://registry.npmjs.org/')
-    assert.equal(
-      manifest.publishConfig?.tag,
-      packageInfo.name === '@natsail/effect' ? 'next' : undefined
-    )
+    assert.equal(manifest.publishConfig?.tag, undefined)
     assert.equal(manifest.repository?.url, 'git+https://github.com/thedonmon/natsail.git')
     assert(
       !Object.hasOwn(manifest.publishConfig ?? {}, 'provenance'),
@@ -105,7 +102,7 @@ try {
         dependencies: {
           ...localPackages,
           '@opentelemetry/api': '^1.9.0',
-          effect: '4.0.0-rc.112',
+          effect: '4.0.0',
           react: '^19.0.0',
           rxjs: '^7.8.0',
         },

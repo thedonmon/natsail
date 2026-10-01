@@ -17,7 +17,7 @@
     "@natsail/example-chat-ui": "workspace:*",
     "@natsail/jetstream": "workspace:*",
     "@natsail/session": "workspace:*",
-    "effect": "4.0.0-rc.112",
+    "effect": "4.0.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
