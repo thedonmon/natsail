@@ -119,7 +119,7 @@ processJetStream(runtime, {
 
 A throwing hook stops the processor.
 
-Decode failures are terminal by default on every path. A processor without a hook, `consumeJetStream()`, and reducing sessions all end with a `JetStreamDecodeError`, and session `recovery` does not retry it. Recognise it with `error instanceof JetStreamDecodeError`. Its message names the stream, sequence, subject, and original message but never the payload. It also carries `subject`, `cursor`, and, for processors, `deliveryAttempt`. The original error is `error.cause`. Ordered consumers do not acknowledge, so only processors can skip a bad message with `onDecodeFailure`. Elsewhere, decode defensively: have `decode` return a tagged value and let the handler or reducer skip the bad entry.
+Decode failures are terminal by default on every path. A processor without a hook, `consumeJetStream()`, and reducing sessions all end with a `JetStreamDecodeError`, and session `recovery` does not retry it. Recognise it with `error instanceof JetStreamDecodeError`. Its message names the stream, sequence, subject, and the original error's type, but never the payload or the original message (codec errors can quote the payload). It also carries `subject`, `cursor`, and, for processors, `deliveryAttempt`. The original error is `error.cause`. Ordered consumers do not acknowledge, so only processors can skip a bad message with `onDecodeFailure`. Elsewhere, decode defensively: have `decode` return a tagged value and let the handler or reducer skip the bad entry.
 
 ## Delivery headers
 
@@ -152,7 +152,7 @@ processJetStream(
 
 Add a safety net for deliveries that never reach the handler's last attempt, such as repeated ack-wait timeouts. Capture the server's max-deliveries advisory in a stream, with the subject `$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.<stream>.<consumer>`. Each advisory carries `stream_seq`, and `jsm.streams.getMessage(stream, { seq })` returns the original.
 
-Do not rely on the advisory alone for `term`. The server treats `term` like an acknowledgement, so on `WorkQueue` and `Interest` retention streams the original can be removed before a dead-letter worker fetches it. Limits and age can also remove it. The handler-side publish above is the reliable path. `tests/integration/jetstream-failure-handling.test.ts` runs both against a real server.
+Do not rely on the advisory alone for `term`. The server treats `term` like an acknowledgement, so on `WorkQueue` and `Interest` retention streams the original can be removed before a dead-letter worker fetches it. Limits and age can also remove it. The handler-side publish above is the reliable path. `tests/integration/jetstream-failure-handling.test.ts` runs the handler-side recipe against a real server.
 
 ## Watching a KV bucket
 

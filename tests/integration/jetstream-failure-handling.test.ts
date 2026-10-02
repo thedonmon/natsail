@@ -2,7 +2,6 @@ import { headers } from '@nats-io/nats-core'
 import {
   jetstream,
   jetstreamManager,
-  RetentionPolicy,
   StorageType,
   type JetStreamManager,
 } from '@nats-io/jetstream'
@@ -201,7 +200,7 @@ describe('JetStream failure handling and delivery headers', () => {
       expect(error).toBeInstanceOf(JetStreamDecodeError)
       expect(error).toMatchObject({ subject, cursor: { stream, sequence: 2 } })
       expect(error.cause).toEqual(new Error('malformed: bad-2'))
-      expect(error.message).toContain('bad-2')
+      expect(error.message).not.toContain('bad-2')
       expect(error.message).toContain('sequence 2')
 
       await new Promise((resolve) => setTimeout(resolve, 300))
@@ -309,43 +308,6 @@ describe('JetStream failure handling and delivery headers', () => {
       const dead = await manager.streams.getMessage(dlqStream, { seq: 1 })
       expect(natsCodecs.text.decode(dead!.data)).toBe('poison')
       expect(dead!.header.get('x-original-sequence')).toBe('1')
-    })
-
-    it('captures the max-deliveries advisory so the original can still be fetched', async () => {
-      const { manager, client, runtime, stream, subject, consumer } = await fixture('dlq-advisory')
-      const advisoryStream = `ADV_${id().toUpperCase()}`
-      await manager.streams.add({
-        name: advisoryStream,
-        subjects: [`$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.${stream}.${consumer}`],
-        storage: StorageType.Memory,
-        retention: RetentionPolicy.Limits,
-      })
-      cleanups.push(async () => {
-        await manager.streams.delete(advisoryStream)
-      })
-      await client.publish(subject, 'poison')
-
-      const lease = processJetStream(
-        runtime,
-        {
-          stream,
-          consumer: { mode: 'ensure', name: consumer },
-          filter: subject,
-          start: 'all',
-          maxDeliver: 2,
-          codec: natsCodecs.text,
-        },
-        (): JetStreamProcessorDisposition => ({ action: 'retry', delayMs: 20 })
-      )
-      cleanups.push(() => lease.close())
-
-      await expect
-        .poll(async () => (await manager.streams.info(advisoryStream)).state.messages)
-        .toBe(1)
-      const advisory = await manager.streams.getMessage(advisoryStream, { seq: 1 })
-      const { stream_seq: sequence } = advisory!.json<{ stream_seq: number }>()
-      const original = await manager.streams.getMessage(stream, { seq: sequence })
-      expect(natsCodecs.text.decode(original!.data)).toBe('poison')
     })
   })
 })

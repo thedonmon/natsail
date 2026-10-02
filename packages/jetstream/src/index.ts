@@ -299,7 +299,7 @@ export class JetStreamDecodeError extends Error {
   ) {
     super(
       `JetStream payload decode failed for stream ${cursor.stream} sequence ${cursor.sequence} ` +
-        `on subject ${subject}: ${cause instanceof Error ? cause.message : String(cause)}`,
+        `on subject ${subject} (${cause instanceof Error ? cause.name : typeof cause})`,
       { cause }
     )
   }
