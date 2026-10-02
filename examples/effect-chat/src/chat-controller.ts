@@ -1,10 +1,10 @@
-import { Effect, Stream } from 'effect'
+import { Effect, Schema, Stream } from 'effect'
 
-import { natsailDefaultScheduler, natsCodecs, type NatsPayloadCodec } from '@natsail/core'
+import { natsailDefaultScheduler } from '@natsail/core'
 import type { NatsailService } from '@natsail/effect'
+import { natsSchemaCodec } from '@natsail/effect/schema'
 import {
   demoConversations,
-  isDemoChatMessage,
   type DemoChatEntry,
   type DemoChatMessage,
   type DemoConversationActivity,
@@ -19,15 +19,17 @@ import { readPerformanceTelemetry, resetPerformanceTelemetry } from './runtime'
 export const chatStream = 'NATSAIL_EFFECT_CHAT'
 export const chatSubjectPrefix = 'natsail.examples.effect.chat'
 
-const jsonCodec = natsCodecs.json<unknown>()
-const chatCodec: NatsPayloadCodec<DemoChatMessage> = {
-  encode: (message) => jsonCodec.encode(message),
-  decode: (data) => {
-    const value = jsonCodec.decode(data)
-    if (!isDemoChatMessage(value)) throw new Error('Received an invalid Effect chat message')
-    return value
-  },
-}
+const chatCodec = natsSchemaCodec(
+  Schema.Struct({
+    id: Schema.String,
+    conversationId: Schema.String,
+    role: Schema.Literals(['assistant', 'user']),
+    author: Schema.String,
+    body: Schema.String,
+    sentAt: Schema.String,
+    clientId: Schema.String,
+  })
+)
 
 interface ConversationModel {
   readonly entries: readonly DemoChatEntry[]

@@ -10,6 +10,7 @@ export default defineConfig({
       '@natsail/browser-broker': fromRoot('./packages/browser-broker/src/index.ts'),
       '@natsail/checkpoints': fromRoot('./packages/checkpoints/src/index.ts'),
       '@natsail/core': fromRoot('./packages/core/src/index.ts'),
+      '@natsail/effect/schema': fromRoot('./packages/effect/src/schema.ts'),
       '@natsail/effect': fromRoot('./packages/effect/src/index.ts'),
       '@natsail/jetstream': fromRoot('./packages/jetstream/src/index.ts'),
       '@natsail/opentelemetry': fromRoot('./packages/opentelemetry/src/index.ts'),

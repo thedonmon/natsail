@@ -1,5 +1,7 @@
-import { Effect, Fiber, Stream } from 'effect'
-import { describe, expect, it, vi } from 'vitest'
+import { it } from '@effect/vitest'
+import { Cause, Effect, Exit, Fiber, Schema, Stream, Tracer } from 'effect'
+import { TestClock } from 'effect/testing'
+import { describe, expect, vi } from 'vitest'
 
 import type {
   CoreRequestOptions,
@@ -15,15 +17,15 @@ import { createNatsailTelemetryReporter, NATS_RUNTIME_ADAPTER } from '@natsail/c
 import {
   jetStreamStates as jetStreamStatesEffect,
   makeNatsail,
-  makeNatsailLayer,
-  makeNatsailScopedLayer,
   Natsail,
+  type NatsailService,
   NatsailOperationError,
   NatsailSessionError,
   NatsailStreamBufferOverflowError,
   NatsailSubjectError,
   subscribe as subscribeEffect,
 } from '@natsail/effect'
+import { natsSchemaCodec } from '@natsail/effect/schema'
 import type { JetStreamStateSnapshot } from '@natsail/jetstream'
 import {
   createSessionRegistry,
@@ -95,7 +97,17 @@ function controllableSource<T>(): {
   }
 }
 
-function controllableSubscription<T>(telemetryEvents?: NatsailTelemetryEvent[]): {
+const invalidOptionsDefinition = defineSession({
+  key: 'conversation:effect-invalid-options',
+  contract: 'conversation:v1',
+  source: controllableSource<JetStreamStateSnapshot<number>>().source,
+})
+
+/** `drainOnClose` mirrors CoreSubscription.close(), which awaits in-flight handlers. */
+function controllableSubscription<T>(
+  telemetryEvents?: NatsailTelemetryEvent[],
+  drainOnClose = false
+): {
   readonly runtime: NatsRuntime
   readonly subscribe: ReturnType<typeof vi.fn>
   readonly close: ReturnType<typeof vi.fn>
@@ -109,7 +121,11 @@ function controllableSubscription<T>(telemetryEvents?: NatsailTelemetryEvent[]):
     closeSubscription = resolve
     failSubscription = reject
   })
-  const close = vi.fn(async () => closeSubscription())
+  const inFlight = new Set<Promise<unknown>>()
+  const close = vi.fn(async () => {
+    if (drainOnClose) await Promise.allSettled(inFlight)
+    closeSubscription()
+  })
   const lease: SubscriptionLease = {
     ready: Promise.resolve(),
     closed,
@@ -138,7 +154,15 @@ function controllableSubscription<T>(telemetryEvents?: NatsailTelemetryEvent[]):
     }),
     subscribe,
     close,
-    deliver: async (value) => handler(value, {} as never, { signal: new AbortController().signal }),
+    deliver: (value) => {
+      const delivered = Promise.resolve(
+        handler(value, {} as never, { signal: new AbortController().signal })
+      )
+      inFlight.add(delivered)
+      const settled = () => inFlight.delete(delivered)
+      delivered.then(settled, settled)
+      return delivered
+    },
     fail: failSubscription,
   }
 }
@@ -204,7 +228,7 @@ describe('Effect adapter', () => {
     expect(controlled.subscribe).not.toHaveBeenCalled()
 
     const fiber = Effect.runFork(
-      stream.pipe(Stream.take(1), Stream.runCollect, Effect.provide(makeNatsailLayer(resource)))
+      stream.pipe(Stream.take(1), Stream.runCollect, Effect.provide(Natsail.layer(resource)))
     )
     await vi.waitFor(() => expect(controlled.subscribe).toHaveBeenCalledOnce())
     await controlled.deliver('hello')
@@ -263,6 +287,40 @@ describe('Effect adapter', () => {
 
     expect(received).toEqual([1, 2, 3])
     expect(controlled.close).toHaveBeenCalledOnce()
+  })
+
+  it('closes the subscription when the consumer is interrupted while a delivery waits for buffer space', async () => {
+    const controlled = controllableSubscription<number>(undefined, true)
+    const service = makeNatsail({
+      runtime: controlled.runtime,
+      sessions: createSessionRegistry(),
+    })
+    let markStarted!: () => void
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve
+    })
+    const fiber = Effect.runFork(
+      service.subscribe({ subject: 'numbers', decode: () => 0 }, { bufferSize: 1 }).pipe(
+        Stream.runForEach(() =>
+          Effect.promise(() => {
+            markStarted()
+            return new Promise<void>(() => undefined)
+          })
+        )
+      )
+    )
+
+    await vi.waitFor(() => expect(controlled.subscribe).toHaveBeenCalledOnce())
+    void controlled.deliver(1)
+    await started
+    void controlled.deliver(2)
+    const parked = controlled.deliver(3)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+
+    await Effect.runPromise(Fiber.interrupt(fiber))
+
+    expect(controlled.close).toHaveBeenCalledOnce()
+    await parked
   })
 
   it('composes subject delivery with Effect v4 chunk processing', async () => {
@@ -415,68 +473,77 @@ describe('Effect adapter', () => {
     expect(sessions.inspect().activeSessions).toBe(0)
   })
 
-  it('shares reduced JetStream state and coalesces cumulative live updates', async () => {
-    const controlled = controllableSource<JetStreamStateSnapshot<number>>()
-    const sessions = createSessionRegistry()
-    const definition = defineSession({
-      key: 'conversation:effect-jetstream-state',
-      contract: 'conversation:v1',
-      source: controlled.source,
-    })
-    const resource = { runtime: runtimeStub(), sessions }
-    const service = makeNatsail(resource)
-    const first = Effect.runFork(
-      service
-        .jetStreamStates(definition, { bufferSize: 256, liveBatchWithin: '20 millis' })
-        .pipe(Stream.take(3), Stream.runCollect)
-    )
-    const second = Effect.runFork(
-      jetStreamStatesEffect(definition, {
-        bufferSize: 256,
-        liveBatchWithin: '20 millis',
-      }).pipe(Stream.take(2), Stream.runCollect, Effect.provide(makeNatsailLayer(resource)))
-    )
-
-    await vi.waitFor(() => expect(sessions.inspect().sessions[0]?.references).toBe(2))
-    await controlled.deliver({
-      phase: 'replaying',
-      data: 0,
-      restarts: 0,
-      replay: { delivered: 0, remaining: 3 },
-    })
-    await controlled.deliver({
-      phase: 'live',
-      data: 3,
-      restarts: 0,
-      replay: { delivered: 3, remaining: 0 },
-    })
-    for (let data = 4; data <= 220; data += 1) {
-      await controlled.deliver({
-        phase: 'live',
-        data,
-        restarts: 0,
-        replay: { delivered: 3, remaining: 0 },
+  it.effect('shares reduced JetStream state and coalesces cumulative live updates', () =>
+    Effect.gen(function* () {
+      const controlled = controllableSource<JetStreamStateSnapshot<number>>()
+      const sessions = createSessionRegistry()
+      const definition = defineSession({
+        key: 'conversation:effect-jetstream-state',
+        contract: 'conversation:v1',
+        source: controlled.source,
       })
-    }
+      const resource = { runtime: runtimeStub(), sessions }
+      const service = makeNatsail(resource)
+      const first = yield* Effect.forkChild(
+        service
+          .jetStreamStates(definition, { bufferSize: 256, liveBatchWithin: '20 millis' })
+          .pipe(Stream.take(3), Stream.runCollect)
+      )
+      const second = yield* Effect.forkChild(
+        jetStreamStatesEffect(definition, {
+          bufferSize: 256,
+          liveBatchWithin: '20 millis',
+        }).pipe(Stream.take(2), Stream.runCollect, Effect.provide(Natsail.layer(resource)))
+      )
 
-    const [firstStates, secondStates] = await Promise.all([
-      Effect.runPromise(Fiber.join(first)),
-      Effect.runPromise(Fiber.join(second)),
-    ])
+      yield* Effect.promise(() =>
+        vi.waitFor(() => expect(sessions.inspect().sessions[0]?.references).toBe(2))
+      )
+      yield* Effect.promise(async () => {
+        await controlled.deliver({
+          phase: 'replaying',
+          data: 0,
+          restarts: 0,
+          replay: { delivered: 0, remaining: 3 },
+        })
+        await controlled.deliver({
+          phase: 'live',
+          data: 3,
+          restarts: 0,
+          replay: { delivered: 3, remaining: 0 },
+        })
+        for (let data = 4; data <= 220; data += 1) {
+          await controlled.deliver({
+            phase: 'live',
+            data,
+            restarts: 0,
+            replay: { delivered: 3, remaining: 0 },
+          })
+        }
+      })
+      // The coalescing window only closes when the test clock says so.
+      while (first.pollUnsafe() === undefined) {
+        yield* Effect.promise(() => new Promise((resolve) => setImmediate(resolve)))
+        yield* TestClock.adjust('20 millis')
+      }
 
-    expect(firstStates.map(({ phase, data }) => ({ phase, data }))).toEqual([
-      { phase: 'replaying', data: 0 },
-      { phase: 'live', data: 3 },
-      { phase: 'live', data: 220 },
-    ])
-    expect(secondStates.map(({ phase, data }) => ({ phase, data }))).toEqual([
-      { phase: 'replaying', data: 0 },
-      { phase: 'live', data: 3 },
-    ])
-    expect(controlled.starts).toHaveBeenCalledOnce()
-    expect(controlled.closeLease).toHaveBeenCalledOnce()
-    expect(sessions.inspect().activeSessions).toBe(0)
-  })
+      const firstStates = yield* Fiber.join(first)
+      const secondStates = yield* Fiber.join(second)
+
+      expect(firstStates.map(({ phase, data }) => ({ phase, data }))).toEqual([
+        { phase: 'replaying', data: 0 },
+        { phase: 'live', data: 3 },
+        { phase: 'live', data: 220 },
+      ])
+      expect(secondStates.map(({ phase, data }) => ({ phase, data }))).toEqual([
+        { phase: 'replaying', data: 0 },
+        { phase: 'live', data: 3 },
+      ])
+      expect(controlled.starts).toHaveBeenCalledOnce()
+      expect(controlled.closeLease).toHaveBeenCalledOnce()
+      expect(sessions.inspect().activeSessions).toBe(0)
+    })
+  )
 
   it('flushes pending live state before an immediate reconnect boundary', async () => {
     const controlled = controllableSource<JetStreamStateSnapshot<number>>()
@@ -567,21 +634,70 @@ describe('Effect adapter', () => {
     expect(controlled.closeLease).toHaveBeenCalledOnce()
   })
 
-  it('rejects invalid shared JetStream live batch windows', () => {
-    const controlled = controllableSource<JetStreamStateSnapshot<number>>()
+  it.each([
+    [
+      'subject bufferSize',
+      (service: NatsailService) =>
+        service.subscribe({ subject: 'events.invalid', decode: () => 0 }, { bufferSize: 0 }),
+      'bufferSize',
+    ],
+    [
+      'session bufferSize',
+      (service: NatsailService) =>
+        service.sessionSnapshots(invalidOptionsDefinition, { bufferSize: -1 }),
+      'bufferSize',
+    ],
+    [
+      'negative liveBatchWithin',
+      (service: NatsailService) =>
+        service.jetStreamStates(invalidOptionsDefinition, { liveBatchWithin: -1 }),
+      'liveBatchWithin',
+    ],
+    [
+      'NaN liveBatchWithin',
+      (service: NatsailService) =>
+        service.jetStreamStates(invalidOptionsDefinition, { liveBatchWithin: Number.NaN }),
+      'liveBatchWithin',
+    ],
+  ] as const)('defers invalid %s to a defect when the Stream runs', async (_name, create, message) => {
     const service = makeNatsail({ runtime: runtimeStub(), sessions: createSessionRegistry() })
-    const definition = defineSession({
-      key: 'conversation:effect-jetstream-invalid-window',
-      contract: 'conversation:v1',
-      source: controlled.source,
+    let stream!: Stream.Stream<unknown, unknown>
+
+    expect(() => {
+      stream = create(service)
+    }).not.toThrow()
+    const exit = await Effect.runPromiseExit(Stream.runDrain(stream))
+
+    if (!Exit.isFailure(exit)) throw new Error('Expected the invalid Stream to fail')
+    expect(Cause.hasDies(exit.cause)).toBe(true)
+    expect(Cause.pretty(exit.cause)).toContain(message)
+  })
+
+  it('fails a session Stream with the typed acquire error when the registry is closed', async () => {
+    const sessions = createSessionRegistry()
+    await sessions.close()
+    const service = makeNatsail({ runtime: runtimeStub(), sessions })
+
+    const error = await Effect.runPromise(
+      service.sessionValues(invalidOptionsDefinition).pipe(Stream.runCollect, Effect.flip)
+    )
+
+    expect(error).toBeInstanceOf(NatsailSessionError)
+    expect(error).toMatchObject({ key: invalidOptionsDefinition.key, stage: 'acquire' })
+  })
+
+  it('dies instead of hanging when stream setup throws a defect', async () => {
+    const service = makeNatsail({ runtime: runtimeStub(), sessions: createSessionRegistry() })
+    const stream = service.subscribe({
+      subject: 'events.defect',
+      decode: () => 0,
+      signal: 'not a signal' as never,
     })
 
-    expect(() => service.jetStreamStates(definition, { liveBatchWithin: -1 })).toThrow(
-      'liveBatchWithin'
-    )
-    expect(() => service.jetStreamStates(definition, { liveBatchWithin: Number.NaN })).toThrow(
-      'liveBatchWithin'
-    )
+    const exit = await Effect.runPromiseExit(Stream.runDrain(stream))
+
+    if (!Exit.isFailure(exit)) throw new Error('Expected the Stream to fail')
+    expect(Cause.hasDies(exit.cause)).toBe(true)
   })
 
   it('fails a value Stream with a source-tagged session error', async () => {
@@ -681,22 +797,16 @@ describe('Effect adapter', () => {
     await vi.waitFor(() => expect(events.activeIterators()).toBe(0))
   })
 
-  it('scopes shutdown in registry-then-runtime order and still attempts both closes', async () => {
-    const order: string[] = []
+  it('scopes shutdown over registry and runtime and still attempts both closes', async () => {
     const registryFailure = new Error('registry close failed')
     const sessions = {
       events: emptyEvents(),
       close: vi.fn(async () => {
-        order.push('sessions')
         throw registryFailure
       }),
     } as unknown as SessionRegistry
-    const runtime = runtimeStub({
-      close: vi.fn(async () => {
-        order.push('runtime')
-      }),
-    })
-    const layer = makeNatsailScopedLayer(Effect.succeed({ runtime, sessions }))
+    const runtime = runtimeStub()
+    const layer = Natsail.layerScoped(Effect.succeed({ runtime, sessions }))
 
     const exit = await Effect.runPromiseExit(
       Effect.gen(function* () {
@@ -706,7 +816,76 @@ describe('Effect adapter', () => {
     )
 
     expect(exit._tag).toBe('Failure')
-    expect(order).toEqual(['sessions', 'runtime'])
+    expect(sessions.close).toHaveBeenCalledOnce()
+    expect(runtime.close).toHaveBeenCalledOnce()
+  })
+
+  it('traces publish and request with OpenTelemetry messaging attributes', async () => {
+    const spans: Tracer.NativeSpan[] = []
+    const tracer = Tracer.make({
+      span(options) {
+        const span = new Tracer.NativeSpan(options)
+        spans.push(span)
+        return span
+      },
+    })
+    const service = makeNatsail({
+      runtime: runtimeStub({ request: vi.fn(async () => 'pong' as never) }),
+      sessions: createSessionRegistry(),
+    })
+
+    await Effect.runPromise(
+      Effect.all([
+        service.publish('events.audit'),
+        service.request({ subject: 'rpc.ping', decode: () => 'pong' }),
+      ]).pipe(Effect.provideService(Tracer.Tracer, tracer))
+    )
+
+    expect(
+      spans.map((span) => ({
+        name: span.name,
+        kind: span.kind,
+        attributes: Object.fromEntries(span.attributes),
+      }))
+    ).toEqual([
+      {
+        name: 'Natsail.publish',
+        kind: 'producer',
+        attributes: {
+          'messaging.system': 'nats',
+          'messaging.destination.name': 'events.audit',
+          'messaging.operation.type': 'send',
+          'messaging.operation.name': 'publish',
+        },
+      },
+      {
+        name: 'Natsail.request',
+        kind: 'client',
+        attributes: {
+          'messaging.system': 'nats',
+          'messaging.destination.name': 'rpc.ping',
+          'messaging.operation.type': 'send',
+          'messaging.operation.name': 'send',
+        },
+      },
+    ])
+  })
+})
+
+describe('natsSchemaCodec', () => {
+  const codec = natsSchemaCodec(Schema.Struct({ id: Schema.BigInt, at: Schema.Date }))
+
+  it('round-trips transformed values over a JSON wire format', () => {
+    const value = { id: 7n, at: new Date('2026-10-02T10:00:00.000Z') }
+
+    const bytes = codec.encode(value)
+
+    expect(new TextDecoder().decode(bytes)).toBe('{"id":"7","at":"2026-10-02T10:00:00.000Z"}')
+    expect(codec.decode(bytes)).toEqual(value)
+  })
+
+  it('throws on a payload that violates the schema', () => {
+    expect(() => codec.decode(new TextEncoder().encode('{"id":"seven","at":"x"}'))).toThrow()
   })
 })
 

@@ -1,5 +1,8 @@
-import { Effect, Fiber, Stream } from 'effect'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { it } from '@effect/vitest'
+import { Cause, Effect, Exit, Fiber, Option, Stream, Tracer } from 'effect'
+import { TestClock } from 'effect/testing'
+import { headers as natsHeaders, type MsgHdrs } from '@nats-io/nats-core'
+import { beforeEach, describe, expect, vi } from 'vitest'
 
 import type { NatsRuntime, NatsRuntimeEvent, SubscriptionLease } from '@natsail/core'
 import {
@@ -7,6 +10,7 @@ import {
   materializeNatsJetStreamEvents,
   NatsailJetStreamError,
   type NatsailJetStreamEvent,
+  type NatsailService,
 } from '@natsail/effect'
 import type {
   JetStreamCatchUp,
@@ -283,94 +287,166 @@ describe('Effect JetStream adapter', () => {
     expect(controlled.close).toHaveBeenCalledOnce()
   })
 
-  it('materializes replay atomically and microbatches live state', async () => {
+  it('rejects a delivery that never reached the consumer so its checkpoint cannot advance', async () => {
     const controlled = controlledJetStreamSource<number>()
     const service = makeNatsail({
       runtime: runtimeStub(),
       sessions: createSessionRegistry(),
     })
-    const reduced: number[][] = []
+    const consumerGate = deferred<void>()
+    const consumerStarted = deferred<void>()
     const fiber = Effect.runFork(
-      service
-        .materializeJetStream(
-          sourceOptions,
-          {
-            initial: () => 0,
-            reduceBatch: (state, deliveries) =>
-              Effect.sync(() => {
-                reduced.push(deliveries.map((event) => event.value))
-                return state + deliveries.reduce((sum, event) => sum + event.value, 0)
-              }),
-          },
-          { batchSize: 10, batchWithin: '20 millis' }
+      service.jetStreamDeliveries(sourceOptions, { bufferSize: 1 }).pipe(
+        Stream.take(1),
+        Stream.runForEach(() =>
+          Effect.promise(() => {
+            consumerStarted.resolve()
+            return consumerGate.promise
+          })
         )
-        .pipe(Stream.take(3), Stream.runCollect)
+      )
     )
 
     await vi.waitFor(() => expect(controlled.source).toHaveBeenCalledOnce())
-    await controlled.deliver(delivery(1, 1, 'initial'))
-    await controlled.deliver(delivery(2, 2, 'initial'))
-    controlled.catchUp({ cursor: { stream: 'ORDERS', sequence: 2 }, delivered: 2 })
-    await controlled.deliver(delivery(4, 3, 'live'))
+    void controlled.deliver(delivery(1, 1, 'initial'))
+    await consumerStarted.promise
+    void controlled.deliver(delivery(2, 2, 'initial'))
+    const unseen = controlled.deliver(delivery(3, 3, 'initial'))
+    await new Promise((resolve) => setTimeout(resolve, 10))
 
-    expect(await Effect.runPromise(Fiber.join(fiber))).toEqual([
-      { phase: 'replaying', data: 0, replay: { delivered: 0 } },
-      {
-        phase: 'live',
-        data: 3,
-        cursor: { stream: 'ORDERS', sequence: 2 },
-        replay: { delivered: 2 },
-      },
-      {
-        phase: 'live',
-        data: 7,
-        cursor: { stream: 'ORDERS', sequence: 3 },
-        replay: { delivered: 2 },
-      },
-    ])
-    expect(reduced).toEqual([[1, 2], [4]])
-    expect(controlled.close).toHaveBeenCalledOnce()
+    consumerGate.resolve()
+    await Effect.runPromise(Fiber.join(fiber))
+
+    await expect(unseen).rejects.toThrow('closed before accepting')
   })
 
-  it('flushes caught-up state without waiting for the live batch timer', async () => {
-    const controlled = controlledJetStreamSource<number>()
-    const service = makeNatsail({
-      runtime: runtimeStub(),
-      sessions: createSessionRegistry(),
+  it.each([
+    [
+      'bufferSize',
+      (service: NatsailService) => service.jetStreamEvents(sourceOptions, { bufferSize: 0 }),
+    ],
+    [
+      'resume',
+      (service: NatsailService) =>
+        service.materializeJetStream(
+          { ...sourceOptions, resume: {} } as never,
+          { initial: () => 0, reduceBatch: (state) => Effect.succeed(state) }
+        ),
+    ],
+  ] as const)('defers an invalid JetStream %s option to a defect when the Stream runs', async (
+    _name,
+    create
+  ) => {
+    const service = makeNatsail({ runtime: runtimeStub(), sessions: createSessionRegistry() })
+    let stream!: Stream.Stream<unknown, unknown>
+
+    expect(() => {
+      stream = create(service)
+    }).not.toThrow()
+    const exit = await Effect.runPromiseExit(Stream.runDrain(stream))
+
+    if (!Exit.isFailure(exit)) throw new Error('Expected the invalid Stream to fail')
+    expect(Cause.hasDies(exit.cause)).toBe(true)
+  })
+
+  it.effect('materializes replay atomically and microbatches live state', () =>
+    Effect.gen(function* () {
+      const controlled = controlledJetStreamSource<number>()
+      const service = makeNatsail({
+        runtime: runtimeStub(),
+        sessions: createSessionRegistry(),
+      })
+      const reduced: number[][] = []
+      const fiber = yield* Effect.forkChild(
+        service
+          .materializeJetStream(
+            sourceOptions,
+            {
+              initial: () => 0,
+              reduceBatch: (state, deliveries) =>
+                Effect.sync(() => {
+                  reduced.push(deliveries.map((event) => event.value))
+                  return state + deliveries.reduce((sum, event) => sum + event.value, 0)
+                }),
+            },
+            { batchSize: 10, batchWithin: '20 millis' }
+          )
+          .pipe(Stream.take(3), Stream.runCollect)
+      )
+
+      yield* Effect.promise(async () => {
+        await vi.waitFor(() => expect(controlled.source).toHaveBeenCalledOnce())
+        await controlled.deliver(delivery(1, 1, 'initial'))
+        await controlled.deliver(delivery(2, 2, 'initial'))
+        controlled.catchUp({ cursor: { stream: 'ORDERS', sequence: 2 }, delivered: 2 })
+        await controlled.deliver(delivery(4, 3, 'live'))
+      })
+      // The live batch only flushes when the test clock passes the window.
+      while (fiber.pollUnsafe() === undefined) {
+        yield* Effect.promise(() => new Promise((resolve) => setImmediate(resolve)))
+        yield* TestClock.adjust('20 millis')
+      }
+
+      expect(yield* Fiber.join(fiber)).toEqual([
+        { phase: 'replaying', data: 0, replay: { delivered: 0 } },
+        {
+          phase: 'live',
+          data: 3,
+          cursor: { stream: 'ORDERS', sequence: 2 },
+          replay: { delivered: 2 },
+        },
+        {
+          phase: 'live',
+          data: 7,
+          cursor: { stream: 'ORDERS', sequence: 3 },
+          replay: { delivered: 2 },
+        },
+      ])
+      expect(reduced).toEqual([[1, 2], [4]])
+      expect(controlled.close).toHaveBeenCalledOnce()
     })
-    const fiber = Effect.runFork(
-      service
-        .materializeJetStream(
-          sourceOptions,
-          {
-            initial: () => 0,
-            reduceBatch: (state, deliveries) =>
-              Effect.succeed(state + deliveries.reduce((sum, event) => sum + event.value, 0)),
-          },
-          { batchPolicy: { maxItems: 256, maxWaitMs: 60_000 } }
-        )
-        .pipe(Stream.take(2), Stream.runCollect)
-    )
+  )
 
-    await vi.waitFor(() => expect(controlled.source).toHaveBeenCalledOnce())
-    await controlled.deliver(delivery(1, 1, 'initial'))
-    controlled.catchUp({ cursor: { stream: 'ORDERS', sequence: 1 }, delivered: 1 })
-    const result = await Promise.race([
-      Effect.runPromise(Fiber.join(fiber)),
-      new Promise<'timer-delayed'>((resolve) => setTimeout(() => resolve('timer-delayed'), 25)),
-    ])
+  it.effect('flushes caught-up state without waiting for the live batch timer', () =>
+    Effect.gen(function* () {
+      const controlled = controlledJetStreamSource<number>()
+      const service = makeNatsail({
+        runtime: runtimeStub(),
+        sessions: createSessionRegistry(),
+      })
+      const fiber = yield* Effect.forkChild(
+        service
+          .materializeJetStream(
+            sourceOptions,
+            {
+              initial: () => 0,
+              reduceBatch: (state, deliveries) =>
+                Effect.succeed(state + deliveries.reduce((sum, event) => sum + event.value, 0)),
+            },
+            { batchPolicy: { maxItems: 256, maxWaitMs: 60_000 } }
+          )
+          .pipe(Stream.take(2), Stream.runCollect)
+      )
 
-    expect(result).toEqual([
-      { phase: 'replaying', data: 0, replay: { delivered: 0 } },
-      {
-        phase: 'live',
-        data: 1,
-        cursor: { stream: 'ORDERS', sequence: 1 },
-        replay: { delivered: 1 },
-      },
-    ])
-    expect(controlled.close).toHaveBeenCalledOnce()
-  })
+      yield* Effect.promise(async () => {
+        await vi.waitFor(() => expect(controlled.source).toHaveBeenCalledOnce())
+        await controlled.deliver(delivery(1, 1, 'initial'))
+        controlled.catchUp({ cursor: { stream: 'ORDERS', sequence: 1 }, delivered: 1 })
+      })
+
+      // The test clock never advances, so a flush that waited for the timer would hang here.
+      expect(yield* Fiber.join(fiber)).toEqual([
+        { phase: 'replaying', data: 0, replay: { delivered: 0 } },
+        {
+          phase: 'live',
+          data: 1,
+          cursor: { stream: 'ORDERS', sequence: 1 },
+          replay: { delivered: 1 },
+        },
+      ])
+      expect(controlled.close).toHaveBeenCalledOnce()
+    })
+  )
 
   it('partitions materializer work at the shared byte bound', async () => {
     const controlled = controlledJetStreamSource<number>()
@@ -555,5 +631,133 @@ describe('Effect JetStream adapter', () => {
 
     expect(error).toBeInstanceOf(NatsailJetStreamError)
     expect(error).toMatchObject({ stream: 'ORDERS', stage: 'processor', cause })
+  })
+
+  it('interrupts a processor without waiting for the in-flight handler to finish', async () => {
+    let processorHandler!: JetStreamProcessorHandler<number>
+    const inFlight = new Set<Promise<unknown>>()
+    const closed = deferred<void>()
+    const close = vi.fn(async () => {
+      await Promise.allSettled(inFlight)
+      closed.resolve()
+    })
+    jetStreamMocks.processJetStream.mockImplementation(
+      (
+        _runtime: NatsRuntime,
+        _options: JetStreamProcessorOptions<number>,
+        handler: JetStreamProcessorHandler<number>
+      ) => {
+        processorHandler = handler
+        return { ready: Promise.resolve(), closed: closed.promise, close } satisfies SubscriptionLease
+      }
+    )
+    const service = makeNatsail({ runtime: runtimeStub(), sessions: createSessionRegistry() })
+    const processor = Effect.runFork(
+      service.runJetStreamProcessor(
+        {
+          stream: 'ORDERS',
+          consumer: { mode: 'ensure', name: 'effect-orders' },
+          filter: 'jobs.orders',
+          start: 'all',
+          decode: () => 0,
+        },
+        () => Effect.never
+      )
+    )
+
+    await vi.waitFor(() => expect(jetStreamMocks.processJetStream).toHaveBeenCalledOnce())
+    const handling = Promise.resolve(
+      processorHandler(processingDelivery(42, 1), { signal: new AbortController().signal })
+    ).catch(() => undefined)
+    inFlight.add(handling)
+
+    await Effect.runPromise(Fiber.interrupt(processor))
+
+    expect(close).toHaveBeenCalledOnce()
+  })
+
+  describe('processor delivery spans', () => {
+    async function runDeliveryUnderParentSpan(headers?: MsgHdrs) {
+      let processorHandler!: JetStreamProcessorHandler<number>
+      const closed = deferred<void>()
+      jetStreamMocks.processJetStream.mockImplementation(
+        (
+          _runtime: NatsRuntime,
+          _options: JetStreamProcessorOptions<number>,
+          handler: JetStreamProcessorHandler<number>
+        ) => {
+          processorHandler = handler
+          return {
+            ready: Promise.resolve(),
+            closed: closed.promise,
+            close: async () => closed.resolve(),
+          } satisfies SubscriptionLease
+        }
+      )
+      const spans: Tracer.NativeSpan[] = []
+      const tracer = Tracer.make({
+        span(options) {
+          const span = new Tracer.NativeSpan(options)
+          spans.push(span)
+          return span
+        },
+      })
+      const service = makeNatsail({ runtime: runtimeStub(), sessions: createSessionRegistry() })
+      const processor = Effect.runFork(
+        service
+          .runJetStreamProcessor(
+            {
+              stream: 'ORDERS',
+              consumer: { mode: 'ensure', name: 'effect-orders' },
+              filter: 'jobs.orders',
+              start: 'all',
+              decode: () => 0,
+            },
+            () => Effect.void
+          )
+          .pipe(Effect.withSpan('processor-lifetime'), Effect.provideService(Tracer.Tracer, tracer))
+      )
+
+      await vi.waitFor(() => expect(jetStreamMocks.processJetStream).toHaveBeenCalledOnce())
+      await processorHandler(
+        { ...processingDelivery(42, 7), ...(headers ? { headers } : {}) },
+        { signal: new AbortController().signal }
+      )
+      closed.resolve()
+      await Effect.runPromise(Fiber.join(processor))
+
+      return spans.find((candidate) => candidate.name === 'process ORDERS')
+    }
+
+    it('starts a root consumer span with messaging attributes and no link', async () => {
+      const span = await runDeliveryUnderParentSpan()
+
+      expect(span?.kind).toBe('consumer')
+      expect(Option.isNone(span!.parent)).toBe(true)
+      expect(span?.links).toEqual([])
+      expect(Object.fromEntries(span?.attributes ?? [])).toMatchObject({
+        'messaging.system': 'nats',
+        'messaging.destination.name': 'jobs.orders',
+        'messaging.operation.type': 'process',
+        'messaging.operation.name': 'process',
+        'messaging.consumer.group.name': 'effect-orders',
+        'natsail.jetstream.sequence': 7,
+        'natsail.delivery.attempt': 1,
+      })
+    })
+
+    it('links the span to the producer trace carried in the traceparent header', async () => {
+      const incoming = natsHeaders()
+      incoming.set('traceparent', '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01')
+
+      const span = await runDeliveryUnderParentSpan(incoming)
+
+      expect(Option.isNone(span!.parent)).toBe(true)
+      expect(span?.links).toHaveLength(1)
+      expect(span?.links[0]?.span).toMatchObject({
+        traceId: '4bf92f3577b34da6a3ce929d0e0e4736',
+        spanId: '00f067aa0ba902b7',
+      })
+    })
   })
 })

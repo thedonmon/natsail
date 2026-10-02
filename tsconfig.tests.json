@@ -13,6 +13,7 @@
       "@natsail/checkpoints": ["./packages/checkpoints/src/index.ts"],
       "@natsail/core": ["./packages/core/src/index.ts"],
       "@natsail/effect": ["./packages/effect/src/index.ts"],
+      "@natsail/effect/schema": ["./packages/effect/src/schema.ts"],
       "@natsail/jetstream": ["./packages/jetstream/src/index.ts"],
       "@natsail/opentelemetry": ["./packages/opentelemetry/src/index.ts"],
       "@natsail/react": ["./packages/react/src/index.ts"],

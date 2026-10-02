@@ -1,6 +1,8 @@
+import { Effect, ManagedRuntime } from 'effect'
+
 import { wsconnect } from '@nats-io/nats-core'
 import { createNatsRuntime, type NatsailTelemetryEvent } from '@natsail/core'
-import { makeNatsail } from '@natsail/effect'
+import { Natsail } from '@natsail/effect'
 import { createSessionRegistry } from '@natsail/session'
 
 interface PerformanceTelemetrySnapshot {
@@ -64,11 +66,7 @@ export const runtime = createNatsRuntime({
 })
 
 export const sessions = createSessionRegistry({ idleCloseMs: 0, telemetry })
-export const natsail = makeNatsail({ runtime, sessions })
+const managed = ManagedRuntime.make(Natsail.layerScoped(Effect.sync(() => ({ runtime, sessions }))))
+export const natsail = await managed.runPromise(Natsail)
 
-let closePromise: Promise<void> | undefined
-
-export const closeExampleRuntime = (): Promise<void> => {
-  closePromise ??= Promise.allSettled([sessions.close(), runtime.close()]).then(() => undefined)
-  return closePromise
-}
+export const closeExampleRuntime = (): Promise<void> => managed.dispose()

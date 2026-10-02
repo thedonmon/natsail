@@ -2,8 +2,9 @@ import { jetstream, jetstreamManager, StorageType } from '@nats-io/jetstream'
 import { Effect, Fiber, Stream } from 'effect'
 import { describe, expect, it } from 'vitest'
 
+import { createMemoryCheckpointStore } from '@natsail/checkpoints'
 import { createNatsRuntime, natsCodecs, type NatsRuntime } from '@natsail/core'
-import { makeNatsailScopedLayer, Natsail } from '@natsail/effect'
+import { Natsail } from '@natsail/effect'
 import {
   createCoreSessionSource,
   createSessionRegistry,
@@ -17,7 +18,7 @@ describe('Effect adapter with NATS', () => {
   it('streams wildcard Core subjects directly and scopes the subscription', async () => {
     let runtime!: NatsRuntime
     const subjectRoot = uniqueSubject('effect-direct')
-    const layer = makeNatsailScopedLayer(
+    const layer = Natsail.layerScoped(
       Effect.sync(() => {
         runtime = createNatsRuntime({ connect: connectToTestNats })
         return { runtime, sessions: createSessionRegistry() }
@@ -51,11 +52,99 @@ describe('Effect adapter with NATS', () => {
     expect(runtime.inspect().connection.state).toBe('closed')
   })
 
+  it('closes a backpressured Core subject Stream when the consumer stops early', async () => {
+    let runtime!: NatsRuntime
+    const subject = uniqueSubject('effect-early-stop')
+    const layer = Natsail.layerScoped(
+      Effect.sync(() => {
+        runtime = createNatsRuntime({ connect: connectToTestNats })
+        return { runtime, sessions: createSessionRegistry() }
+      })
+    )
+
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const nats = yield* Natsail
+        const fiber = yield* Effect.forkChild(
+          nats.subscribe({ subject, codec: natsCodecs.text }, { bufferSize: 1 }).pipe(
+            Stream.mapEffect((value) => Effect.sleep('50 millis').pipe(Effect.as(value))),
+            Stream.take(1),
+            Stream.runCollect
+          )
+        )
+
+        yield* Effect.promise(() => expect.poll(() => runtime.inspect().activeResources).toBe(1))
+        for (let index = 0; index < 10; index += 1) {
+          yield* nats.publish(subject, natsCodecs.text.encode(`message-${index}`))
+        }
+
+        return yield* Fiber.join(fiber)
+      }).pipe(Effect.provide(layer))
+    )
+
+    expect(result).toEqual(['message-0'])
+    expect(runtime.inspect().connection.state).toBe('closed')
+  })
+
+  it('stops a backpressured JetStream Stream early without checkpointing unseen events', async () => {
+    const adminConnection = await connectToTestNats()
+    const manager = await jetstreamManager(adminConnection)
+    const client = jetstream(adminConnection)
+    const stream = `EFFECT_${crypto.randomUUID().replaceAll('-', '_').toUpperCase()}`
+    const subject = uniqueSubject('effect-jetstream-early-stop')
+    const checkpoints = createMemoryCheckpointStore()
+    let runtime!: NatsRuntime
+
+    try {
+      await manager.streams.add({ name: stream, subjects: [subject], storage: StorageType.Memory })
+      for (let index = 0; index < 8; index += 1) await client.publish(subject, `${index}`)
+
+      const layer = Natsail.layerScoped(
+        Effect.sync(() => {
+          runtime = createNatsRuntime({ connect: connectToTestNats })
+          return { runtime, sessions: createSessionRegistry() }
+        })
+      )
+
+      const values = await Effect.runPromise(
+        Effect.gen(function* () {
+          const nats = yield* Natsail
+          return yield* nats
+            .jetStreamDeliveries(
+              {
+                stream,
+                filter: subject,
+                start: 'all',
+                codec: natsCodecs.text,
+                resume: { key: 'effect-early-stop', store: checkpoints },
+              },
+              { bufferSize: 1 }
+            )
+            .pipe(
+              Stream.mapEffect((delivery) =>
+                Effect.sleep('50 millis').pipe(Effect.as(delivery.value))
+              ),
+              Stream.take(1),
+              Stream.runCollect
+            )
+        }).pipe(Effect.provide(layer))
+      )
+
+      expect(values).toEqual(['0'])
+      expect(runtime.inspect().connection.state).toBe('closed')
+      // One event consumed plus one buffered: nothing beyond what the Stream admitted.
+      expect((await checkpoints.load('effect-early-stop'))?.sequence).toBeLessThanOrEqual(2)
+    } finally {
+      await manager.streams.delete(stream).catch(() => undefined)
+      await adminConnection.drain()
+    }
+  })
+
   it('shares one scoped subscription and releases every resource after the program', async () => {
     let runtime!: NatsRuntime
     let sessions!: SessionRegistry
     const subject = uniqueSubject('effect')
-    const layer = makeNatsailScopedLayer(
+    const layer = Natsail.layerScoped(
       Effect.sync(() => {
         runtime = createNatsRuntime({ connect: connectToTestNats })
         sessions = createSessionRegistry()
@@ -119,7 +208,7 @@ describe('Effect adapter with NATS', () => {
       await client.publish(eventSubject, '1')
       await client.publish(eventSubject, '2')
 
-      const layer = makeNatsailScopedLayer(
+      const layer = Natsail.layerScoped(
         Effect.sync(() => {
           runtime = createNatsRuntime({ connect: connectToTestNats })
           return { runtime, sessions: createSessionRegistry() }

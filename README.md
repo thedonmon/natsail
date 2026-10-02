@@ -258,9 +258,9 @@ Effect can observe the same reducing definition through a scoped Stream. Like th
 
 ```ts
 import { Effect, Stream } from 'effect'
-import { jetStreamStates, makeNatsailScopedLayer } from '@natsail/effect'
+import { jetStreamStates, Natsail } from '@natsail/effect'
 
-const NatsLive = makeNatsailScopedLayer(Effect.sync(() => ({ runtime, sessions })))
+const NatsLive = Natsail.layerScoped(Effect.sync(() => ({ runtime, sessions })))
 
 const program = jetStreamStates(conversationState, {
   liveBatchWithin: '16 millis',
