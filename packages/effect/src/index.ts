@@ -13,7 +13,8 @@ import {
   Sink,
   Stream,
 } from 'effect'
-import type { Pull, Scope } from 'effect'
+import { Headers, HttpTraceContext } from 'effect/http'
+import type { Pull, Scope, Tracer } from 'effect'
 
 import type {
   CoreRequestOptions,
@@ -267,12 +268,18 @@ export interface NatsailService {
 export class Natsail extends Context.Service<Natsail, NatsailService>()('@natsail/effect/Natsail') {
   /** Supplies an existing resource without taking ownership of it. */
   static readonly layer = (resource: NatsailResource): Layer.Layer<Natsail> =>
-    makeNatsailLayer(resource)
+    Layer.succeed(Natsail, makeNatsail(resource))
 
-  /** Acquires a resource and closes it when the Layer scope exits. */
+  /** Acquires a resource and closes the registry and runtime together when the Layer scope exits. */
   static readonly layerScoped = <E, R>(
     acquire: Effect.Effect<NatsailResource, E, R>
-  ): Layer.Layer<Natsail, E, R> => makeNatsailScopedLayer(acquire)
+  ): Layer.Layer<Natsail, E, R> =>
+    Layer.effect(
+      Natsail,
+      Effect.acquireRelease(acquire, (resource) =>
+        Effect.promise(() => closeResource(resource))
+      ).pipe(Effect.map(makeNatsail))
+    )
 }
 
 type PushOptions =
@@ -341,28 +348,12 @@ function sessionError(
 
 function tryRuntimePromise<A>(
   operation: NatsailOperation,
-  run: (signal: AbortSignal) => PromiseLike<A>,
-  messaging?: { readonly subject: string; readonly type: 'send' }
+  run: (signal: AbortSignal) => PromiseLike<A>
 ): Effect.Effect<A, NatsailOperationError> {
   return Effect.tryPromise({
     try: run,
     catch: (cause) => operationError(operation, cause),
-  }).pipe(
-    Effect.withSpan(
-      `Natsail.${operation}`,
-      messaging === undefined
-        ? {}
-        : {
-            kind: 'producer',
-            attributes: {
-              'messaging.system': 'nats',
-              'messaging.destination.name': messaging.subject,
-              'messaging.operation.type': messaging.type,
-            },
-          },
-      { captureStackTrace: false }
-    )
-  )
+  })
 }
 
 function resolveStreamOptions(options: NatsailSessionStreamOptions = {}): ResolvedStreamOptions {
@@ -460,7 +451,7 @@ function reportBufferOverflow(runtime: NatsRuntime, source: 'effect' | 'session'
   })
 }
 
-/** Stream.callback never surfaces a failed registration, so route it into the queue. */
+/** Stream.callback never surfaces a failed registration, so route failures and defects into the queue. */
 function callbackStream<A, E>(
   register: (queue: Queue.Queue<A, E | Cause.Done>) => Effect.Effect<unknown, E, Scope.Scope>,
   options?: {
@@ -469,35 +460,36 @@ function callbackStream<A, E>(
   }
 ): Stream.Stream<A, E> {
   return Stream.callback<A, E>(
-    (queue) => register(queue).pipe(Effect.catch((error) => Queue.fail(queue, error))),
+    (queue) =>
+      register(queue).pipe(
+        Effect.catchCause((cause) =>
+          Cause.hasInterruptsOnly(cause) ? Effect.void : Queue.failCause(queue, cause)
+        )
+      ),
     options
   )
 }
 
-/** Fast path first; park only when full under `suspend`, and wake on abort or shutdown. */
+/** Fast path first; the queue strategy decides whether to park, and abort or shutdown wakes it. */
 async function offerToQueue<A, E>(
   queue: Queue.Queue<A, E | Cause.Done>,
   value: A,
-  suspend: boolean,
   signal: AbortSignal
 ): Promise<boolean> {
   if (Queue.offerUnsafe(queue, value)) return true
-  if (!suspend) return false
   return Effect.runPromise(Queue.offer(queue, value), { signal }).catch(() => false)
 }
 
 /** Stops the producer before closing the lease so an in-flight handler cannot block close(). */
-function releaseLease<A, E>(
+const releaseLease = Effect.fnUntraced(function* <A, E>(
   stop: AbortController,
   lease: { close(): Promise<void> },
   queue?: Queue.Enqueue<A, E>
-): Effect.Effect<void> {
-  return Effect.gen(function* () {
-    stop.abort()
-    if (queue !== undefined) yield* Queue.shutdown(queue)
-    yield* Effect.promise(() => lease.close().catch(() => undefined))
-  })
-}
+) {
+  stop.abort()
+  if (queue !== undefined) yield* Queue.shutdown(queue)
+  yield* Effect.promise(() => lease.close().catch(() => undefined))
+})
 
 function createSubjectStream<T>(
   runtime: NatsRuntime,
@@ -519,12 +511,7 @@ function createSubjectStream<T>(
             Effect.try({
               try: () =>
                 runtime.subscribe({ ...options, signal }, async (value) => {
-                  const accepted = await offerToQueue(
-                    queue,
-                    value,
-                    resolved.callbackStrategy === 'suspend',
-                    signal
-                  )
+                  const accepted = await offerToQueue(queue, value, signal)
                   if (
                     accepted ||
                     resolved.overflowStrategy === 'suspend' ||
@@ -595,12 +582,7 @@ function createJetStreamEventStream<T>(
           void catchUpMarkerEnqueued.catch(() => undefined)
           // Throw on every unaccepted event so the resume checkpoint never passes an unseen one.
           const offerEvent = async (event: NatsailJetStreamEvent<T>): Promise<void> => {
-            const accepted = await offerToQueue(
-              queue,
-              event,
-              resolved.callbackStrategy === 'suspend',
-              signal
-            )
+            const accepted = await offerToQueue(queue, event, signal)
             if (accepted) return
 
             if (resolved.overflowStrategy === 'error' && queue.state._tag === 'Open') {
@@ -849,6 +831,16 @@ function createJetStreamMaterializedStream<Value, State, E, R>(
   })
 }
 
+/** Links a delivery span to the producer trace in a W3C `traceparent` header, when present. */
+function producerLinks(
+  headers: { get(key: string): string } | undefined
+): Array<{ readonly span: Tracer.AnySpan; readonly attributes: Record<string, never> }> {
+  const traceparent = headers?.get('traceparent')
+  if (!traceparent) return []
+  const producer = HttpTraceContext.w3c(Headers.fromInput({ traceparent }))
+  return Option.isSome(producer) ? [{ span: producer.value, attributes: {} }] : []
+}
+
 function runJetStreamProcessorEffect<T, E, R>(
   runtime: NatsRuntime,
   options: JetStreamProcessorOptions<T>,
@@ -869,13 +861,17 @@ function runJetStreamProcessorEffect<T, E, R>(
               const exit = await Effect.runPromiseExitWith(context)(
                 handler(delivery).pipe(
                   Effect.withSpan(
-                    `nats.process ${delivery.subject}`,
+                    `process ${delivery.cursor.stream}`,
                     {
                       kind: 'consumer',
+                      root: true,
+                      links: producerLinks(delivery.headers),
                       attributes: {
                         'messaging.system': 'nats',
                         'messaging.destination.name': delivery.subject,
                         'messaging.operation.type': 'process',
+                        'messaging.operation.name': 'process',
+                        'messaging.consumer.group.name': options.consumer.name,
                         'natsail.jetstream.stream': delivery.cursor.stream,
                         'natsail.jetstream.sequence': delivery.cursor.sequence,
                         'natsail.delivery.attempt': delivery.deliveryAttempt,
@@ -1170,23 +1166,44 @@ export function makeNatsail(resource: NatsailResource): NatsailService {
     sessionEvents: Stream.fromAsyncIterable(sessions.events, (cause) =>
       operationError('session-events', cause)
     ),
-    connection: () => tryRuntimePromise('connection', () => runtime.connection()),
-    reconnect: (options) => tryRuntimePromise('reconnect', () => runtime.reconnect(options)),
+    connection: Effect.fn('Natsail.connection')(function* () {
+      return yield* tryRuntimePromise('connection', () => runtime.connection())
+    }),
+    reconnect: Effect.fn('Natsail.reconnect')(function* (options) {
+      return yield* tryRuntimePromise('reconnect', () => runtime.reconnect(options))
+    }),
     publish: (subject, data, options) =>
-      tryRuntimePromise('publish', () => runtime.publish(subject, data, options), {
-        subject,
-        type: 'send',
-      }),
-    request: <T>(options: CoreRequestOptions<T>) =>
-      tryRuntimePromise(
-        'request',
-        (effectSignal) =>
-          runtime.request({
-            ...options,
-            signal: options.signal ? AbortSignal.any([options.signal, effectSignal]) : effectSignal,
-          }),
-        { subject: options.subject, type: 'send' }
+      tryRuntimePromise('publish', () => runtime.publish(subject, data, options)).pipe(
+        Effect.withSpan(
+          'Natsail.publish',
+          {
+            kind: 'producer',
+            attributes: {
+              'messaging.system': 'nats',
+              'messaging.destination.name': subject,
+              'messaging.operation.type': 'send',
+              'messaging.operation.name': 'publish',
+            },
+          },
+          { captureStackTrace: false }
+        )
       ),
+    request: Effect.fn('Natsail.request', { kind: 'client' })(function* <T>(
+      options: CoreRequestOptions<T>
+    ) {
+      yield* Effect.annotateCurrentSpan({
+        'messaging.system': 'nats',
+        'messaging.destination.name': options.subject,
+        'messaging.operation.type': 'send',
+        'messaging.operation.name': 'send',
+      })
+      return yield* tryRuntimePromise('request', (effectSignal) =>
+        runtime.request({
+          ...options,
+          signal: options.signal ? AbortSignal.any([options.signal, effectSignal]) : effectSignal,
+        })
+      )
+    }),
     subscribe: (options, streamOptions) => createSubjectStream(runtime, options, streamOptions),
     jetStreamEvents: (options, streamOptions) =>
       createJetStreamEventStream(runtime, options, streamOptions),
@@ -1198,7 +1215,9 @@ export function makeNatsail(resource: NatsailResource): NatsailService {
       createJetStreamStateStream(runtime, sessions, definition, options),
     runJetStreamProcessor: (options, handler) =>
       runJetStreamProcessorEffect(runtime, options, handler),
-    restartSession: (key) => tryRuntimePromise('restart-session', () => sessions.restart(key)),
+    restartSession: Effect.fn('Natsail.restartSession')(function* (key) {
+      return yield* tryRuntimePromise('restart-session', () => sessions.restart(key))
+    }),
     sessionSnapshots: (definition, options) =>
       createSessionSnapshotStream(runtime, sessions, definition, options),
     sessionValues: <T>(definition: SessionDefinition<T>, options?: NatsailSessionStreamOptions) =>
@@ -1283,26 +1302,6 @@ export function runJetStreamProcessor<T, E, R>(
   return Natsail.use((service) => service.runJetStreamProcessor(options, handler))
 }
 
-/** Supplies an existing resource without taking ownership of it. */
-export function makeNatsailLayer(resource: NatsailResource): Layer.Layer<Natsail> {
-  return Layer.succeed(Natsail, makeNatsail(resource))
-}
-
 function closeResource(resource: NatsailResource): Promise<void> {
   return resource.close ? resource.close() : closeNatsResources(resource)
-}
-
-/**
- * Acquires one Layer-owned resource and closes it when the Layer scope exits.
- * The default finalizer closes the registry and runtime together.
- */
-export function makeNatsailScopedLayer<E, R>(
-  acquire: Effect.Effect<NatsailResource, E, R>
-): Layer.Layer<Natsail, E, R> {
-  return Layer.effect(
-    Natsail,
-    Effect.acquireRelease(acquire, (resource) =>
-      Effect.promise(() => closeResource(resource))
-    ).pipe(Effect.map(makeNatsail))
-  )
 }

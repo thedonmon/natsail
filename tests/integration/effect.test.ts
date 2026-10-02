@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest'
 
 import { createMemoryCheckpointStore } from '@natsail/checkpoints'
 import { createNatsRuntime, natsCodecs, type NatsRuntime } from '@natsail/core'
-import { makeNatsailScopedLayer, Natsail } from '@natsail/effect'
+import { Natsail } from '@natsail/effect'
 import {
   createCoreSessionSource,
   createSessionRegistry,
@@ -18,7 +18,7 @@ describe('Effect adapter with NATS', () => {
   it('streams wildcard Core subjects directly and scopes the subscription', async () => {
     let runtime!: NatsRuntime
     const subjectRoot = uniqueSubject('effect-direct')
-    const layer = makeNatsailScopedLayer(
+    const layer = Natsail.layerScoped(
       Effect.sync(() => {
         runtime = createNatsRuntime({ connect: connectToTestNats })
         return { runtime, sessions: createSessionRegistry() }
@@ -55,7 +55,7 @@ describe('Effect adapter with NATS', () => {
   it('closes a backpressured Core subject Stream when the consumer stops early', async () => {
     let runtime!: NatsRuntime
     const subject = uniqueSubject('effect-early-stop')
-    const layer = makeNatsailScopedLayer(
+    const layer = Natsail.layerScoped(
       Effect.sync(() => {
         runtime = createNatsRuntime({ connect: connectToTestNats })
         return { runtime, sessions: createSessionRegistry() }
@@ -99,7 +99,7 @@ describe('Effect adapter with NATS', () => {
       await manager.streams.add({ name: stream, subjects: [subject], storage: StorageType.Memory })
       for (let index = 0; index < 8; index += 1) await client.publish(subject, `${index}`)
 
-      const layer = makeNatsailScopedLayer(
+      const layer = Natsail.layerScoped(
         Effect.sync(() => {
           runtime = createNatsRuntime({ connect: connectToTestNats })
           return { runtime, sessions: createSessionRegistry() }
@@ -144,7 +144,7 @@ describe('Effect adapter with NATS', () => {
     let runtime!: NatsRuntime
     let sessions!: SessionRegistry
     const subject = uniqueSubject('effect')
-    const layer = makeNatsailScopedLayer(
+    const layer = Natsail.layerScoped(
       Effect.sync(() => {
         runtime = createNatsRuntime({ connect: connectToTestNats })
         sessions = createSessionRegistry()
@@ -208,7 +208,7 @@ describe('Effect adapter with NATS', () => {
       await client.publish(eventSubject, '1')
       await client.publish(eventSubject, '2')
 
-      const layer = makeNatsailScopedLayer(
+      const layer = Natsail.layerScoped(
         Effect.sync(() => {
           runtime = createNatsRuntime({ connect: connectToTestNats })
           return { runtime, sessions: createSessionRegistry() }

@@ -16,9 +16,9 @@ Use `subscribe()` when every Effect consumer should own one ephemeral Core NATS 
 import { Effect, Stream } from 'effect'
 
 import { natsCodecs } from '@natsail/core'
-import { makeNatsailScopedLayer, subscribe } from '@natsail/effect'
+import { Natsail, subscribe } from '@natsail/effect'
 
-const NatsLive = makeNatsailScopedLayer(
+const NatsLive = Natsail.layerScoped(
   Effect.sync(() => ({
     runtime: createNatsRuntime({ connect: connectToNats }),
     sessions: createSessionRegistry(),
@@ -222,11 +222,15 @@ const request = Effect.gen(function* () {
 }).pipe(Effect.provide(NatsLive))
 ```
 
-An interrupted request aborts the underlying NATS request. `Natsail.layerScoped()` (alias `makeNatsailScopedLayer()`) closes the session registry and runtime together when the Layer scope exits. `Natsail.layer()` (alias `makeNatsailLayer()`) supplies application-owned objects without closing them.
+An interrupted request aborts the underlying NATS request. `Natsail.layerScoped()` closes the session registry and runtime together when the Layer scope exits. `Natsail.layer()` supplies application-owned objects without closing them.
 
-`publish()` and `request()` run in `Natsail.publish` and `Natsail.request` spans, and each processor delivery runs in a `nats.process <subject>` span, all with OpenTelemetry messaging attributes. Interrupting a processor aborts the in-flight handler before the consumer closes.
+`publish()` and `request()` run in `Natsail.publish` and `Natsail.request` spans. Each processor delivery runs in its own root `process <stream>` consumer span, linked to the producer trace when the message carries a W3C `traceparent` header. Spans carry the subject as `messaging.destination.name` and are exported only when a tracer is installed.
 
-`natsSchemaCodec(schema)`, imported from `@natsail/effect/schema` so Schema stays out of the main bundle, returns a JSON `NatsPayloadCodec` backed by an Effect `Schema`, for both `codec` options and publishing. A payload that fails the schema is terminal for the subscription; to skip bad messages, decode `natsCodecs.bytes` inside the Stream instead.
+Interrupting a processor aborts the in-flight handler and closes the consumer. The in-flight message is not acknowledged, so JetStream redelivers it after `ack_wait`; processor handlers must be idempotent.
+
+`natsSchemaCodec(schema)`, imported from `@natsail/effect/schema`, returns a JSON `NatsPayloadCodec` backed by an Effect `Schema`, for both `codec` options and publishing. Schemas with `Schema.Date`, `BigInt` or classes encode through their JSON codec. A payload that fails the schema is terminal for the subscription; to skip bad messages, decode `natsCodecs.bytes` inside the Stream instead.
+
+Decode failures from JetStream surface as `NatsailJetStreamError` (`stage: 'source'` or `'processor'`) or, for shared sessions, `NatsailSessionError` (`stage: 'source'`), with a `JetStreamDecodeError` as the `cause`. Set the processor option `onDecodeFailure` to choose a disposition instead of stopping the processor.
 
 Invalid stream options (for example `bufferSize: 0`) surface as a defect when the Stream runs, the same way through the service and the free functions.
 

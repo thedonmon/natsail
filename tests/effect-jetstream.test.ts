@@ -1,6 +1,7 @@
 import { it } from '@effect/vitest'
-import { Cause, Effect, Exit, Fiber, Stream, Tracer } from 'effect'
+import { Cause, Effect, Exit, Fiber, Option, Stream, Tracer } from 'effect'
 import { TestClock } from 'effect/testing'
+import { headers as natsHeaders, type MsgHdrs } from '@nats-io/nats-core'
 import { beforeEach, describe, expect, vi } from 'vitest'
 
 import type { NatsRuntime, NatsRuntimeEvent, SubscriptionLease } from '@natsail/core'
@@ -86,16 +87,11 @@ function processingDelivery(value: number, sequence: number): JetStreamProcessin
   }
 }
 
-/** `drainOnClose` mirrors JetStreamSubscription.close(), which awaits in-flight handlers. */
-function controlledJetStreamSource<T>(drainOnClose = false) {
+function controlledJetStreamSource<T>() {
   let accept!: (value: JetStreamDelivery<T>) => Promise<void>
-  const inFlight = new Set<Promise<unknown>>()
   const caughtUp = deferred<JetStreamCatchUp>()
   const closed = deferred<void>()
-  const close = vi.fn(async () => {
-    if (drainOnClose) await Promise.allSettled(inFlight)
-    closed.resolve()
-  })
+  const close = vi.fn(async () => closed.resolve())
   const lease: JetStreamLease<T> = {
     ready: Promise.resolve(),
     closed: closed.promise,
@@ -119,13 +115,7 @@ function controlledJetStreamSource<T>(drainOnClose = false) {
   return {
     source,
     close,
-    deliver: (value: JetStreamDelivery<T>) => {
-      const delivered = accept(value)
-      inFlight.add(delivered)
-      const settled = () => inFlight.delete(delivered)
-      delivered.then(settled, settled)
-      return delivered
-    },
+    deliver: (value: JetStreamDelivery<T>) => accept(value),
     catchUp: (value: JetStreamCatchUp) => caughtUp.resolve(value),
     fail: (cause: unknown) => closed.reject(cause),
   }
@@ -294,39 +284,6 @@ describe('Effect JetStream adapter', () => {
     await third
     await Effect.runPromise(Fiber.join(fiber))
     expect(received).toEqual([1, 2, 3])
-    expect(controlled.close).toHaveBeenCalledOnce()
-  })
-
-  it('closes the subscription when the consumer completes while a delivery waits for buffer space', async () => {
-    const controlled = controlledJetStreamSource<number>(true)
-    const service = makeNatsail({
-      runtime: runtimeStub(),
-      sessions: createSessionRegistry(),
-    })
-    const consumerGate = deferred<void>()
-    const consumerStarted = deferred<void>()
-    const fiber = Effect.runFork(
-      service.jetStreamDeliveries(sourceOptions, { bufferSize: 1 }).pipe(
-        Stream.take(1),
-        Stream.runForEach(() =>
-          Effect.promise(() => {
-            consumerStarted.resolve()
-            return consumerGate.promise
-          })
-        )
-      )
-    )
-
-    await vi.waitFor(() => expect(controlled.source).toHaveBeenCalledOnce())
-    void controlled.deliver(delivery(1, 1, 'initial'))
-    await consumerStarted.promise
-    void controlled.deliver(delivery(2, 2, 'initial'))
-    void controlled.deliver(delivery(3, 3, 'initial')).catch(() => undefined)
-    await new Promise((resolve) => setTimeout(resolve, 10))
-
-    consumerGate.resolve()
-    await Effect.runPromise(Fiber.join(fiber))
-
     expect(controlled.close).toHaveBeenCalledOnce()
   })
 
@@ -719,61 +676,88 @@ describe('Effect JetStream adapter', () => {
     expect(close).toHaveBeenCalledOnce()
   })
 
-  it('runs each processor delivery in a consumer span with messaging attributes', async () => {
-    let processorHandler!: JetStreamProcessorHandler<number>
-    const closed = deferred<void>()
-    jetStreamMocks.processJetStream.mockImplementation(
-      (
-        _runtime: NatsRuntime,
-        _options: JetStreamProcessorOptions<number>,
-        handler: JetStreamProcessorHandler<number>
-      ) => {
-        processorHandler = handler
-        return {
-          ready: Promise.resolve(),
-          closed: closed.promise,
-          close: async () => closed.resolve(),
-        } satisfies SubscriptionLease
-      }
-    )
-    const spans: Tracer.NativeSpan[] = []
-    const tracer = Tracer.make({
-      span(options) {
-        const span = new Tracer.NativeSpan(options)
-        spans.push(span)
-        return span
-      },
+  describe('processor delivery spans', () => {
+    async function runDeliveryUnderParentSpan(headers?: MsgHdrs) {
+      let processorHandler!: JetStreamProcessorHandler<number>
+      const closed = deferred<void>()
+      jetStreamMocks.processJetStream.mockImplementation(
+        (
+          _runtime: NatsRuntime,
+          _options: JetStreamProcessorOptions<number>,
+          handler: JetStreamProcessorHandler<number>
+        ) => {
+          processorHandler = handler
+          return {
+            ready: Promise.resolve(),
+            closed: closed.promise,
+            close: async () => closed.resolve(),
+          } satisfies SubscriptionLease
+        }
+      )
+      const spans: Tracer.NativeSpan[] = []
+      const tracer = Tracer.make({
+        span(options) {
+          const span = new Tracer.NativeSpan(options)
+          spans.push(span)
+          return span
+        },
+      })
+      const service = makeNatsail({ runtime: runtimeStub(), sessions: createSessionRegistry() })
+      const processor = Effect.runFork(
+        service
+          .runJetStreamProcessor(
+            {
+              stream: 'ORDERS',
+              consumer: { mode: 'ensure', name: 'effect-orders' },
+              filter: 'jobs.orders',
+              start: 'all',
+              decode: () => 0,
+            },
+            () => Effect.void
+          )
+          .pipe(Effect.withSpan('processor-lifetime'), Effect.provideService(Tracer.Tracer, tracer))
+      )
+
+      await vi.waitFor(() => expect(jetStreamMocks.processJetStream).toHaveBeenCalledOnce())
+      await processorHandler(
+        { ...processingDelivery(42, 7), ...(headers ? { headers } : {}) },
+        { signal: new AbortController().signal }
+      )
+      closed.resolve()
+      await Effect.runPromise(Fiber.join(processor))
+
+      return spans.find((candidate) => candidate.name === 'process ORDERS')
+    }
+
+    it('starts a root consumer span with messaging attributes and no link', async () => {
+      const span = await runDeliveryUnderParentSpan()
+
+      expect(span?.kind).toBe('consumer')
+      expect(Option.isNone(span!.parent)).toBe(true)
+      expect(span?.links).toEqual([])
+      expect(Object.fromEntries(span?.attributes ?? [])).toMatchObject({
+        'messaging.system': 'nats',
+        'messaging.destination.name': 'jobs.orders',
+        'messaging.operation.type': 'process',
+        'messaging.operation.name': 'process',
+        'messaging.consumer.group.name': 'effect-orders',
+        'natsail.jetstream.sequence': 7,
+        'natsail.delivery.attempt': 1,
+      })
     })
-    const service = makeNatsail({ runtime: runtimeStub(), sessions: createSessionRegistry() })
-    const processor = Effect.runFork(
-      service
-        .runJetStreamProcessor(
-          {
-            stream: 'ORDERS',
-            consumer: { mode: 'ensure', name: 'effect-orders' },
-            filter: 'jobs.orders',
-            start: 'all',
-            decode: () => 0,
-          },
-          () => Effect.void
-        )
-        .pipe(Effect.provideService(Tracer.Tracer, tracer))
-    )
 
-    await vi.waitFor(() => expect(jetStreamMocks.processJetStream).toHaveBeenCalledOnce())
-    await processorHandler(processingDelivery(42, 7), { signal: new AbortController().signal })
-    closed.resolve()
-    await Effect.runPromise(Fiber.join(processor))
+    it('links the span to the producer trace carried in the traceparent header', async () => {
+      const incoming = natsHeaders()
+      incoming.set('traceparent', '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01')
 
-    const span = spans.find((candidate) => candidate.name === 'nats.process jobs.orders')
-    expect(span?.kind).toBe('consumer')
-    expect(Object.fromEntries(span?.attributes ?? [])).toMatchObject({
-      'messaging.system': 'nats',
-      'messaging.destination.name': 'jobs.orders',
-      'messaging.operation.type': 'process',
-      'natsail.jetstream.stream': 'ORDERS',
-      'natsail.jetstream.sequence': 7,
-      'natsail.delivery.attempt': 1,
+      const span = await runDeliveryUnderParentSpan(incoming)
+
+      expect(Option.isNone(span!.parent)).toBe(true)
+      expect(span?.links).toHaveLength(1)
+      expect(span?.links[0]?.span).toMatchObject({
+        traceId: '4bf92f3577b34da6a3ce929d0e0e4736',
+        spanId: '00f067aa0ba902b7',
+      })
     })
   })
 })

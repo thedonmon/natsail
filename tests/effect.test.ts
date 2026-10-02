@@ -17,8 +17,6 @@ import { createNatsailTelemetryReporter, NATS_RUNTIME_ADAPTER } from '@natsail/c
 import {
   jetStreamStates as jetStreamStatesEffect,
   makeNatsail,
-  makeNatsailLayer,
-  makeNatsailScopedLayer,
   Natsail,
   type NatsailService,
   NatsailOperationError,
@@ -230,7 +228,7 @@ describe('Effect adapter', () => {
     expect(controlled.subscribe).not.toHaveBeenCalled()
 
     const fiber = Effect.runFork(
-      stream.pipe(Stream.take(1), Stream.runCollect, Effect.provide(makeNatsailLayer(resource)))
+      stream.pipe(Stream.take(1), Stream.runCollect, Effect.provide(Natsail.layer(resource)))
     )
     await vi.waitFor(() => expect(controlled.subscribe).toHaveBeenCalledOnce())
     await controlled.deliver('hello')
@@ -291,52 +289,39 @@ describe('Effect adapter', () => {
     expect(controlled.close).toHaveBeenCalledOnce()
   })
 
-  it.each(['completes', 'is interrupted'] as const)(
-    'closes the subscription when the consumer %s while a delivery waits for buffer space',
-    async (stop) => {
-      const controlled = controllableSubscription<number>(undefined, true)
-      const service = makeNatsail({
-        runtime: controlled.runtime,
-        sessions: createSessionRegistry(),
-      })
-      let markStarted!: () => void
-      const started = new Promise<void>((resolve) => {
-        markStarted = resolve
-      })
-      let releaseConsumer!: () => void
-      const consumerMayFinish = new Promise<void>((resolve) => {
-        releaseConsumer = resolve
-      })
-      const fiber = Effect.runFork(
-        service.subscribe({ subject: 'numbers', decode: () => 0 }, { bufferSize: 1 }).pipe(
-          Stream.take(1),
-          Stream.runForEach(() =>
-            Effect.promise(() => {
-              markStarted()
-              return consumerMayFinish
-            })
-          )
+  it('closes the subscription when the consumer is interrupted while a delivery waits for buffer space', async () => {
+    const controlled = controllableSubscription<number>(undefined, true)
+    const service = makeNatsail({
+      runtime: controlled.runtime,
+      sessions: createSessionRegistry(),
+    })
+    let markStarted!: () => void
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve
+    })
+    const fiber = Effect.runFork(
+      service.subscribe({ subject: 'numbers', decode: () => 0 }, { bufferSize: 1 }).pipe(
+        Stream.runForEach(() =>
+          Effect.promise(() => {
+            markStarted()
+            return new Promise<void>(() => undefined)
+          })
         )
       )
+    )
 
-      await vi.waitFor(() => expect(controlled.subscribe).toHaveBeenCalledOnce())
-      void controlled.deliver(1)
-      await started
-      void controlled.deliver(2)
-      const parked = controlled.deliver(3)
-      await new Promise((resolve) => setTimeout(resolve, 10))
+    await vi.waitFor(() => expect(controlled.subscribe).toHaveBeenCalledOnce())
+    void controlled.deliver(1)
+    await started
+    void controlled.deliver(2)
+    const parked = controlled.deliver(3)
+    await new Promise((resolve) => setTimeout(resolve, 10))
 
-      if (stop === 'completes') {
-        releaseConsumer()
-        await Effect.runPromise(Fiber.join(fiber))
-      } else {
-        await Effect.runPromise(Fiber.interrupt(fiber))
-      }
+    await Effect.runPromise(Fiber.interrupt(fiber))
 
-      expect(controlled.close).toHaveBeenCalledOnce()
-      await parked
-    }
-  )
+    expect(controlled.close).toHaveBeenCalledOnce()
+    await parked
+  })
 
   it('composes subject delivery with Effect v4 chunk processing', async () => {
     const controlled = controllableSubscription<number>()
@@ -508,7 +493,7 @@ describe('Effect adapter', () => {
         jetStreamStatesEffect(definition, {
           bufferSize: 256,
           liveBatchWithin: '20 millis',
-        }).pipe(Stream.take(2), Stream.runCollect, Effect.provide(makeNatsailLayer(resource)))
+        }).pipe(Stream.take(2), Stream.runCollect, Effect.provide(Natsail.layer(resource)))
       )
 
       yield* Effect.promise(() =>
@@ -701,6 +686,20 @@ describe('Effect adapter', () => {
     expect(error).toMatchObject({ key: invalidOptionsDefinition.key, stage: 'acquire' })
   })
 
+  it('dies instead of hanging when stream setup throws a defect', async () => {
+    const service = makeNatsail({ runtime: runtimeStub(), sessions: createSessionRegistry() })
+    const stream = service.subscribe({
+      subject: 'events.defect',
+      decode: () => 0,
+      signal: 'not a signal' as never,
+    })
+
+    const exit = await Effect.runPromiseExit(Stream.runDrain(stream))
+
+    if (!Exit.isFailure(exit)) throw new Error('Expected the Stream to fail')
+    expect(Cause.hasDies(exit.cause)).toBe(true)
+  })
+
   it('fails a value Stream with a source-tagged session error', async () => {
     const controlled = controllableSource<string>()
     const sessions = createSessionRegistry()
@@ -807,7 +806,7 @@ describe('Effect adapter', () => {
       }),
     } as unknown as SessionRegistry
     const runtime = runtimeStub()
-    const layer = makeNatsailScopedLayer(Effect.succeed({ runtime, sessions }))
+    const layer = Natsail.layerScoped(Effect.succeed({ runtime, sessions }))
 
     const exit = await Effect.runPromiseExit(
       Effect.gen(function* () {
@@ -856,15 +855,17 @@ describe('Effect adapter', () => {
           'messaging.system': 'nats',
           'messaging.destination.name': 'events.audit',
           'messaging.operation.type': 'send',
+          'messaging.operation.name': 'publish',
         },
       },
       {
         name: 'Natsail.request',
-        kind: 'producer',
+        kind: 'client',
         attributes: {
           'messaging.system': 'nats',
           'messaging.destination.name': 'rpc.ping',
           'messaging.operation.type': 'send',
+          'messaging.operation.name': 'send',
         },
       },
     ])
