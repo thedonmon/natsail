@@ -88,11 +88,7 @@ Named explicit-ack processors can also use package-owned recovery. They resume f
 
 Configuration, decode, retention-gap, duplicate-policy, and application-handler failures remain terminal by default.
 
-Call `runtime.reconnect()` after an authenticator receives new credentials. The promise resolves after the runtime observes a new connected generation.
-
-For the full rotation pattern (refresh into a variable, synchronous authenticator, async connect factory), see [rotating credentials](../packages/core/README.md#rotating-credentials).
-
-A reconnect can interrupt in-flight messages and requests. The configured nats.js reconnect behavior still applies.
+Call `runtime.reconnect()` after an authenticator receives new credentials. It can interrupt in-flight messages and requests. See [rotating credentials](../packages/core/README.md#rotating-credentials) for the pattern and semantics.
 
 ## Resource limits and buffering
 
