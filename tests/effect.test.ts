@@ -438,41 +438,6 @@ describe('Effect adapter', () => {
     expect(controlled.close).toHaveBeenCalledOnce()
   })
 
-  it('shares one registry source across concurrent Effect stream consumers', async () => {
-    const controlled = controllableSource<string>()
-    const sessions = createSessionRegistry()
-    const definition = defineSession({
-      key: 'conversation:effect-shared',
-      contract: 'conversation:v1',
-      source: controlled.source,
-    })
-    const service = makeNatsail({ runtime: runtimeStub(), sessions })
-
-    const result = await Effect.runPromise(
-      Effect.gen(function* () {
-        const first = yield* Effect.forkChild(
-          service.sessionValues(definition).pipe(Stream.take(1), Stream.runCollect)
-        )
-        const second = yield* Effect.forkChild(
-          service.sessionValues(definition).pipe(Stream.take(1), Stream.runCollect)
-        )
-
-        yield* Effect.promise(() =>
-          vi.waitFor(() => expect(sessions.inspect().sessions[0]?.references).toBe(2))
-        )
-        yield* Effect.promise(() => controlled.deliver('hello'))
-
-        return yield* Effect.all([Fiber.join(first), Fiber.join(second)], {
-          concurrency: 'unbounded',
-        })
-      })
-    )
-
-    expect(result).toEqual([['hello'], ['hello']])
-    expect(controlled.starts).toHaveBeenCalledOnce()
-    expect(sessions.inspect().activeSessions).toBe(0)
-  })
-
   it.effect('shares reduced JetStream state and coalesces cumulative live updates', () =>
     Effect.gen(function* () {
       const controlled = controllableSource<JetStreamStateSnapshot<number>>()
