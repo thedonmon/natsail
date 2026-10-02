@@ -8,7 +8,7 @@ pnpm add @natsail/core @natsail/checkpoints @natsail/session @natsail/jetstream
 
 `consumeJetStream()` uses an ordered consumer with `AckPolicy.None`. It saves the application checkpoint only after the handler succeeds. Its lease exposes `caughtUp`, `inspect()`, and lifecycle notifications. Every delivery includes the server pending count and a stable `replay: 'initial' | 'live'` classification based on the backlog captured when the consumer opens.
 
-`createJetStreamSessionSource()` adapts the consumer for one shared React and RxJS session. Set `recovery` to let the package replace a failed ordered consumer after its last successfully processed cursor. Permanent configuration, retention, duplicate, and application-handler failures stay terminal by default. A decode error is not marked terminal; see [Decode failures](#decode-failures).
+`createJetStreamSessionSource()` adapts the consumer for one shared React and RxJS session. Set `recovery` to let the package replace a failed ordered consumer after its last successfully processed cursor. Permanent configuration, retention, decode, duplicate, and application-handler failures stay terminal by default. Decode failures are terminal too; see [Decode failures](#decode-failures).
 
 Custom `recovery.delayMs` or `recovery.shouldRetry` functions require a stable `recovery.scope` when used in a validated definition. The scope prevents two callers from sharing a key while silently using different retry semantics.
 
@@ -117,7 +117,9 @@ processJetStream(runtime, {
 }, handle)
 ```
 
-A throwing hook stops the processor. `consumeJetStream()` and reducing sessions have no disposition to return because ordered consumers do not acknowledge. A decode error there ends the lease with that error. With session `recovery` it counts as a retryable source failure unless it is a `TypeError`, so the replacement consumer meets the same message again. Decode defensively in a `decode` function that returns a tagged value, and let the handler or reducer skip the bad entry.
+A throwing hook stops the processor.
+
+Decode failures are terminal by default on every path. A processor without a hook, `consumeJetStream()`, and reducing sessions all end with a `JetStreamDecodeError`, and session `recovery` does not retry it. Recognise it with `error instanceof JetStreamDecodeError`. Its message names the stream, sequence, subject, and original message but never the payload. It also carries `subject`, `cursor`, and, for processors, `deliveryAttempt`. The original error is `error.cause`. Ordered consumers do not acknowledge, so only processors can skip a bad message with `onDecodeFailure`. Elsewhere, decode defensively: have `decode` return a tagged value and let the handler or reducer skip the bad entry.
 
 ## Delivery headers
 

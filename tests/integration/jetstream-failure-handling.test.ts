@@ -11,6 +11,8 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { createNatsRuntime, natsCodecs, type NatsPayloadCodec } from '@natsail/core'
 import {
   consumeJetStream,
+  createReducingJetStreamSessionSource,
+  JetStreamDecodeError,
   processJetStream,
   type JetStreamProcessorDecodeFailure,
   type JetStreamProcessorDisposition,
@@ -152,8 +154,60 @@ describe('JetStream failure handling and delivery headers', () => {
       )
       cleanups.push(() => lease.close().catch(() => undefined))
 
-      await expect(lease.closed).rejects.toThrow('malformed: bad-1')
+      const error = (await lease.closed.catch((reason: unknown) => reason)) as JetStreamDecodeError
+      expect(error).toBeInstanceOf(JetStreamDecodeError)
+      expect(error).toMatchObject({ subject, deliveryAttempt: 1, cursor: { stream, sequence: 1 } })
+      expect(error.cause).toEqual(new Error('malformed: bad-1'))
       expect(await ackFloor(manager, stream, consumer)).toBe(0)
+    })
+  })
+
+  describe('ordered consumer decode failures', () => {
+    it('ends a recovering session with a typed error instead of reopening the consumer', async () => {
+      const { admin, client, runtime, stream, subject } = await fixture('decode-ordered')
+      await client.publish(subject, 'ok-1')
+      await client.publish(subject, 'bad-2')
+      await client.publish(subject, 'ok-3')
+      const consumerCreates: string[] = []
+      const watcher = admin.subscribe(`$JS.API.CONSUMER.CREATE.${stream}.>`, {
+        callback: (_error, message) => {
+          consumerCreates.push(message.subject)
+        },
+      })
+      cleanups.push(async () => watcher.unsubscribe())
+      let decodeCalls = 0
+      const codec = pickyCodec()
+      let latest: { restarts: number } | undefined
+
+      const lease = createReducingJetStreamSessionSource(
+        runtime,
+        {
+          stream,
+          filter: subject,
+          start: 'all',
+          recovery: { delayMs: 10, maxAttempts: 5 },
+          decode: (message) => {
+            decodeCalls += 1
+            return codec.decode(message.data)
+          },
+        },
+        { scope: 'count:v1', initial: () => 0, reduce: (count) => count + 1 }
+      )(async (snapshot) => {
+        latest = snapshot
+      })
+      cleanups.push(() => lease.close().catch(() => undefined))
+
+      const error = (await lease.closed.catch((reason: unknown) => reason)) as JetStreamDecodeError
+      expect(error).toBeInstanceOf(JetStreamDecodeError)
+      expect(error).toMatchObject({ subject, cursor: { stream, sequence: 2 } })
+      expect(error.cause).toEqual(new Error('malformed: bad-2'))
+      expect(error.message).toContain('bad-2')
+      expect(error.message).toContain('sequence 2')
+
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      expect(decodeCalls).toBe(2)
+      expect(consumerCreates).toHaveLength(1)
+      expect(latest?.restarts ?? 0).toBe(0)
     })
   })
 

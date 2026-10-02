@@ -287,6 +287,24 @@ export class JetStreamDuplicateError extends Error {
   }
 }
 
+/** A payload the codec or decoder rejected; `cause` is the original error. */
+export class JetStreamDecodeError extends Error {
+  readonly name = 'JetStreamDecodeError'
+
+  constructor(
+    readonly subject: string,
+    readonly cursor: StreamCursor,
+    cause: unknown,
+    readonly deliveryAttempt?: number
+  ) {
+    super(
+      `JetStream payload decode failed for stream ${cursor.stream} sequence ${cursor.sequence} ` +
+        `on subject ${subject}: ${cause instanceof Error ? cause.message : String(cause)}`,
+      { cause }
+    )
+  }
+}
+
 export type JetStreamHandler<T> = (delivery: JetStreamDelivery<T>) => void | Promise<void>
 
 export interface JetStreamProcessingDelivery<T> {
@@ -855,8 +873,14 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
           ...(streamEpoch === undefined ? {} : { epoch: streamEpoch }),
           sequence,
         }
+        let value: T
+        try {
+          value = decodeJetStreamPayload(this.options, message)
+        } catch (error) {
+          markApplicationDeliveryFailure(new JetStreamDecodeError(message.subject, cursor, error))
+        }
         const delivery: JetStreamDelivery<T> = {
-          value: decodeJetStreamPayload(this.options, message),
+          value,
           subject: message.subject,
           cursor,
           duplicate,
@@ -1362,7 +1386,14 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
         { signal: this.cancellation.signal }
       )
     }
-    if (!this.options.onDecodeFailure) throw decodeError
+    if (!this.options.onDecodeFailure) {
+      throw new JetStreamDecodeError(
+        message.subject,
+        cursor,
+        decodeError,
+        message.info.deliveryCount
+      )
+    }
     const disposition = await this.options.onDecodeFailure({
       error: decodeError,
       subject: message.subject,
