@@ -162,9 +162,7 @@ const runtime = createNatsRuntime({
 const sessions = createSessionRegistry({ telemetry })
 ```
 
-Use only stable, low-cardinality primitive attributes. NATSail does not include subjects, payloads, credentials, session/checkpoint keys, stream names, or consumer names in its default telemetry attributes. Internal operation attributes override colliding caller attributes. A sink runs inline, so it should enqueue measurements and avoid blocking I/O; sink exceptions are isolated from observed operations.
-
-Install [`@natsail/opentelemetry`](packages/opentelemetry/README.md) to map the same interface to OpenTelemetry without adding an OpenTelemetry dependency to Core.
+Attributes must be primitive and low-cardinality, and a sink runs inline, so it should only enqueue. See the [Core telemetry guide](packages/core/README.md#telemetry) for the attribute rules. Install [`@natsail/opentelemetry`](packages/opentelemetry/README.md) to map the same events to OpenTelemetry without adding that dependency to Core.
 
 ## Share sources across browser tabs
 
@@ -191,11 +189,11 @@ await browser.publish('send-message', encodedMessage)
 const reply = await browser.request('lookup-message', encodedQuery)
 ```
 
-Per-tab item and encoded-byte queues are bounded independently. A lagging tab receives an explicit resume-required error from its last acknowledged JetStream cursor; other tabs continue. Tenant/authentication context is immutable source identity, while credentials can be refreshed through the authenticated tab bootstrap. Publish and request use logical operation names that the worker maps to authorized NATS subjects or services. See the [browser broker guide](packages/browser-broker/README.md) for worker setup, idle runtime cleanup, fallback policy, and protocol v1.
+Publish and request use logical operation names that the worker maps to authorized NATS subjects. A lagging tab receives an explicit resume-required error while other tabs continue. See the [browser broker guide](packages/browser-broker/README.md) for worker setup, queue bounds, credential refresh, fallback policy, and protocol v1.
 
 ## Batching and cooperative reducers
 
-Core exports one dependency-free `NatsailBatchPolicy<T>` for count, byte, and time bounds plus `NatsailWorkBudget` for cooperative serial reducer yields. Reducing JetStream sessions apply replay in bounded batches but publish one atomic hydrated state, then coalesce live cumulative state with a 16ms default. RxJS, React, and Effect accept the same policy while keeping their native scheduling APIs and legacy options. Ordered cursor/checkpoint advancement remains behind successful batch application; close discards a pending partial batch and waits for in-flight work.
+Core exports one dependency-free `NatsailBatchPolicy<T>` for count, byte, and time bounds plus `NatsailWorkBudget` for cooperative reducer yields. Reducing JetStream sessions publish one atomic hydrated state after replay, then coalesce live state with a 16ms default. RxJS, React, and Effect accept the same policy. See the [Core batching guide](packages/core/README.md#batching-and-cooperative-work).
 
 ## Shared session adapters
 
@@ -371,9 +369,9 @@ The runtime accepts any official NATS connection factory. Browser applications c
 
 ## Development
 
-The workspace requires Node.js 22.14 or newer, pnpm, Docker, and Chrome for local browser tests.
+The workspace requires Node.js 22.14 or newer, pnpm, Docker, and Playwright browsers for local browser tests.
 
-`pnpm format` and `pnpm lint` use Oxfmt and Oxlint on `packages/*/src` only. Tests, examples, documentation, tooling, and generated files are outside both checks, including when the tools run from the repository root. Formatting keeps the existing single quotes, no semicolons, and 100-column width; import sorting stays off.
+`pnpm lint` runs Oxlint on `packages/*/src`. `pnpm format` and `pnpm format:check` run Oxfmt on the same sources plus each `packages/*/CHANGELOG.md`. Tests, examples, documentation, tooling, and generated files are outside both checks, including when the tools run from the repository root. Formatting keeps the existing single quotes, no semicolons, and 100-column width; import sorting stays off.
 
 CI rejects lint errors. Cyclomatic complexity above 20 and existing React lifecycle findings produce warnings while they await a separate behavior-tested cleanup. Run `pnpm lint:strict` to fail on those warnings too. The broker keeps collection snapshots around callbacks and awaits, so its client and worker disable `no-useless-spread`.
 
@@ -384,6 +382,7 @@ pnpm lint
 pnpm nats:up
 pnpm test
 pnpm test:browser
+pnpm test:browser-broker
 pnpm check
 pnpm benchmark
 ```
