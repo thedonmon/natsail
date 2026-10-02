@@ -1,5 +1,14 @@
 # @natsail/browser-broker
 
+## 0.1.3
+
+### Patch Changes
+
+- Updated dependencies [28984b3]
+- Updated dependencies [28984b3]
+  - @natsail/core@0.6.0
+  - @natsail/session@0.5.1
+
 ## 0.1.2
 
 ### Patch Changes
