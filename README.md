@@ -272,7 +272,7 @@ const program = jetStreamStates(conversationState, {
 
 The adapter also provides cold Core and JetStream Streams with bounded queues, a native Effect replay materializer with typed reducer requirements, and explicit-ack processors.
 
-The current Effect adapter targets the version in its [package guide](packages/effect/README.md) and uses the npm `next` tag.
+The Effect adapter targets stable Effect 4.0.0 (see its [package guide](packages/effect/README.md)) and publishes on the npm `latest` tag.
 
 ## Explicit-ack processing example
 

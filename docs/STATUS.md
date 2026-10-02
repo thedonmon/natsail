@@ -14,11 +14,13 @@ The test suite uses NATS 2.14.4. Separate fixtures cover anonymous, token, user/
 - Bounded shutdown grace periods, cooperative cancellation, and event-buffer overflow reporting
 - Recovery after forced reconnect or permanent close
 - Forced reauthentication after credential changes
+- Cancellable connection factories with attempt identifiers, bounded shutdown, and late-connection discard
 - Structured status, diagnostics, and resource inspection
 - Browser WebSocket transport in Node.js and Chromium
 - Connection-wide limits for consumers, buffered messages, and buffered bytes
 - Dependency-free counters, gauges, and deterministic duration telemetry isolated from runtime operations
 - Optional OpenTelemetry metrics adapter with no Core OpenTelemetry dependency
+- W3C trace-context inject and extract helpers for NATS message headers in the OpenTelemetry package
 - SharedWorker broker protocol with immutable tenant/auth identity, refreshable credentials, brokered publish/request, and idle runtime cleanup
 
 ### JetStream
@@ -38,6 +40,9 @@ The test suite uses NATS 2.14.4. Separate fixtures cover anonymous, token, user/
 - Editable consumer drift updates and safe owned recreation from acknowledgement boundaries
 - Backoff, metadata, acknowledgement sampling, replicas, and memory-storage processor configuration
 - Message-count and byte-capacity pull limits
+- Typed, terminal decode failures with an optional processor `onDecodeFailure` disposition (retry or term)
+- Message headers on every JetStream delivery
+- Tested dead-letter and KV watch recipes built on existing processor and reducing-session APIs
 - Replay/remaining, handler, redelivery, acknowledgement, checkpoint, recovery, and buffer-signal measurements
 
 ### Sessions and framework adapters
@@ -45,12 +50,15 @@ The test suite uses NATS 2.14.4. Separate fixtures cover anonymous, token, user/
 - Keyed session sharing with final-release cleanup
 - Contract checks for shared logical sources
 - Memory and IndexedDB checkpoint stores
-- Strict-Mode-safe React runtime ownership
+- Strict-Mode-safe React runtime ownership with concurrent runtime and registry shutdown through `closeNatsResources`
 - React selectors, reducers, status, and processor hooks, including processor restart state
 - Frame-coalesced React JetStream state
 - RxJS runtime, session, Core, and JetStream Observables
 - Frame-coalesced RxJS cumulative state
-- Effect v4 Layers, bounded Streams, replay materialization, and processors
+- Stable Effect 4.0.0 Layers, bounded Streams, replay materialization, and processors
+- Effect Streams that stop cleanly on early termination or interruption, fail with a typed acquire error, and emit publish, request, and per-delivery spans
+- Effect `Natsail.layer` and `Natsail.layerScoped` constructors and a Schema-backed payload codec
+- RxJS `batchWithPolicy` operator on the shared count, bytes, and time batch policy
 - One logical session shared by Effect, React, and RxJS
 - One physical SessionSource shared across same-origin tabs with per-tab cursor acknowledgements
 - Bounded per-tab item/byte queues with explicit lagged resume requirements
@@ -107,7 +115,7 @@ Shared count/byte/time batching and cooperative work budgets are implemented in 
 
 ### Processor policy
 
-Named processors support progress heartbeats, optional confirmed acknowledgements, and explicit delayed-retry or terminal handler results. Thrown handler errors remain terminal. External side effects still need idempotency; terminal results do not create a dead-letter record automatically.
+Named processors support progress heartbeats, optional confirmed acknowledgements, and explicit delayed-retry or terminal handler results. Thrown handler errors remain terminal. External side effects still need idempotency; terminal results do not create a dead-letter record automatically. The JetStream package guide documents a tested recipe that publishes to a dead-letter subject before returning `term`, and decode failures stay terminal unless `onDecodeFailure` chooses `retry`.
 
 ## Roadmap
 
@@ -122,6 +130,6 @@ Named processors support progress heartbeats, optional confirmed acknowledgement
 
 ## Publication status
 
-All nine package tarballs pass repository checks. Routine releases use Changesets and GitHub trusted publishing.
+All nine package tarballs pass repository checks. Routine releases use Changesets and GitHub trusted publishing; see [releasing](./RELEASING.md).
 
 The browser-broker and OpenTelemetry packages have completed their first publication.
