@@ -41,8 +41,10 @@ const broker = createBrowserBrokerWorker({
   idleTeardownMs: 250,
 })
 
-self.onconnect = (event) => broker.connect(event.ports[0])
+self.onconnect = (event) => broker.connect(event.ports[0]!)
 ```
+
+Defaults: `maxTabQueueItems` 256, `maxTabQueueBytes` 1 MiB, `maxRetainedItems` 1,024, `maxRetainedBytes` 4 MiB, `maxBatchItems` 64, `maxBatchBytes` 256 KiB, `idleTeardownMs` 0, `clientTimeoutMs` 30 s, `sweepIntervalMs` 10 s. The client defaults to a 10 s `heartbeatIntervalMs` and a 5 s `requestTimeoutMs`.
 
 `BrowserBrokerDelivery.data` is encoded bytes. A JetStream source should also supply its stream cursor. The broker retains a bounded source log and keeps at most one transferred batch in flight per tab. It copies each tab's batch into transferable `ArrayBuffer` values, then waits for an acknowledgement before sending another batch.
 
@@ -121,7 +123,7 @@ The protocol is same-origin transport, not authorization. The worker source fact
 
 ## Telemetry
 
-Pass the Stage 1 sink to the worker and client. The package reports active tabs, physical sources, caller-reported upstream connections, aggregate queue item/byte depth, lag, fallback, source restart, connection reconnect, and worker replacement. Attributes contain only stable action/source dimensions; tenant IDs, auth contexts, credentials, source keys, contracts, stream names, and cursors are excluded.
+Pass a Core `NatsailTelemetrySink` as `telemetry` to the worker and the client. The package reports active tabs, physical sources, caller-reported upstream connections, aggregate queue item/byte depth, lag, fallback, source restart, connection reconnect, and worker replacement. Attributes contain only stable action/source dimensions; tenant IDs, auth contexts, credentials, source keys, contracts, stream names, and cursors are excluded.
 
 Call `broker.reportConnection('opened' | 'reconnected' | 'closed')` from the upstream connection lifecycle to populate physical-connection telemetry accurately. Use `closeIdleResources` to close and reset the worker runtime after the final physical source or broker host closes; later work waits for cleanup before the application recreates it.
 

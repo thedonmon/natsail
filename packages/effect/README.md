@@ -15,8 +15,9 @@ Use `subscribe()` when every Effect consumer should own one ephemeral Core NATS 
 ```ts
 import { Effect, Stream } from 'effect'
 
-import { natsCodecs } from '@natsail/core'
+import { createNatsRuntime, natsCodecs } from '@natsail/core'
 import { Natsail, subscribe } from '@natsail/effect'
+import { createSessionRegistry } from '@natsail/session'
 
 const NatsLive = Natsail.layerScoped(
   Effect.sync(() => ({
