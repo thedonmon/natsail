@@ -13,6 +13,9 @@ importers:
       '@nats-io/jetstream':
         specifier: 3.4.0
         version: 3.4.0
+      '@nats-io/kv':
+        specifier: 3.4.0
+        version: 3.4.0
       '@nats-io/nats-core':
         specifier: 3.4.0
         version: 3.4.0
@@ -25,6 +28,9 @@ importers:
       '@opentelemetry/api':
         specifier: 1.9.0
         version: 1.9.0
+      '@opentelemetry/core':
+        specifier: 2.11.0
+        version: 2.11.0(@opentelemetry/api@1.9.0)
       '@playwright/test':
         specifier: 1.62.1
         version: 1.62.1
@@ -1936,6 +1942,12 @@ packages:
         integrity: sha512-GzHQodNJ942+R5LRb8PuZ5ugVWVWMRiufxUYLLVWkXKfwDXYN+Owo0d7L/b9O7BPyrbYD7jQWAC6+ZVuXa9Gyw==,
       }
 
+  '@nats-io/kv@3.4.0':
+    resolution:
+      {
+        integrity: sha512-168pcRJxWcIRHwdyczI3DaGk5r3CAj3CyKXuk4Nmx5KKj7N1znQOJPIxCoV0TPlAvoTidVb7eBv41J9imapMeQ==,
+      }
+
   '@nats-io/nats-core@3.4.0':
     resolution:
       {
@@ -1990,6 +2002,22 @@ packages:
         integrity: sha512-3giAOQvZiH5F9bMlMiv8+GSPMeqg0dbaeo58/0SlA9sxSqZhnUtxzX9/2FzyhS9sWQf5S0GJE0AKBrFqjpeYcg==,
       }
     engines: { node: '>=8.0.0' }
+
+  '@opentelemetry/core@2.11.0':
+    resolution:
+      {
+        integrity: sha512-7YP44XH0tV6+Mb54x2YGf84i7yi+31MBZlE8JwvozkxyTvXbSp10X7cI7YE49ChJ3shMJoBmCJF3+1QFBJctGA==,
+      }
+    engines: { node: ^18.19.0 || >=20.6.0 }
+    peerDependencies:
+      '@opentelemetry/api': '>=1.0.0 <1.10.0'
+
+  '@opentelemetry/semantic-conventions@1.43.0':
+    resolution:
+      {
+        integrity: sha512-eSYWTm620tTk45EKSedaUL8MFYI8hW164hIXsgIHyxu3VobUB3fFCu5t0hQby6OoWRPsG1KkKUG2M5UadiLiVg==,
+      }
+    engines: { node: '>=14' }
 
   '@oxfmt/binding-android-arm-eabi@0.66.0':
     resolution:
@@ -6762,6 +6790,11 @@ snapshots:
     dependencies:
       '@nats-io/nats-core': 3.4.0
 
+  '@nats-io/kv@3.4.0':
+    dependencies:
+      '@nats-io/jetstream': 3.4.0
+      '@nats-io/nats-core': 3.4.0
+
   '@nats-io/nats-core@3.4.0':
     dependencies:
       '@nats-io/nkeys': 2.0.3
@@ -6792,6 +6825,13 @@ snapshots:
       fastq: 1.20.1
 
   '@opentelemetry/api@1.9.0': {}
+
+  '@opentelemetry/core@2.11.0(@opentelemetry/api@1.9.0)':
+    dependencies:
+      '@opentelemetry/api': 1.9.0
+      '@opentelemetry/semantic-conventions': 1.43.0
+
+  '@opentelemetry/semantic-conventions@1.43.0': {}
 
   '@oxfmt/binding-android-arm-eabi@0.66.0':
     optional: true

@@ -10,10 +10,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createNatsRuntime, type NatsRuntime } from '@natsail/core'
 import {
-  classifyJetStreamProcessorDrift,
   createJetStreamProcessorController,
-  normalizeJetStreamProcessorActive,
-  validateJetStreamProcessorAdminOptions,
   JetStreamProcessorConfigurationError,
   type JetStreamProcessorAdminOptions,
 } from '@natsail/jetstream'
@@ -134,29 +131,29 @@ describe('JetStream processor administration', () => {
     [{ start: { after: Number.MAX_SAFE_INTEGER } }, 'room for the next sequence'],
   ] as const)('rejects invalid administration options %#', (patch, message) => {
     expect(() =>
-      validateJetStreamProcessorAdminOptions({
+      createJetStreamProcessorController(runtime(), {
         ...baseOptions,
         ...patch,
       } as JetStreamProcessorAdminOptions)
     ).toThrow(message)
   })
 
-  it('compares only explicitly requested optional fields and canonicalizes maps and filters', () => {
-    const activeInfo = info({
+  it('compares only explicitly requested optional fields and canonicalizes maps and filters', async () => {
+    active = info({
       replay_policy: ReplayPolicy.Original,
       filter_subjects: ['events.b', 'events.a'],
       metadata: { z: 'last', _nats_level: 'server-owned', a: 'first' },
       ack_wait: 9_000_000_000,
     })
-    delete activeInfo.config.filter_subject
-    const current = normalizeJetStreamProcessorActive(activeInfo)
+    delete active.config.filter_subject
+    const controller = createJetStreamProcessorController(runtime(), {
+      ...baseOptions,
+      filter: ['events.a', 'events.b'],
+      metadata: { a: 'first', z: 'last' },
+    })
 
-    expect(
-      classifyJetStreamProcessorDrift(
-        { ...baseOptions, filter: ['events.a', 'events.b'], metadata: { a: 'first', z: 'last' } },
-        current
-      )
-    ).toEqual({ editable: [], immutable: [] })
+    await expect(controller.reconcile()).resolves.toMatchObject({ status: 'unchanged' })
+    expect(mocks.update).not.toHaveBeenCalled()
   })
 
   it('rejects immutable ensure drift without partially applying editable drift', async () => {

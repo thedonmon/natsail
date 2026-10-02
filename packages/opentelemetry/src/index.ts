@@ -1,10 +1,15 @@
 import {
+  context as otelContext,
   metrics,
+  propagation,
   type Attributes,
+  type Context,
   type Counter,
   type Gauge,
   type Histogram,
   type Meter,
+  type TextMapGetter,
+  type TextMapSetter,
 } from '@opentelemetry/api'
 
 import type { NatsailTelemetryEvent, NatsailTelemetrySink } from '@natsail/core'
@@ -69,4 +74,40 @@ export function createOpenTelemetrySink(
       }
     },
   })
+}
+
+/** The subset of nats.js `MsgHdrs` used for propagation; the real type satisfies it. */
+export interface NatsHeaderCarrier {
+  get(key: string): string
+  set(key: string, value: string): void
+  keys(): string[]
+}
+
+const setter: TextMapSetter<NatsHeaderCarrier> = {
+  set: (carrier, key, value) => carrier.set(key, value),
+}
+
+const getter: TextMapGetter<NatsHeaderCarrier> = {
+  get: (carrier, key) => carrier.get(key) || undefined,
+  keys: (carrier) => carrier.keys(),
+}
+
+/**
+ * Writes the trace context into NATS message headers with the globally registered
+ * propagator and returns the same headers. Pass `headers()` from nats.js to start fresh.
+ */
+export function injectTraceContext<H extends NatsHeaderCarrier>(
+  headers: H,
+  context: Context = otelContext.active()
+): H {
+  propagation.inject(context, headers, setter)
+  return headers
+}
+
+/** Reads the trace context from NATS message headers; returns `context` unchanged without any. */
+export function extractTraceContext(
+  headers: NatsHeaderCarrier | undefined,
+  context: Context = otelContext.active()
+): Context {
+  return headers === undefined ? context : propagation.extract(context, headers, getter)
 }

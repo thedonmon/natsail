@@ -419,7 +419,7 @@ export function validateJetStreamProcessorAdminOptions(
   }
 }
 
-export function normalizeJetStreamProcessorDesired(
+function normalizeJetStreamProcessorDesired(
   options: JetStreamProcessorAdminOptions,
   start: JetStreamProcessorStart = options.start
 ): JetStreamProcessorNormalizedConfig {
@@ -456,9 +456,7 @@ export function normalizeJetStreamProcessorDesired(
   }
 }
 
-export function normalizeJetStreamProcessorActive(
-  info: ConsumerInfo
-): JetStreamProcessorNormalizedConfig {
+function normalizeJetStreamProcessorActive(info: ConsumerInfo): JetStreamProcessorNormalizedConfig {
   const config = info.config
   const sample = config.sample_freq?.replace('%', '')
   const parsedSample = sample === undefined ? undefined : Number(sample)
@@ -518,7 +516,7 @@ function same(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right)
 }
 
-export function classifyJetStreamProcessorDrift(
+function classifyJetStreamProcessorDrift(
   options: JetStreamProcessorAdminOptions,
   active: JetStreamProcessorNormalizedConfig,
   effectiveStart: JetStreamProcessorStart = options.start
@@ -558,7 +556,7 @@ export function classifyJetStreamProcessorDrift(
   return { editable, immutable }
 }
 
-export function jetStreamProcessorConsumerConfig(
+function jetStreamProcessorConsumerConfig(
   options: JetStreamProcessorAdminOptions,
   start: JetStreamProcessorStart = options.start
 ): ConsumerConfig {
