@@ -6,7 +6,7 @@
 pnpm add react @natsail/core @natsail/session @natsail/jetstream @natsail/react
 ```
 
-`NatsProvider` owns neither the runtime nor the session registry. The application closes both objects. `NatsManagedProvider` is the ownership-safe alternative: it creates both after commit, reuses the resource during React Strict Mode effect replay, and closes it after final unmount.
+`NatsProvider` owns neither the runtime nor the session registry. The application closes both objects. `NatsManagedProvider` is the ownership-safe alternative: it creates both after commit, reuses the resource during React Strict Mode effect replay, and closes it after final unmount. `fallback` renders until the resource exists, and `onCloseError` receives a failed close.
 
 Default managed cleanup uses `closeNatsResources({ runtime, sessions })` from `@natsail/session` to start registry and runtime shutdown together so a pending session cannot postpone the runtime's deadline. Identity changes permit temporary overlap: the replacement starts without waiting for the previous resource to drain. A custom resource `close()` overrides this behavior and remains responsible for both lifetimes; it can delegate to the same helper. See the [lifecycle upgrade notes](https://github.com/thedonmon/natsail/blob/main/docs/UPGRADING-LIFECYCLE.md).
 
@@ -22,9 +22,9 @@ Default managed cleanup uses `closeNatsResources({ runtime, sessions })` from `@
 </NatsManagedProvider>
 ```
 
-`useNatsJetStreamSubscription()` and its selector variant open one registry-shared, checkpointed JetStream source.
+`useNatsJetStreamSubscription()` opens one registry-shared, checkpointed JetStream source. To select from a source, pass it to `useNatsSessionSelector()`.
 
-`useNatsJetStreamReducer()` accepts a validated reducing definition and returns its atomic replay/live snapshot. `useNatsJetStreamReducerSelector()` can schedule React notifications immediately, in a microtask, or on the next animation frame. The underlying session still reduces every delivery serially; only rendering is coalesced.
+`useNatsJetStreamReducer()` accepts a validated reducing definition and returns its atomic replay/live snapshot. `useNatsJetStreamReducerSelector()` can schedule React notifications immediately, in a microtask, or on the next animation frame (the default for both reducer hooks, set with `notifications`). The underlying session still reduces every delivery serially; only rendering is coalesced.
 
 Both reducer hooks also accept the shared `batchPolicy` and an optional `NatsailScheduler`. Count, byte, and time bounds affect React notification delivery only. Replay and recovery phase changes bypass live coalescing.
 

@@ -59,7 +59,7 @@ consumeJetStream(
 )
 ```
 
-The same `codec` option works with `processJetStream()`. Supply any `NatsPayloadCodec<T>` for another wire format. Use `decode(message)` only when the application needs the raw `JsMsg`; ordinary deliveries already include `subject`, cursor, duplicate, and redelivery metadata.
+The same `codec` option works with `processJetStream()`. Supply any `NatsPayloadCodec<T>` for another wire format. Use `decode(message)` only when the application needs the raw `JsMsg`; ordinary deliveries already include `subject`, cursor, `redelivered`, and `headers`; ordered deliveries also carry `duplicate`, `consumerPending`, and `replay`, and processor deliveries carry `deliveryAttempt`.
 
 `processJetStream()` is the work-processing seam. `ensure` creates or reuses a retained durable pull consumer, `bind` validates and attaches to an existing consumer without mutating it, and `owned` creates a durable consumer that its lease deletes on close. Every mode requires `AckPolicy.Explicit`; the package acknowledges only after the handler succeeds.
 
@@ -77,7 +77,7 @@ Set `recovery` to reopen the same named consumer after a connection or consumer-
 
 The processor lease exposes `inspect()` and `subscribe()`. Its phase is `connecting`, `live`, `reconnecting`, `closed`, or `error`. Cached inspection includes ownership, pending messages and acknowledgements, delivered and acknowledged consumer/stream sequences, redeliveries, pause state, handler failure, restarts, normalized desired/active configuration, and the last reconciliation. Inspection never performs network I/O.
 
-Configure `ackWaitMs`, ordered `backoffMs`, `maxDeliver` (`-1` means unlimited), `maxAckPending`, `metadata`, `ackSamplePercent`, `replicas`, `memoryStorage`, replay policy, start position, pull-buffer capacity, and recovery attempts or delay. The first backoff is the effective acknowledgement wait. Invalid ranges, backoff relationships, metadata, and policies fail before a connection is acquired. A failed handler is cached before the lease stops and leaves its delivery unacknowledged.
+Configure `ackWaitMs`, ordered `backoffMs`, `maxDeliver` (`-1` means unlimited), `maxAckPending`, `metadata`, `ackSamplePercent`, `replicas`, `memoryStorage`, replay policy, start position, pull-buffer capacity, and recovery attempts or delay. The first backoff is the effective acknowledgement wait. `ackWaitMs`, `backoffMs` entries, `maxAckPending`, and `replicas` must be positive integers. `maxDeliver` is `-1` or a positive integer. `backoffMs` must be non-empty and non-decreasing, `ackWaitMs` (if set) must equal its first entry, and its length must not exceed a finite `maxDeliver`. Invalid ranges, backoff relationships, metadata, and policies fail before a connection is acquired. A failed handler is cached before the lease stops and leaves its delivery unacknowledged.
 
 Use `maxBufferedMessages` or `maxBufferedBytes` to bound the nats.js pull loop. These modes are mutually exclusive. The runtime reserves the selected capacity before it opens the consumer.
 
@@ -94,10 +94,6 @@ Set `progressIntervalMs` below the effective acknowledgement wait to send in-pro
 Handlers receive a second `{ signal }` argument for cancellation. Returning nothing acknowledges success; returning `{ action: 'retry', delayMs: 500 }` requests delayed redelivery; `{ action: 'term', reason: 'unsupported schema' }` explicitly stops redelivery. Thrown errors remain terminal for the processor. Confirmed acknowledgement does not apply to retry or terminal commands, and external side effects still require idempotency.
 
 Forced runtime shutdown preserves owned consumers and prevents late handler results from being acknowledged. See the [production guide](https://github.com/thedonmon/natsail/blob/main/docs/PRODUCTION.md) for the full shutdown contract and configuration examples.
-
-## License
-
-Apache-2.0
 
 ## Decode failures
 
@@ -117,7 +113,7 @@ processJetStream(runtime, {
 }, handle)
 ```
 
-A throwing hook stops the processor.
+A throwing hook, or one that returns nothing, stops the processor.
 
 Decode failures are terminal by default on every path. A processor without a hook, `consumeJetStream()`, and reducing sessions all end with a `JetStreamDecodeError`, and session `recovery` does not retry it. Recognise it with `error instanceof JetStreamDecodeError`. Its message names the stream, sequence, subject, and the original error's type, but never the payload or the original message (codec errors can quote the payload). It also carries `subject`, `cursor`, and, for processors, `deliveryAttempt`. The original error is `error.cause`. Ordered consumers do not acknowledge, so only processors can skip a bad message with `onDecodeFailure`. Elsewhere, decode defensively: have `decode` return a tagged value and let the handler or reducer skip the bad entry.
 
@@ -186,3 +182,7 @@ const settings = defineReducingJetStreamSession(
 ```
 
 `start: 'all'` yields the last value per key only for buckets with the default `history: 1`. Buckets with more history replay every revision, and the reducer keeps the last. Write with `@nats-io/kv` as usual. `tests/integration/jetstream-kv.test.ts` covers put, delete, and purge.
+
+## License
+
+Apache-2.0
