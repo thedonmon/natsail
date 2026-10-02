@@ -80,4 +80,3 @@ describe('Effect, React, and RxJS adapter composition', () => {
     expect(close).toHaveBeenCalledOnce()
   })
 })
-
