@@ -8,12 +8,14 @@ import {
 import type { NatsConnection } from '@nats-io/nats-core'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { createNatsRuntime, type NatsRuntime } from '@natsail/core'
+import type { NatsRuntime } from '@natsail/core'
 import {
   createJetStreamProcessorController,
   JetStreamProcessorConfigurationError,
   type JetStreamProcessorAdminOptions,
 } from '@natsail/jetstream'
+
+import { fakeConnectionRuntime } from './fixtures/fakes'
 
 const mocks = vi.hoisted(() => ({
   add: vi.fn(),
@@ -69,21 +71,6 @@ function info(
   }
 }
 
-function runtime() {
-  let close!: () => void
-  const closed = new Promise<void>((resolve) => {
-    close = resolve
-  })
-  const connection = {
-    closed: () => closed,
-    drain: vi.fn(async () => close()),
-    getServer: () => 'mock:4222',
-    isClosed: () => false,
-    status: async function* () {},
-  } as unknown as NatsConnection
-  return createNatsRuntime({ connect: async () => connection })
-}
-
 describe('JetStream processor administration', () => {
   let active: ConsumerInfo | undefined
 
@@ -131,7 +118,7 @@ describe('JetStream processor administration', () => {
     [{ start: { after: Number.MAX_SAFE_INTEGER } }, 'room for the next sequence'],
   ] as const)('rejects invalid administration options %#', (patch, message) => {
     expect(() =>
-      createJetStreamProcessorController(runtime(), {
+      createJetStreamProcessorController(fakeConnectionRuntime(), {
         ...baseOptions,
         ...patch,
       } as JetStreamProcessorAdminOptions)
@@ -146,7 +133,7 @@ describe('JetStream processor administration', () => {
       ack_wait: 9_000_000_000,
     })
     delete active.config.filter_subject
-    const controller = createJetStreamProcessorController(runtime(), {
+    const controller = createJetStreamProcessorController(fakeConnectionRuntime(), {
       ...baseOptions,
       filter: ['events.a', 'events.b'],
       metadata: { a: 'first', z: 'last' },
@@ -158,7 +145,7 @@ describe('JetStream processor administration', () => {
 
   it('clears the mutually exclusive filter field when filter cardinality changes', async () => {
     active = info({ filter_subject: 'events.>' })
-    const controller = createJetStreamProcessorController(runtime(), {
+    const controller = createJetStreamProcessorController(fakeConnectionRuntime(), {
       ...baseOptions,
       filter: ['events.a', 'events.b'],
     })
@@ -172,7 +159,7 @@ describe('JetStream processor administration', () => {
   })
 
   it('enforces inspect-only bind and ownership deletion guards at runtime', async () => {
-    const bind = createJetStreamProcessorController(runtime(), {
+    const bind = createJetStreamProcessorController(fakeConnectionRuntime(), {
       ...baseOptions,
       consumer: { mode: 'bind', name: 'processor' },
     })
@@ -198,7 +185,7 @@ describe('JetStream processor administration', () => {
         throw new Error('first failed')
       })
       .mockImplementation(async () => active!)
-    const controller = createJetStreamProcessorController(runtime(), baseOptions)
+    const controller = createJetStreamProcessorController(fakeConnectionRuntime(), baseOptions)
     const first = controller.refresh()
     const second = controller.refresh()
 
@@ -210,7 +197,7 @@ describe('JetStream processor administration', () => {
   })
 
   it('caches rich authoritative inspection state', async () => {
-    const controller = createJetStreamProcessorController(runtime(), baseOptions)
+    const controller = createJetStreamProcessorController(fakeConnectionRuntime(), baseOptions)
     const inspection = await controller.refresh()
 
     expect(inspection).toMatchObject({
@@ -266,7 +253,7 @@ describe('JetStream processor administration', () => {
         num_ack_pending: 0,
       }
     )
-    const controller = createJetStreamProcessorController(runtime(), {
+    const controller = createJetStreamProcessorController(fakeConnectionRuntime(), {
       ...baseOptions,
       consumer: { mode: 'owned', name: 'processor' },
       start: 'all',
@@ -307,7 +294,7 @@ describe('JetStream processor administration', () => {
         active = info(config)
         return active
       })
-    const controller = createJetStreamProcessorController(runtime(), {
+    const controller = createJetStreamProcessorController(fakeConnectionRuntime(), {
       ...baseOptions,
       consumer: { mode: 'owned', name: 'processor' },
       start: 'all',
@@ -355,7 +342,7 @@ describe('JetStream processor administration', () => {
         num_ack_pending: 1,
       }
     )
-    const controller = createJetStreamProcessorController(runtime(), {
+    const controller = createJetStreamProcessorController(fakeConnectionRuntime(), {
       ...baseOptions,
       consumer: { mode: 'owned', name: 'processor' },
       start: 'all',
@@ -369,7 +356,7 @@ describe('JetStream processor administration', () => {
 
   it('rejects a past pause deadline, forwards a future one, and deletes an owned consumer', async () => {
     active = info({ metadata: { 'natsail.io/processor-owner': 'natsail' } })
-    const controller = createJetStreamProcessorController(runtime(), {
+    const controller = createJetStreamProcessorController(fakeConnectionRuntime(), {
       ...baseOptions,
       consumer: { mode: 'owned', name: 'processor' },
     })
@@ -384,7 +371,7 @@ describe('JetStream processor administration', () => {
   })
 
   it('never recreates or deletes an unmarked consumer claimed as owned', async () => {
-    const controller = createJetStreamProcessorController(runtime(), {
+    const controller = createJetStreamProcessorController(fakeConnectionRuntime(), {
       ...baseOptions,
       consumer: { mode: 'owned', name: 'processor' },
       start: 'new',
