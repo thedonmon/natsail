@@ -4,6 +4,7 @@ import {
   BrowserBrokerResumeRequiredError,
   createBrowserBrokerClient,
   createBrowserBrokerWorker,
+  createSharedWorkerConnector,
   createTabLocalBrokerConnector,
   NATS_BROWSER_BROKER_PROTOCOL,
   NATS_BROWSER_BROKER_PROTOCOL_VERSION,
@@ -465,6 +466,119 @@ describe('@natsail/browser-broker', () => {
     expect(started).toEqual(['first', 'second'])
 
     await closeAll([client], [host], [sessions])
+  })
+
+  it('reopens the physical source on lease restart and keeps delivering to the same lease', async () => {
+    const source = controlledSource()
+    const sessions = createSessionRegistry()
+    const host = createHost(source, { sessions, createSource: source.factory })
+    const client = await createBrowserBrokerClient({
+      identity,
+      credentials,
+      connect: connector(host),
+      heartbeatIntervalMs: 0,
+    })
+    const values: string[] = []
+    const lease = client.createSource(descriptor)(async (delivery) => {
+      values.push(decoder.decode(delivery.data))
+    })
+    await lease.ready
+
+    await lease.restart()
+    await source.emit(1, 'after-restart', cursor(1))
+
+    await vi.waitFor(() => expect(values).toEqual(['after-restart']))
+    expect(source.opens).toBe(2)
+    expect(source.closes).toBe(1)
+    await expect(client.restart('missing-subscription')).rejects.toMatchObject({
+      code: 'subscription-missing',
+    })
+
+    await closeAll([client], [host], [sessions])
+  })
+
+  it('restarts an errored physical source when another tab attaches to it', async () => {
+    const sessions = createSessionRegistry()
+    const failures: Array<(error: Error) => void> = []
+    let opens = 0
+    const host = createBrowserBrokerWorker({
+      sessions,
+      sweepIntervalMs: 0,
+      idleTeardownMs: 60_000,
+      createSource: () => () => {
+        opens += 1
+        return {
+          ready: Promise.resolve(),
+          closed: new Promise<void>((_resolve, reject) => failures.push(reject)),
+          close: async () => undefined,
+        }
+      },
+    })
+    const connect = connector(host)
+    const first = await createBrowserBrokerClient({
+      identity,
+      credentials,
+      connect,
+      heartbeatIntervalMs: 0,
+    })
+    const second = await createBrowserBrokerClient({
+      identity,
+      credentials,
+      connect,
+      heartbeatIntervalMs: 0,
+    })
+    await first.createSource(descriptor)(async () => undefined).ready
+    failures[0]!(new Error('upstream died'))
+    await vi.waitFor(() => expect(sessions.inspect().sessions[0]?.phase).toBe('error'))
+
+    const attached = second.createSource(descriptor)(async () => undefined)
+    await attached.ready
+
+    expect(opens).toBe(2)
+    await closeAll([first, second], [host], [sessions])
+  })
+
+  it('connects through a SharedWorker port with module type and the requested name', async () => {
+    const source = controlledSource()
+    const sessions = createSessionRegistry()
+    const host = createHost(source, { sessions, createSource: source.factory })
+    const constructed: Array<{ url: string | URL; options: WorkerOptions | undefined }> = []
+    class FakeSharedWorker {
+      readonly port: MessagePort
+      constructor(url: string | URL, options?: WorkerOptions) {
+        constructed.push({ url, options })
+        const channel = new MessageChannel()
+        host.connect(channel.port1)
+        this.port = channel.port2
+      }
+    }
+    vi.stubGlobal('SharedWorker', FakeSharedWorker)
+    try {
+      const client = await createBrowserBrokerClient({
+        identity,
+        credentials,
+        connect: createSharedWorkerConnector('/broker.js', { name: 'broker' }),
+        heartbeatIntervalMs: 0,
+        strict: true,
+      })
+
+      expect(constructed).toEqual([{ url: '/broker.js', options: { type: 'module', name: 'broker' } }])
+      expect(await client.stats()).toMatchObject({ tabCount: 1 })
+      await closeAll([client], [host], [sessions])
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('reports an unavailable SharedWorker instead of constructing one', () => {
+    vi.stubGlobal('SharedWorker', undefined)
+    try {
+      expect(() => createSharedWorkerConnector('/broker.js')()).toThrowError(
+        expect.objectContaining({ code: 'unavailable' })
+      )
+    } finally {
+      vi.unstubAllGlobals()
+    }
   })
 
   it('removes failed source attachments instead of retaining dead host references', async () => {

@@ -1,9 +1,11 @@
 import {
   createBrowserBrokerClient,
+  createSharedWorkerConnector,
   type BrowserBrokerClient,
   type BrowserBrokerStats,
 } from '@natsail/browser-broker'
 import type { SubscriptionLease } from '@natsail/core'
+import workerUrl from './nats-shared-worker.ts?sharedworker&url'
 
 interface DeliveryWaiter {
   resolve(value: string): void
@@ -53,11 +55,9 @@ void (async () => {
   client = await createBrowserBrokerClient({
     identity: { tenant: 'browser-acceptance', authenticationContext: 'anonymous-v1' },
     credentials: () => ({ revision: 1, bytes: new Uint8Array(0) }),
-    connect: () =>
-      new SharedWorker(new URL('./nats-shared-worker.ts', import.meta.url), {
-        name: 'natsail-browser-broker-acceptance',
-        type: 'module',
-      }).port,
+    connect: createSharedWorkerConnector(workerUrl, {
+      name: 'natsail-browser-broker-acceptance',
+    }),
     strict: true,
     heartbeatIntervalMs: 250,
     requestTimeoutMs: 2_000,
