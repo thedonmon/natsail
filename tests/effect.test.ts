@@ -872,14 +872,14 @@ describe('Effect adapter', () => {
 })
 
 describe('natsSchemaCodec', () => {
-  const codec = natsSchemaCodec(Schema.Struct({ id: Schema.Number, at: Schema.DateFromString }))
+  const codec = natsSchemaCodec(Schema.Struct({ id: Schema.BigInt, at: Schema.Date }))
 
   it('round-trips transformed values over a JSON wire format', () => {
-    const value = { id: 7, at: new Date('2026-10-02T10:00:00.000Z') }
+    const value = { id: 7n, at: new Date('2026-10-02T10:00:00.000Z') }
 
     const bytes = codec.encode(value)
 
-    expect(new TextDecoder().decode(bytes)).toBe('{"id":7,"at":"2026-10-02T10:00:00.000Z"}')
+    expect(new TextDecoder().decode(bytes)).toBe('{"id":"7","at":"2026-10-02T10:00:00.000Z"}')
     expect(codec.decode(bytes)).toEqual(value)
   })
 

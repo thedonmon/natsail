@@ -6,7 +6,7 @@ import type { NatsPayloadCodec } from '@natsail/core'
 export function natsSchemaCodec<S extends Schema.Codec<unknown, unknown>>(
   schema: S
 ): NatsPayloadCodec<S['Type']> {
-  const json = Schema.fromJsonString(schema)
+  const json = Schema.fromJsonString(Schema.toCodecJson(schema))
   const decode = Schema.decodeUnknownSync(json)
   const encode = Schema.encodeSync(json)
   const textEncoder = new TextEncoder()
