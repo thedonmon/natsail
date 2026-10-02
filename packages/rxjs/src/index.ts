@@ -41,6 +41,7 @@ function createPolicyBuffer<T>(
   let pendingItems = 0
   let pendingBytes = 0
   let timer: Subscription | undefined
+  let cancelled = false
 
   const cancelTimer = () => {
     timer?.unsubscribe()
@@ -63,7 +64,11 @@ function createPolicyBuffer<T>(
           throw new TypeError('NATSail batch sizeOf must return a finite non-negative number')
         }
         if (size > policy.maxBytes) throw new NatsailBatchItemTooLargeError(size, policy.maxBytes)
-        if (pendingItems > 0 && pendingBytes + size > policy.maxBytes) flush()
+        if (pendingItems > 0 && pendingBytes + size > policy.maxBytes) {
+          flush()
+          // A downstream operator may have unsubscribed during the flush.
+          if (cancelled) return
+        }
       }
       sink.store(value)
       pendingItems += 1
@@ -84,6 +89,7 @@ function createPolicyBuffer<T>(
     },
     flush,
     cancel: () => {
+      cancelled = true
       cancelTimer()
       pendingItems = 0
       pendingBytes = 0

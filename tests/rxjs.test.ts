@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { Subject } from 'rxjs'
+import { Subject, take } from 'rxjs'
 import { TestScheduler } from 'rxjs/testing'
 
 import {
@@ -118,6 +118,25 @@ describe('batchWithPolicy', () => {
       subscription.unsubscribe()
       expect(vi.getTimerCount()).toBe(0)
       expect(batches).toEqual([[1]])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('leaves no timer when a downstream take unsubscribes during an overflow flush', () => {
+    vi.useFakeTimers()
+    try {
+      const source = new Subject<string>()
+      const batches: (readonly string[])[] = []
+      source
+        .pipe(batchWithPolicy({ maxBytes: 4, maxWaitMs: 50, sizeOf }), take(1))
+        .subscribe((batch) => batches.push(batch))
+
+      source.next('aa')
+      source.next('BBB')
+
+      expect(batches).toEqual([['aa']])
+      expect(vi.getTimerCount()).toBe(0)
     } finally {
       vi.useRealTimers()
     }
