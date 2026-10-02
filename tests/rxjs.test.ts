@@ -86,9 +86,16 @@ describe('batchWithPolicy', () => {
       { x: ['aa'], y: ['BBB'] },
     ],
     ['time', { maxWaitMs: 3 }, 'a-b---c----', '---x-----y-', { x: ['a', 'b'], y: ['c'] }],
+    [
+      'count flush cancels its timer',
+      { maxItems: 3, maxWaitMs: 50 },
+      'a 9ms b 9ms c 19ms d',
+      '20ms x 69ms y',
+      { x: ['a', 'b', 'c'], y: ['d'] },
+    ],
     ['completion', { maxItems: 5 }, 'a-b-|', '----(x|)', { x: ['a', 'b'] }],
   ] as const)('flushes on %s in source order', (_reason, policy, source, expected, batches) => {
-    run(policy, source, expected, { a: 'a', b: 'b', c: 'c', A: 'aa', B: 'BBB' }, batches as never)
+    run(policy, source, expected, { a: 'a', b: 'b', c: 'c', d: 'd', A: 'aa', B: 'BBB' }, batches as never)
   })
 
   it('schedules nothing and emits nothing while idle', () => {

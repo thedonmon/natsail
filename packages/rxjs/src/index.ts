@@ -25,20 +25,20 @@ import type {
 } from '@natsail/session'
 
 interface PolicyBuffer<T> {
-  /** Throws on an invalid or oversized item without buffering it. */
+  /** Throws on an invalid or oversized item without storing it. */
   add(value: T): void
   flush(): void
-  /** Drops pending values and the timer. */
+  /** Drops the bookkeeping and timer; the caller drops its own storage. */
   cancel(): void
 }
 
-/** Count/byte/time bookkeeping shared by every RxJS batching entry point. */
+/** Count/byte/time bookkeeping shared by RxJS batching; the caller owns value storage. */
 function createPolicyBuffer<T>(
   policy: Readonly<NatsailBatchPolicy<T>>,
   scheduler: SchedulerLike,
-  emit: (batch: T[]) => void
+  sink: { store(value: T): void; emit(): void }
 ): PolicyBuffer<T> {
-  let pending: T[] = []
+  let pendingItems = 0
   let pendingBytes = 0
   let timer: Subscription | undefined
 
@@ -48,11 +48,10 @@ function createPolicyBuffer<T>(
   }
   const flush = () => {
     cancelTimer()
-    if (pending.length === 0) return
-    const batch = pending
-    pending = []
+    if (pendingItems === 0) return
+    pendingItems = 0
     pendingBytes = 0
-    emit(batch)
+    sink.emit()
   }
 
   return {
@@ -64,12 +63,13 @@ function createPolicyBuffer<T>(
           throw new TypeError('NATSail batch sizeOf must return a finite non-negative number')
         }
         if (size > policy.maxBytes) throw new NatsailBatchItemTooLargeError(size, policy.maxBytes)
-        if (pending.length > 0 && pendingBytes + size > policy.maxBytes) flush()
+        if (pendingItems > 0 && pendingBytes + size > policy.maxBytes) flush()
       }
-      pending.push(value)
+      sink.store(value)
+      pendingItems += 1
       pendingBytes += size
       if (
-        (policy.maxItems !== undefined && pending.length >= policy.maxItems) ||
+        (policy.maxItems !== undefined && pendingItems >= policy.maxItems) ||
         (policy.maxBytes !== undefined && pendingBytes >= policy.maxBytes)
       ) {
         flush()
@@ -85,7 +85,7 @@ function createPolicyBuffer<T>(
     flush,
     cancel: () => {
       cancelTimer()
-      pending = []
+      pendingItems = 0
       pendingBytes = 0
     },
   }
@@ -108,7 +108,15 @@ export function batchWithPolicy<T>(
 
   return (source) =>
     new Observable<readonly T[]>((subscriber) => {
-      const buffer = createPolicyBuffer(validated, scheduler, (batch) => subscriber.next(batch))
+      let pending: T[] = []
+      const buffer = createPolicyBuffer(validated, scheduler, {
+        store: (value) => pending.push(value),
+        emit: () => {
+          const batch = pending
+          pending = []
+          subscriber.next(batch)
+        },
+      })
       const subscription = source.subscribe({
         next: (value) => {
           try {
@@ -280,9 +288,11 @@ export function observeNatsJetStreamState<State>(
 
   return new Observable((subscriber) => {
     let seenLive = false
-    const buffer = createPolicyBuffer(policy, scheduler, (batch) =>
-      subscriber.next(batch[batch.length - 1]!)
-    )
+    let latest: JetStreamStateSnapshot<State> | undefined
+    const buffer = createPolicyBuffer(policy, scheduler, {
+      store: (value) => (latest = value),
+      emit: () => subscriber.next(latest!),
+    })
     const source = values.subscribe({
       next: (value) => {
         if (value.phase !== 'live') {
