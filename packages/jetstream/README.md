@@ -148,7 +148,7 @@ processJetStream(
 
 Add a safety net for deliveries that never reach the handler's last attempt, such as repeated ack-wait timeouts. Capture the server's max-deliveries advisory in a stream, with the subject `$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.<stream>.<consumer>`. Each advisory carries `stream_seq`, and `jsm.streams.getMessage(stream, { seq })` returns the original.
 
-Do not rely on the advisory alone for `term`. The server treats `term` like an acknowledgement, so on `WorkQueue` and `Interest` retention streams the original can be removed before a dead-letter worker fetches it. Limits and age can also remove it. The handler-side publish above is the reliable path. `tests/integration/jetstream-failure-handling.test.ts` runs the handler-side recipe against a real server.
+`term` does not raise the max-deliveries advisory. It raises `$JS.EVENT.ADVISORY.CONSUMER.MSG_TERMINATED.<stream>.<consumer>`, and the server treats it as an acknowledgement, so on `WorkQueue` and `Interest` streams the original can be gone before a dead-letter worker fetches it. Limits and age can also remove it. The handler-side publish above is the reliable path. `tests/integration/jetstream-failure-handling.test.ts` runs the handler-side recipe against a real server.
 
 ## Watching a KV bucket
 
@@ -181,7 +181,7 @@ const settings = defineReducingJetStreamSession(
 )
 ```
 
-`start: 'all'` yields the last value per key only for buckets with the default `history: 1`. Buckets with more history replay every revision, and the reducer keeps the last. Write with `@nats-io/kv` as usual. `tests/integration/jetstream-kv.test.ts` covers put, delete, and purge.
+`start: 'all'` yields the last value per key only for buckets with the default `history: 1`. Buckets with more history replay every revision, and the reducer keeps the last. This assumes the default codecs and stream name: a bucket opened with a key or value codec (such as `Base64KeyCodec()`), a custom `streamName`, or a mirror needs the same decoding and prefix here. Write with `@nats-io/kv` as usual. `tests/integration/jetstream-kv.test.ts` covers put, delete, and purge.
 
 ## License
 

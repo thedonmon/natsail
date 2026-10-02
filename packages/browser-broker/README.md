@@ -46,7 +46,7 @@ self.onconnect = (event) => broker.connect(event.ports[0]!)
 
 Defaults: `maxTabQueueItems` 256, `maxTabQueueBytes` 1 MiB, `maxRetainedItems` 1,024, `maxRetainedBytes` 4 MiB, `maxBatchItems` 64, `maxBatchBytes` 256 KiB, `idleTeardownMs` 0, `clientTimeoutMs` 30 s, `sweepIntervalMs` 10 s. The client defaults to a 10 s `heartbeatIntervalMs` and a 5 s `requestTimeoutMs`.
 
-`BrowserBrokerDelivery.data` is encoded bytes. A JetStream source should also supply its stream cursor. The broker retains a bounded source log and keeps at most one transferred batch in flight per tab. It copies each tab's batch into transferable `ArrayBuffer` values, then waits for an acknowledgement before sending another batch.
+`BrowserBrokerDelivery.data` is encoded bytes. A JetStream source should also supply its stream cursor. The broker retains a bounded source log and keeps at most one transferred batch in flight per tab subscription. It copies each tab's batch into transferable `ArrayBuffer` values, then waits for an acknowledgement before sending another batch.
 
 ## Tab client
 

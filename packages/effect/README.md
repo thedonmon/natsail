@@ -231,7 +231,7 @@ Interrupting a processor aborts the in-flight handler and closes the consumer. T
 
 `natsSchemaCodec(schema)`, imported from `@natsail/effect/schema`, returns a JSON `NatsPayloadCodec` backed by an Effect `Schema`, for both `codec` options and publishing. Schemas with `Schema.Date`, `BigInt` or classes encode through their JSON codec. A payload that fails the schema is terminal for the subscription; to skip bad messages, decode `natsCodecs.bytes` inside the Stream instead.
 
-Decode failures from JetStream surface as `NatsailJetStreamError` (`stage: 'source'` or `'processor'`) or, for shared sessions, `NatsailSessionError` (`stage: 'source'`), with a `JetStreamDecodeError` as the `cause`. Set the processor option `onDecodeFailure` to choose a disposition instead of stopping the processor.
+Decode failures from JetStream surface as `NatsailJetStreamError` (`stage: 'catch-up'` during the initial backlog, `'source'` after it, `'processor'` for processors) or, for shared sessions, `NatsailSessionError` (`stage: 'source'`), with a `JetStreamDecodeError` as the `cause`. Set the processor option `onDecodeFailure` to choose a disposition instead of stopping the processor.
 
 Invalid stream options (for example `bufferSize: 0`) surface as a defect when the Stream runs, the same way through the service and the free functions.
 

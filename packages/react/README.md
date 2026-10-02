@@ -22,7 +22,7 @@ Default managed cleanup uses `closeNatsResources({ runtime, sessions })` from `@
 </NatsManagedProvider>
 ```
 
-`useNatsJetStreamSubscription()` opens one registry-shared, checkpointed JetStream source. To select from a source, pass it to `useNatsSessionSelector()`.
+`useNatsJetStreamSubscription()` opens one registry-shared, checkpointed JetStream source. To select from a source, call `useNatsSessionSelector(key, createJetStreamSessionSource(runtime, options), selector)`.
 
 `useNatsJetStreamReducer()` accepts a validated reducing definition and returns its atomic replay/live snapshot. `useNatsJetStreamReducerSelector()` can schedule React notifications immediately, in a microtask, or on the next animation frame (the default for both reducer hooks, set with `notifications`). The underlying session still reduces every delivery serially; only rendering is coalesced.
 

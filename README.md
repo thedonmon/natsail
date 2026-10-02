@@ -369,9 +369,9 @@ The runtime accepts any official NATS connection factory. Browser applications c
 
 ## Development
 
-The workspace requires Node.js 22.14 or newer, pnpm, Docker, and Playwright browsers for local browser tests.
+The workspace requires Node.js 22.14 or newer, pnpm, Docker, Google Chrome, and Playwright's Firefox and WebKit builds (`pnpm exec playwright install firefox webkit`) for local browser tests.
 
-`pnpm lint` runs Oxlint on `packages/*/src`. `pnpm format` and `pnpm format:check` run Oxfmt on the same sources plus each `packages/*/CHANGELOG.md`. Tests, examples, documentation, tooling, and generated files are outside both checks, including when the tools run from the repository root. Formatting keeps the existing single quotes, no semicolons, and 100-column width; import sorting stays off.
+`pnpm lint` runs Oxlint on `packages/*/src`. `pnpm format` and `pnpm format:check` run Oxfmt on the same sources plus each `packages/*/CHANGELOG.md`. Tests, examples, other documentation, tooling, and generated files are outside both checks, including when the tools run from the repository root. Formatting keeps the existing single quotes, no semicolons, and 100-column width; import sorting stays off.
 
 CI rejects lint errors. Cyclomatic complexity above 20 and existing React lifecycle findings produce warnings while they await a separate behavior-tested cleanup. Run `pnpm lint:strict` to fail on those warnings too. The broker keeps collection snapshots around callbacks and awaits, so its client and worker disable `no-useless-spread`.
 
