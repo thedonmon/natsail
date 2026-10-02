@@ -2,7 +2,7 @@
 
 Research date: 2026-08-21. The repository pins `@nats-io/jetstream`, `@nats-io/nats-core`, and `@nats-io/transport-node` 3.4.0.
 
-This document records the initial research. See the [main README](../../README.md#current-limits) for the implemented interface and current limitations.
+This document records the initial research. See the [project status](../STATUS.md) for the implemented interface and current limitations.
 
 ## Conclusion
 
@@ -30,7 +30,7 @@ The public module should be NATS-native and framework-neutral:
 - RxJS remains useful for local composition and fan-out but is not a core dependency or history store;
 - a later `SharedWorker` host can multiplex one runtime across real same-origin browser tabs.
 
-The session interface below remains the implementation primitive. The architecture proposal wraps it in `NatsStreamRuntime` so connection ownership, session scheduling, and total buffering are not repeated by every caller.
+The session interface below remains the implementation primitive. The [architecture overview](../architecture/overview.md) describes how `createNatsRuntime` and the session registry wrap it, so connection ownership, session sharing, and total buffering are not repeated by every caller.
 
 ## Findings from NATS and nats.js
 
@@ -109,9 +109,9 @@ For a NATS-to-WebSocket gateway, bounded NATS pulling is only half the solution.
 
 ### What is already aligned
 
-- [`NatsContext.tsx`](../../src/app/contexts/NatsContext.tsx) enables built-in reconnect indefinitely, monitors connection status, uses a token authenticator backed by a mutable token ref, and separately retries failed initial connections. That is a sound connection owner for an incremental wrapper.
-- [`nats-rx.ts`](../../src/lib/nats/nats-rx.ts) already offers `{ ordered: true }`, drains `ConsumerMessages.status()`, and uses the current nats.js consumer API.
-- [`event-stream.ts`](../../src/lib/caspian-v2/services/event-stream.ts) and [`use-conversation-tail.ts`](../../src/hooks/caspian-v2/use-conversation-tail.ts) already use ordered consumers for canonical Caspian events. Core NATS token deltas remain explicitly ephemeral/display-only, while the canonical final event comes through JetStream; that separation is sensible.
+- `NatsContext.tsx` (in the source application) enables built-in reconnect indefinitely, monitors connection status, uses a token authenticator backed by a mutable token ref, and separately retries failed initial connections. That is a sound connection owner for an incremental wrapper.
+- `nats-rx.ts` (in the source application) already offers `{ ordered: true }`, drains `ConsumerMessages.status()`, and uses the current nats.js consumer API.
+- `event-stream.ts` (in the source application) and `use-conversation-tail.ts` (in the source application) already use ordered consumers for canonical Caspian events. Core NATS token deltas remain explicitly ephemeral/display-only, while the canonical final event comes through JetStream; that separation is sensible.
 - `shareReplay({ refCount: true })` fans a single ordered consumer out inside the application rather than attempting concurrent reads from one ordered consumer, which nats.js forbids.
 
 ### Gaps and corrections
@@ -128,7 +128,7 @@ For a NATS-to-WebSocket gateway, bounded NATS pulling is only half the solution.
 
 6. **Observable caching is not cursor-aware.** `CaspianEventStreamService.activeStreams` is keyed only by organization/workspace, not connection identity, start/checkpoint, or initial delivery policy. The entry is not removed when `shareReplay` ref-count reaches zero. A migration should make session identity and teardown explicit before removing the existing watchdogs.
 
-7. **The legacy push-consumer service is a separate migration.** [`jetstream-service.ts`](../../src/lib/nats/jetstream-service.ts) manually creates deliver inboxes and Core subscriptions. Do not expand the new wrapper to preserve that low-level API. Keep it temporarily, migrate read/replay feeds to ordered pull consumers first, and use named durable pull consumers for processing workloads that require explicit acknowledgement.
+7. **The legacy push-consumer service is a separate migration.** `jetstream-service.ts` (in the source application) manually creates deliver inboxes and Core subscriptions. Do not expand the new wrapper to preserve that low-level API. Keep it temporarily, migrate read/replay feeds to ordered pull consumers first, and use named durable pull consumers for processing workloads that require explicit acknowledgement.
 
 ## Proposed session primitive: one start operation, one status stream, one close operation
 

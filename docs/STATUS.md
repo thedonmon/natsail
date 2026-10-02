@@ -58,7 +58,7 @@ The test suite uses NATS 2.14.4. Separate fixtures cover anonymous, token, user/
 - Stable Effect 4.0.0 Layers, bounded Streams, replay materialization, and processors
 - Effect Streams that stop cleanly on early termination or interruption and fail with a typed acquire error
 - Effect publish and request spans, plus a root span per processor delivery linked to the incoming W3C `traceparent`
-- Effect `Natsail.layer` and `Natsail.layerScoped` constructors (replacing `makeNatsailLayer` and `makeNatsailScopedLayer`), ManagedRuntime-based example wiring, and a Schema-backed JSON payload codec that supports non-JSON schemas such as dates, bigints and classes
+- Effect `Natsail.layer` and `Natsail.layerScoped` constructors, ManagedRuntime-based example wiring, and a Schema-backed JSON payload codec that supports non-JSON schemas such as dates, bigints and classes
 - RxJS `batchWithPolicy` operator on the shared count, bytes, and time batch policy
 - One logical session shared by Effect, React, and RxJS
 - One physical SessionSource shared across same-origin tabs with per-tab cursor acknowledgements

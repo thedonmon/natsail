@@ -49,11 +49,11 @@ When `NPM_RELEASES_ENABLED` is false or absent, the workflow creates only the ve
 The publish step requires all of these conditions:
 
 - The repository variable is `true`.
-- The workflow runs from `main` on a GitHub-hosted runner.
-- The workflow has `id-token: write` permission.
+- The workflow runs from `main` of `thedonmon/natsail` in GitHub Actions on a GitHub-hosted runner.
+- The workflow has `id-token: write` permission, so OIDC credentials are available.
 - Each package trusts `release.yml` on npm.
-- Each package repository URL is `git+https://github.com/thedonmon/natsail.git`.
-- The publisher rejects npm tokens and local publication attempts.
+- Each package repository URL is `git+https://github.com/thedonmon/natsail.git`. `pnpm release:check` enforces this before publication.
+- The publisher rejects `NPM_TOKEN` or `NODE_AUTH_TOKEN`, local runs, and runs without the Changesets action output file.
 
 If a publication stops after some packages succeed, do not change those versions. Correct the failure and rerun the same workflow attempt. The publisher skips versions that reached npm and can restore a missing tag during the rerun.
 
@@ -78,4 +78,4 @@ npm publish "$bootstrap_dir/natsail-<package>-0.0.0.tgz" --access public
 
 Do not run `pnpm release:publish` locally. That command intentionally accepts only the trusted GitHub Actions environment on `main`. After the bootstrap publication, configure the package's trusted publisher and security settings before merging the Changesets version pull request.
 
-Also add the package to the hand-maintained lists: `releasePackages` in `scripts/publish-packages.mjs`, `scripts/verify-package-tarballs.mjs`, the aliases in `vitest.config.ts`, and the paths in `tsconfig.tests.json`.
+Also add the package to the hand-maintained lists: `releasePackages` in `scripts/publish-packages.mjs`, `scripts/verify-package-tarballs.mjs`, the bundle budgets in `scripts/verify-consumer-bundles.mjs`, the aliases in `vitest.config.ts`, and the paths in `tsconfig.tests.json`.

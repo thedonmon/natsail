@@ -22,7 +22,7 @@ Read the [connection lifecycle upgrade notes](./UPGRADING-LIFECYCLE.md) when mov
 
 ```ts
 const runtime = createNatsRuntime({
-  connect: () => connect({ servers: process.env.NATS_URL }),
+  connect: () => connect({ servers: process.env.NATS_URL ?? 'nats://127.0.0.1:4222' }),
   shutdownTimeoutMs: 15_000,
   maxBufferedEvents: 256,
   limits: { maxJetStreamConsumers: 32, maxBufferedMessages: 1_024 },
