@@ -16,46 +16,13 @@ import {
   observeNatsJetStreamState,
   observeNatsRuntimeEvents,
   observeNatsRuntimeStatus,
-  observeNatsSession,
   observeNatsSessionEvents,
   observeNatsSessionValues,
 } from '@natsail/rxjs'
-import { createSessionRegistry, defineSession, type SessionSource } from '@natsail/session'
+import { createSessionRegistry, defineSession } from '@natsail/session'
 import type { JetStreamStateSnapshot } from '@natsail/jetstream'
 
-function controllableSource<T>(): {
-  source: SessionSource<T>
-  deliver(value: T): Promise<void>
-  fail(error: unknown): void
-  close: ReturnType<typeof vi.fn<() => Promise<void>>>
-  starts: ReturnType<typeof vi.fn<SessionSource<T>>>
-} {
-  let accept!: (value: T) => Promise<void>
-  let closeSession!: () => void
-  let failSession!: (error: unknown) => void
-  const closed = new Promise<void>((resolve, reject) => {
-    closeSession = resolve
-    failSession = reject
-  })
-  const close = vi.fn(async () => closeSession())
-  const lease: SubscriptionLease = {
-    ready: Promise.resolve(),
-    closed,
-    close,
-  }
-  const starts = vi.fn<SessionSource<T>>((next) => {
-    accept = next
-    return lease
-  })
-
-  return {
-    source: starts,
-    deliver: (value) => accept(value),
-    fail: (error) => failSession(error),
-    close,
-    starts,
-  }
-}
+import { controllableEvents, controllableSource } from './fixtures/fakes'
 
 describe('batchWithPolicy', () => {
   const sizeOf = (value: string) => value.length
@@ -612,55 +579,3 @@ describe('RxJS session adapter', () => {
   })
 })
 
-function controllableEvents(): {
-  iterable: AsyncIterable<NatsRuntimeEvent>
-  push(event: NatsRuntimeEvent): void
-  activeIterators(): number
-} {
-  const subscribers = new Set<{
-    queue: NatsRuntimeEvent[]
-    resume?: () => void
-    closed: boolean
-  }>()
-
-  return {
-    iterable: {
-      [Symbol.asyncIterator]() {
-        const subscriber: {
-          queue: NatsRuntimeEvent[]
-          resume?: () => void
-          closed: boolean
-        } = { queue: [], closed: false }
-        subscribers.add(subscriber)
-
-        return {
-          async next(): Promise<IteratorResult<NatsRuntimeEvent>> {
-            while (subscriber.queue.length === 0 && !subscriber.closed) {
-              await new Promise<void>((resolve) => {
-                subscriber.resume = resolve
-              })
-            }
-            if (subscriber.closed) {
-              return { done: true, value: undefined }
-            }
-            return { done: false, value: subscriber.queue.shift()! }
-          },
-          async return(): Promise<IteratorResult<NatsRuntimeEvent>> {
-            subscriber.closed = true
-            subscribers.delete(subscriber)
-            subscriber.resume?.()
-            return { done: true, value: undefined }
-          },
-        }
-      },
-    },
-    push(event) {
-      for (const subscriber of subscribers) {
-        subscriber.queue.push(event)
-        subscriber.resume?.()
-        delete subscriber.resume
-      }
-    },
-    activeIterators: () => subscribers.size,
-  }
-}

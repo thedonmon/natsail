@@ -26,34 +26,8 @@ import {
 } from '@natsail/session'
 import type { JetStreamStateSnapshot } from '@natsail/jetstream'
 
-import { emptyEvents } from './fixtures/fakes'
+import { controllableSource, emptyEvents } from './fixtures/fakes'
 
-function controllableSource<T>(): {
-  source: SessionSource<T>
-  deliver(value: T): Promise<void>
-  close: ReturnType<typeof vi.fn<() => Promise<void>>>
-} {
-  let accept!: (value: T) => Promise<void>
-  let closeSession!: () => void
-  const closed = new Promise<void>((resolve) => {
-    closeSession = resolve
-  })
-  const close = vi.fn(async () => closeSession())
-  const lease: SubscriptionLease = {
-    ready: Promise.resolve(),
-    closed,
-    close,
-  }
-
-  return {
-    source: (next) => {
-      accept = next
-      return lease
-    },
-    deliver: (value) => accept(value),
-    close,
-  }
-}
 
 function Probe<T>({
   label,

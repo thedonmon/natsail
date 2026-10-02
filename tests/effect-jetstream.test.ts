@@ -4,7 +4,7 @@ import { TestClock } from 'effect/testing'
 import { headers as natsHeaders, type MsgHdrs } from '@nats-io/nats-core'
 import { beforeEach, describe, expect, vi } from 'vitest'
 
-import type { NatsRuntime, NatsRuntimeEvent, SubscriptionLease } from '@natsail/core'
+import type { NatsRuntime, SubscriptionLease } from '@natsail/core'
 import {
   makeNatsail,
   materializeNatsJetStreamEvents,
@@ -23,6 +23,8 @@ import type {
 } from '@natsail/jetstream'
 import { createSessionRegistry } from '@natsail/session'
 
+import { runtimeStub } from './fixtures/fakes'
+
 const jetStreamMocks = vi.hoisted(() => ({
   createJetStreamSessionSource: vi.fn(),
   processJetStream: vi.fn(),
@@ -38,27 +40,6 @@ function deferred<T>() {
     reject = rejectPromise
   })
   return { promise, resolve, reject }
-}
-
-function emptyEvents<T>(): AsyncIterable<T> {
-  return {
-    async *[Symbol.asyncIterator]() {},
-  }
-}
-
-function runtimeStub(): NatsRuntime {
-  return {
-    events: emptyEvents<NatsRuntimeEvent>(),
-    connection: vi.fn(async () => ({}) as never),
-    reconnect: vi.fn(async () => ({}) as never),
-    publish: vi.fn(async () => undefined),
-    request: vi.fn(async () => undefined as never),
-    subscribe: vi.fn(() => {
-      throw new Error('Not implemented by this test runtime')
-    }),
-    inspect: vi.fn(() => ({}) as never),
-    close: vi.fn(async () => undefined),
-  } as unknown as NatsRuntime
 }
 
 function delivery(

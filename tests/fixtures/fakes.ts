@@ -1,11 +1,18 @@
 import type { ConsumerMessages } from '@nats-io/jetstream'
 import type { NatsConnection } from '@nats-io/nats-core'
 import {
+  createNatsailTelemetryReporter,
   createNatsRuntime,
+  NATS_RUNTIME_ADAPTER,
   type NatsailScheduledTask,
   type NatsailScheduler,
+  type NatsRuntime,
+  type NatsRuntimeEvent,
   type NatsRuntimeOptions,
+  type RuntimeResource,
+  type SubscriptionLease,
 } from '@natsail/core'
+import type { SessionSource } from '@natsail/session'
 import { vi } from 'vitest'
 
 export function emptyEvents<T = never>(): AsyncIterable<T> {
@@ -92,4 +99,96 @@ export function messageSource(
       await closeSignal
     },
   } as unknown as ConsumerMessages
+}
+
+/** A runtime double whose methods are inert unless a test overrides them. */
+export function runtimeStub(overrides: Partial<NatsRuntime> = {}): NatsRuntime {
+  return {
+    [NATS_RUNTIME_ADAPTER]: {
+      manage: <T extends RuntimeResource>(create: () => T) => create(),
+      reportDiagnostic: () => undefined,
+      telemetry: createNatsailTelemetryReporter(),
+    },
+    events: emptyEvents<NatsRuntimeEvent>(),
+    connection: vi.fn(async () => ({}) as never),
+    reconnect: vi.fn(async () => ({}) as never),
+    publish: vi.fn(async () => undefined),
+    request: vi.fn(async () => undefined as never),
+    subscribe: vi.fn(() => {
+      throw new Error('Not implemented by this test runtime')
+    }),
+    inspect: vi.fn(() => ({}) as never),
+    close: vi.fn(async () => undefined),
+    ...overrides,
+  } as unknown as NatsRuntime
+}
+
+/** A session source whose lease the test delivers to, finishes, fails or closes. */
+export function controllableSource<T>() {
+  let accept!: (value: T) => Promise<void>
+  let finish!: () => void
+  let fail!: (error: unknown) => void
+  const closed = new Promise<void>((resolve, reject) => {
+    finish = resolve
+    fail = reject
+  })
+  const close = vi.fn(async () => finish())
+  const lease: SubscriptionLease = { ready: Promise.resolve(), closed, close }
+  const starts = vi.fn<SessionSource<T>>((next) => {
+    accept = next
+    return lease
+  })
+  return { source: starts, starts, close, deliver: (value: T) => accept(value), finish, fail }
+}
+
+/** Multicast runtime events; every iterator sees every pushed event. */
+export function controllableEvents(): {
+  iterable: AsyncIterable<NatsRuntimeEvent>
+  push(event: NatsRuntimeEvent): void
+  activeIterators(): number
+} {
+  const subscribers = new Set<{
+    queue: NatsRuntimeEvent[]
+    resume?: () => void
+    closed: boolean
+  }>()
+
+  return {
+    iterable: {
+      [Symbol.asyncIterator]() {
+        const subscriber: {
+          queue: NatsRuntimeEvent[]
+          resume?: () => void
+          closed: boolean
+        } = { queue: [], closed: false }
+        subscribers.add(subscriber)
+
+        return {
+          async next(): Promise<IteratorResult<NatsRuntimeEvent>> {
+            while (subscriber.queue.length === 0 && !subscriber.closed) {
+              await new Promise<void>((resolve) => {
+                subscriber.resume = resolve
+              })
+            }
+            if (subscriber.closed) return { done: true, value: undefined }
+            return { done: false, value: subscriber.queue.shift()! }
+          },
+          async return(): Promise<IteratorResult<NatsRuntimeEvent>> {
+            subscriber.closed = true
+            subscribers.delete(subscriber)
+            subscriber.resume?.()
+            return { done: true, value: undefined }
+          },
+        }
+      },
+    },
+    push(event) {
+      for (const subscriber of subscribers) {
+        subscriber.queue.push(event)
+        subscriber.resume?.()
+        delete subscriber.resume
+      }
+    },
+    activeIterators: () => subscribers.size,
+  }
 }
