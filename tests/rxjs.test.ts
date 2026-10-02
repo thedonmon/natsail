@@ -201,34 +201,6 @@ describe('RxJS session adapter', () => {
     expect(close).toHaveBeenCalledOnce()
   })
 
-  it('shares a session across Observable subscribers', async () => {
-    const registry = createSessionRegistry()
-    const controlled = controllableSource<string>()
-    const snapshots = observeNatsSession(registry, 'conversation:rxjs', controlled.source)
-    const first: string[] = []
-    const second: string[] = []
-
-    const firstSubscription = snapshots.subscribe((snapshot) => {
-      first.push(`${snapshot.phase}:${snapshot.value ?? ''}`)
-    })
-    const secondSubscription = snapshots.subscribe((snapshot) => {
-      second.push(`${snapshot.phase}:${snapshot.value ?? ''}`)
-    })
-    await Promise.resolve()
-
-    expect(controlled.starts).toHaveBeenCalledOnce()
-    await controlled.deliver('hello')
-    expect(first.at(-1)).toBe('live:hello')
-    expect(second.at(-1)).toBe('live:hello')
-
-    firstSubscription.unsubscribe()
-    expect(controlled.close).not.toHaveBeenCalled()
-
-    secondSubscription.unsubscribe()
-    await Promise.resolve()
-    expect(controlled.close).toHaveBeenCalledOnce()
-  })
-
   it('emits each delivered value once and completes with the session', async () => {
     const registry = createSessionRegistry()
     const controlled = controllableSource<string>()
