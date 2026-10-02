@@ -791,4 +791,3 @@ describe('natsSchemaCodec', () => {
     expect(() => codec.decode(new TextEncoder().encode('{"id":"seven","at":"x"}'))).toThrow()
   })
 })
-

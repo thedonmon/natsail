@@ -578,4 +578,3 @@ describe('RxJS session adapter', () => {
     await vi.waitFor(() => expect(events.activeIterators()).toBe(0))
   })
 })
-
