@@ -13,7 +13,7 @@ import {
   Sink,
   Stream,
 } from 'effect'
-import type { Pull } from 'effect'
+import type { Pull, Scope } from 'effect'
 
 import type {
   CoreRequestOptions,
@@ -46,6 +46,7 @@ import {
   type JetStreamStateSnapshot,
   type StreamCursor,
 } from '@natsail/jetstream'
+import { closeNatsResources } from '@natsail/session'
 import type {
   SessionDefinition,
   SessionRegistry,
@@ -263,9 +264,16 @@ export interface NatsailService {
 }
 
 /** Context service supplied by a NATSail Effect Layer. */
-export class Natsail extends Context.Service<Natsail, NatsailService>()(
-  '@natsail/effect/Natsail'
-) {}
+export class Natsail extends Context.Service<Natsail, NatsailService>()('@natsail/effect/Natsail') {
+  /** Supplies an existing resource without taking ownership of it. */
+  static readonly layer = (resource: NatsailResource): Layer.Layer<Natsail> =>
+    makeNatsailLayer(resource)
+
+  /** Acquires a resource and closes it when the Layer scope exits. */
+  static readonly layerScoped = <E, R>(
+    acquire: Effect.Effect<NatsailResource, E, R>
+  ): Layer.Layer<Natsail, E, R> => makeNatsailScopedLayer(acquire)
+}
 
 type PushOptions =
   | { readonly bufferSize: 'unbounded' }
@@ -333,12 +341,28 @@ function sessionError(
 
 function tryRuntimePromise<A>(
   operation: NatsailOperation,
-  run: (signal: AbortSignal) => PromiseLike<A>
+  run: (signal: AbortSignal) => PromiseLike<A>,
+  messaging?: { readonly subject: string; readonly type: 'send' }
 ): Effect.Effect<A, NatsailOperationError> {
   return Effect.tryPromise({
     try: run,
     catch: (cause) => operationError(operation, cause),
-  })
+  }).pipe(
+    Effect.withSpan(
+      `Natsail.${operation}`,
+      messaging === undefined
+        ? {}
+        : {
+            kind: 'producer',
+            attributes: {
+              'messaging.system': 'nats',
+              'messaging.destination.name': messaging.subject,
+              'messaging.operation.type': messaging.type,
+            },
+          },
+      { captureStackTrace: false }
+    )
+  )
 }
 
 function resolveStreamOptions(options: NatsailSessionStreamOptions = {}): ResolvedStreamOptions {
@@ -436,70 +460,114 @@ function reportBufferOverflow(runtime: NatsRuntime, source: 'effect' | 'session'
   })
 }
 
+/** Stream.callback never surfaces a failed registration, so route it into the queue. */
+function callbackStream<A, E>(
+  register: (queue: Queue.Queue<A, E | Cause.Done>) => Effect.Effect<unknown, E, Scope.Scope>,
+  options?: {
+    readonly bufferSize?: number | undefined
+    readonly strategy?: 'sliding' | 'dropping' | 'suspend' | undefined
+  }
+): Stream.Stream<A, E> {
+  return Stream.callback<A, E>(
+    (queue) => register(queue).pipe(Effect.catch((error) => Queue.fail(queue, error))),
+    options
+  )
+}
+
+/** Fast path first; park only when full under `suspend`, and wake on abort or shutdown. */
+async function offerToQueue<A, E>(
+  queue: Queue.Queue<A, E | Cause.Done>,
+  value: A,
+  suspend: boolean,
+  signal: AbortSignal
+): Promise<boolean> {
+  if (Queue.offerUnsafe(queue, value)) return true
+  if (!suspend) return false
+  return Effect.runPromise(Queue.offer(queue, value), { signal }).catch(() => false)
+}
+
+/** Stops the producer before closing the lease so an in-flight handler cannot block close(). */
+function releaseLease<A, E>(
+  stop: AbortController,
+  lease: { close(): Promise<void> },
+  queue?: Queue.Enqueue<A, E>
+): Effect.Effect<void> {
+  return Effect.gen(function* () {
+    stop.abort()
+    if (queue !== undefined) yield* Queue.shutdown(queue)
+    yield* Effect.promise(() => lease.close().catch(() => undefined))
+  })
+}
+
 function createSubjectStream<T>(
   runtime: NatsRuntime,
   options: CoreSubscriptionOptions<T>,
   streamOptions?: NatsailSubjectStreamOptions
 ): Stream.Stream<T, NatsailSubjectStreamError> {
-  const resolved = resolveSubjectStreamOptions(streamOptions)
-  const streamName = `subject:${options.subject}`
+  return Stream.suspend(() => {
+    const resolved = resolveSubjectStreamOptions(streamOptions)
+    const streamName = `subject:${options.subject}`
 
-  return Stream.callback<T, NatsailSubjectStreamError>(
-    (queue) =>
-      Effect.gen(function* () {
-        const effectSignal = yield* Effect.abortSignal
-        const signal = options.signal
-          ? AbortSignal.any([options.signal, effectSignal])
-          : effectSignal
-        const subscriptionOptions = { ...options, signal }
-        const lease = yield* Effect.acquireRelease(
-          Effect.try({
-            try: () =>
-              runtime.subscribe(subscriptionOptions, async (value) => {
-                const accepted = await Effect.runPromise(Queue.offer(queue, value))
-                if (!accepted) reportBufferOverflow(runtime, 'effect')
+    return callbackStream<T, NatsailSubjectStreamError>(
+      (queue) =>
+        Effect.gen(function* () {
+          const stop = new AbortController()
+          const signal = options.signal
+            ? AbortSignal.any([options.signal, stop.signal])
+            : stop.signal
+          const lease = yield* Effect.acquireRelease(
+            Effect.try({
+              try: () =>
+                runtime.subscribe({ ...options, signal }, async (value) => {
+                  const accepted = await offerToQueue(
+                    queue,
+                    value,
+                    resolved.callbackStrategy === 'suspend',
+                    signal
+                  )
+                  if (
+                    accepted ||
+                    resolved.overflowStrategy === 'suspend' ||
+                    queue.state._tag !== 'Open'
+                  ) {
+                    return
+                  }
 
-                if (
-                  !accepted &&
-                  resolved.overflowStrategy === 'error' &&
-                  queue.state._tag === 'Open'
-                ) {
-                  const overflow = new NatsailStreamBufferOverflowError({
-                    stream: streamName,
-                    capacity: resolved.bufferSize,
-                    message: `NATSail subject ${options.subject} exceeded its ${resolved.bufferSize}-message Effect buffer`,
-                  })
-                  await Effect.runPromise(Queue.fail(queue, overflow))
-                  throw overflow
-                }
-              }),
-            catch: (cause) => subjectError(options, 'subscribe', cause),
-          }),
-          (active) => Effect.promise(() => active.close().catch(() => undefined))
-        )
+                  reportBufferOverflow(runtime, 'effect')
+                  if (resolved.overflowStrategy === 'error') {
+                    const overflow = new NatsailStreamBufferOverflowError({
+                      stream: streamName,
+                      capacity: resolved.bufferSize,
+                      message: `NATSail subject ${options.subject} exceeded its ${resolved.bufferSize}-message Effect buffer`,
+                    })
+                    await Effect.runPromise(Queue.fail(queue, overflow))
+                    throw overflow
+                  }
+                }),
+              catch: (cause) => subjectError(options, 'subscribe', cause),
+            }),
+            (active) => releaseLease(stop, active, queue)
+          )
 
-        yield* Effect.tryPromise({
-          try: () => lease.ready,
-          catch: (cause) => subjectError(options, 'ready', cause),
-        })
-        yield* Effect.tryPromise({
-          try: () => lease.closed,
-          catch: (cause) =>
-            cause instanceof NatsailStreamBufferOverflowError
-              ? cause
-              : subjectError(options, 'source', cause),
-        })
-      }).pipe(
-        Effect.matchEffect({
-          onFailure: (error) => Queue.fail(queue, error),
-          onSuccess: () => Queue.end(queue),
-        })
-      ),
-    {
-      bufferSize: resolved.bufferSize,
-      strategy: resolved.callbackStrategy,
-    }
-  )
+          yield* Effect.tryPromise({
+            try: () => lease.ready,
+            catch: (cause) => subjectError(options, 'ready', cause),
+          })
+          yield* Effect.tryPromise({
+            try: () => lease.closed,
+            catch: (cause) =>
+              cause instanceof NatsailStreamBufferOverflowError
+                ? cause
+                : subjectError(options, 'source', cause),
+          })
+          yield* Queue.end(queue)
+        }),
+      {
+        bufferSize: resolved.bufferSize,
+        strategy: resolved.callbackStrategy,
+      }
+    )
+  })
 }
 
 function createJetStreamEventStream<T>(
@@ -507,85 +575,93 @@ function createJetStreamEventStream<T>(
   options: JetStreamSessionSourceOptions<T>,
   streamOptions?: NatsailJetStreamStreamOptions
 ): Stream.Stream<NatsailJetStreamEvent<T>, NatsailJetStreamStreamError> {
-  const resolved = resolveJetStreamStreamOptions(streamOptions)
-  const streamName = `jetstream:${options.stream}`
+  return Stream.suspend(() => {
+    const resolved = resolveJetStreamStreamOptions(streamOptions)
+    const streamName = `jetstream:${options.stream}`
 
-  return Stream.callback<NatsailJetStreamEvent<T>, NatsailJetStreamStreamError>(
-    (queue) =>
-      Effect.gen(function* () {
-        const effectSignal = yield* Effect.abortSignal
-        const signal = options.signal
-          ? AbortSignal.any([options.signal, effectSignal])
-          : effectSignal
-        let resolveCatchUpMarker!: () => void
-        let rejectCatchUpMarker!: (cause: unknown) => void
-        const catchUpMarkerEnqueued = new Promise<void>((resolve, reject) => {
-          resolveCatchUpMarker = resolve
-          rejectCatchUpMarker = reject
-        })
-        void catchUpMarkerEnqueued.catch(() => undefined)
-        const offerEvent = async (event: NatsailJetStreamEvent<T>): Promise<void> => {
-          const accepted = await Effect.runPromise(Queue.offer(queue, event))
-          if (!accepted) reportBufferOverflow(runtime, 'effect')
+    return callbackStream<NatsailJetStreamEvent<T>, NatsailJetStreamStreamError>(
+      (queue) =>
+        Effect.gen(function* () {
+          const stop = new AbortController()
+          const signal = options.signal
+            ? AbortSignal.any([options.signal, stop.signal])
+            : stop.signal
+          let resolveCatchUpMarker!: () => void
+          let rejectCatchUpMarker!: (cause: unknown) => void
+          const catchUpMarkerEnqueued = new Promise<void>((resolve, reject) => {
+            resolveCatchUpMarker = resolve
+            rejectCatchUpMarker = reject
+          })
+          void catchUpMarkerEnqueued.catch(() => undefined)
+          // Throw on every unaccepted event so the resume checkpoint never passes an unseen one.
+          const offerEvent = async (event: NatsailJetStreamEvent<T>): Promise<void> => {
+            const accepted = await offerToQueue(
+              queue,
+              event,
+              resolved.callbackStrategy === 'suspend',
+              signal
+            )
+            if (accepted) return
 
-          if (!accepted && resolved.overflowStrategy === 'error' && queue.state._tag === 'Open') {
-            const overflow = new NatsailStreamBufferOverflowError({
-              stream: streamName,
-              capacity: resolved.bufferSize,
-              message: `NATSail JetStream ${options.stream} exceeded its ${resolved.bufferSize}-event Effect buffer`,
-            })
-            await Effect.runPromise(Queue.fail(queue, overflow))
-            throw overflow
+            if (resolved.overflowStrategy === 'error' && queue.state._tag === 'Open') {
+              reportBufferOverflow(runtime, 'effect')
+              const overflow = new NatsailStreamBufferOverflowError({
+                stream: streamName,
+                capacity: resolved.bufferSize,
+                message: `NATSail JetStream ${options.stream} exceeded its ${resolved.bufferSize}-event Effect buffer`,
+              })
+              await Effect.runPromise(Queue.fail(queue, overflow))
+              throw overflow
+            }
+            throw new Error(
+              `NATSail JetStream ${options.stream} Effect stream closed before accepting an event`
+            )
           }
-        }
-        const lease: JetStreamLease<T> = yield* Effect.acquireRelease(
-          Effect.try({
-            try: () => {
-              const source = createJetStreamSessionSource(runtime, { ...options, signal })
-              return source(async (delivery) => {
-                if (delivery.replay === 'live') await catchUpMarkerEnqueued
-                await offerEvent({ type: 'delivery', delivery })
-              }) as JetStreamLease<T>
-            },
-            catch: (cause) => jetStreamError(options, 'subscribe', cause),
-          }),
-          (active) => Effect.promise(() => active.close().catch(() => undefined))
-        )
+          const lease: JetStreamLease<T> = yield* Effect.acquireRelease(
+            Effect.try({
+              try: () => {
+                const source = createJetStreamSessionSource(runtime, { ...options, signal })
+                return source(async (delivery) => {
+                  if (delivery.replay === 'live') await catchUpMarkerEnqueued
+                  await offerEvent({ type: 'delivery', delivery })
+                }) as JetStreamLease<T>
+              },
+              catch: (cause) => jetStreamError(options, 'subscribe', cause),
+            }),
+            (active) => releaseLease(stop, active, queue)
+          )
 
-        yield* Effect.tryPromise({
-          try: () => lease.ready,
-          catch: (cause) => jetStreamError(options, 'ready', cause),
-        })
-        const catchUpEvent = lease.caughtUp.then(async (catchUp) => {
-          await offerEvent({ type: 'caught-up', catchUp })
-          return catchUp
-        })
-        void catchUpEvent.then(resolveCatchUpMarker, rejectCatchUpMarker)
-        yield* Effect.tryPromise({
-          try: () => catchUpEvent,
-          catch: (cause) =>
-            cause instanceof NatsailStreamBufferOverflowError
-              ? cause
-              : jetStreamError(options, 'catch-up', cause),
-        })
-        yield* Effect.tryPromise({
-          try: () => lease.closed,
-          catch: (cause) =>
-            cause instanceof NatsailStreamBufferOverflowError
-              ? cause
-              : jetStreamError(options, 'source', cause),
-        })
-      }).pipe(
-        Effect.matchEffect({
-          onFailure: (error) => Queue.fail(queue, error),
-          onSuccess: () => Queue.end(queue),
-        })
-      ),
-    {
-      bufferSize: resolved.bufferSize,
-      strategy: resolved.callbackStrategy,
-    }
-  )
+          yield* Effect.tryPromise({
+            try: () => lease.ready,
+            catch: (cause) => jetStreamError(options, 'ready', cause),
+          })
+          const catchUpEvent = lease.caughtUp.then(async (catchUp) => {
+            await offerEvent({ type: 'caught-up', catchUp })
+            return catchUp
+          })
+          void catchUpEvent.then(resolveCatchUpMarker, rejectCatchUpMarker)
+          yield* Effect.tryPromise({
+            try: () => catchUpEvent,
+            catch: (cause) =>
+              cause instanceof NatsailStreamBufferOverflowError
+                ? cause
+                : jetStreamError(options, 'catch-up', cause),
+          })
+          yield* Effect.tryPromise({
+            try: () => lease.closed,
+            catch: (cause) =>
+              cause instanceof NatsailStreamBufferOverflowError
+                ? cause
+                : jetStreamError(options, 'source', cause),
+          })
+          yield* Queue.end(queue)
+        }),
+      {
+        bufferSize: resolved.bufferSize,
+        strategy: resolved.callbackStrategy,
+      }
+    )
+  })
 }
 
 function createJetStreamDeliveryStream<T>(
@@ -608,18 +684,17 @@ function materializeJetStreamEventStream<Value, State, E, R, SourceError, Source
   streamOptions: NatsailJetStreamMaterializeOptions<Value> = {},
   telemetry?: NatsailTelemetryReporter
 ): Stream.Stream<NatsailJetStreamMaterializedState<State>, SourceError | E, SourceContext | R> {
-  const configuredPolicy = streamOptions.batchPolicy
-  const batchPolicy = defineNatsailBatchPolicy<JetStreamDelivery<Value>>({
-    ...configuredPolicy,
-    maxItems: configuredPolicy?.maxItems ?? streamOptions.batchSize ?? 256,
-    maxWaitMs:
-      configuredPolicy?.maxWaitMs ??
-      Duration.toMillis(Duration.fromInputUnsafe(streamOptions.batchWithin ?? '16 millis')),
-  })
-  const batchSize = batchPolicy.maxItems!
-  const batchWithin = batchPolicy.maxWaitMs!
-
   return Stream.suspend(() => {
+    const configuredPolicy = streamOptions.batchPolicy
+    const batchPolicy = defineNatsailBatchPolicy<JetStreamDelivery<Value>>({
+      ...configuredPolicy,
+      maxItems: configuredPolicy?.maxItems ?? streamOptions.batchSize ?? 256,
+      maxWaitMs:
+        configuredPolicy?.maxWaitMs ??
+        Duration.toMillis(Duration.fromInputUnsafe(streamOptions.batchWithin ?? '16 millis')),
+    })
+    const batchSize = batchPolicy.maxItems!
+    const batchWithin = batchPolicy.maxWaitMs!
     const work =
       streamOptions.workBudget === undefined
         ? undefined
@@ -759,17 +834,19 @@ function createJetStreamMaterializedStream<Value, State, E, R>(
   materializer: NatsailJetStreamMaterializer<Value, State, E, R>,
   streamOptions: NatsailJetStreamMaterializeOptions<Value> = {}
 ): Stream.Stream<NatsailJetStreamMaterializedState<State>, NatsailJetStreamStreamError | E, R> {
-  if (options.resume) {
-    throw new TypeError(
-      'A JetStream materializer cannot resume an event cursor without restoring matching materialized state'
+  return Stream.suspend(() => {
+    if (options.resume) {
+      throw new TypeError(
+        'A JetStream materializer cannot resume an event cursor without restoring matching materialized state'
+      )
+    }
+    return materializeJetStreamEventStream(
+      createJetStreamEventStream(runtime, options, streamOptions),
+      materializer,
+      streamOptions,
+      runtime[NATS_RUNTIME_ADAPTER]?.telemetry
     )
-  }
-  return materializeJetStreamEventStream(
-    createJetStreamEventStream(runtime, options, streamOptions),
-    materializer,
-    streamOptions,
-    runtime[NATS_RUNTIME_ADAPTER]?.telemetry
-  )
+  })
 }
 
 function runJetStreamProcessorEffect<T, E, R>(
@@ -782,16 +859,34 @@ function runJetStreamProcessorEffect<T, E, R>(
   return Effect.scoped(
     Effect.gen(function* () {
       const context = yield* Effect.context<R>()
-      const effectSignal = yield* Effect.abortSignal
-      const signal = options.signal ? AbortSignal.any([options.signal, effectSignal]) : effectSignal
+      const stop = new AbortController()
+      const signal = options.signal ? AbortSignal.any([options.signal, stop.signal]) : stop.signal
       const processorOptions = { ...options, signal }
       const lease = yield* Effect.acquireRelease(
         Effect.try({
           try: () =>
             processJetStream(runtime, processorOptions, async (delivery, handling) => {
-              const exit = await Effect.runPromiseExitWith(context)(handler(delivery), {
-                signal: AbortSignal.any([signal, handling.signal]),
-              })
+              const exit = await Effect.runPromiseExitWith(context)(
+                handler(delivery).pipe(
+                  Effect.withSpan(
+                    `nats.process ${delivery.subject}`,
+                    {
+                      kind: 'consumer',
+                      attributes: {
+                        'messaging.system': 'nats',
+                        'messaging.destination.name': delivery.subject,
+                        'messaging.operation.type': 'process',
+                        'natsail.jetstream.stream': delivery.cursor.stream,
+                        'natsail.jetstream.sequence': delivery.cursor.sequence,
+                        'natsail.delivery.attempt': delivery.deliveryAttempt,
+                        'natsail.delivery.redelivered': delivery.redelivered,
+                      },
+                    },
+                    { captureStackTrace: false }
+                  )
+                ),
+                { signal: AbortSignal.any([signal, handling.signal]) }
+              )
               if (Exit.isFailure(exit)) {
                 const expected = Cause.findErrorOption(exit.cause)
                 if (Option.isSome(expected)) throw new JetStreamEffectFailure(expected.value)
@@ -801,7 +896,7 @@ function runJetStreamProcessorEffect<T, E, R>(
             }),
           catch: (cause) => jetStreamError(options, 'processor', cause),
         }),
-        (active) => Effect.promise(() => active.close().catch(() => undefined))
+        (active) => releaseLease(stop, active)
       )
 
       yield* Effect.tryPromise({
@@ -831,76 +926,78 @@ function createSessionSnapshotStream<T>(
   definition: SessionDefinition<T>,
   options?: NatsailSessionStreamOptions
 ): Stream.Stream<SessionSnapshot<T>, NatsailSessionStreamError> {
-  const resolved = resolveStreamOptions(options)
+  return Stream.suspend(() => {
+    const resolved = resolveStreamOptions(options)
 
-  return Stream.callback<SessionSnapshot<T>, NatsailSessionStreamError>(
-    (queue) =>
-      Effect.gen(function* () {
-        const handle = yield* Effect.acquireRelease(
-          Effect.try({
-            try: () => sessions.acquire(definition),
-            catch: (cause) => sessionError(definition.key, 'acquire', cause),
-          }),
-          (active) => Effect.promise(() => active.release())
-        )
-        let terminal = false
+    return callbackStream<SessionSnapshot<T>, NatsailSessionStreamError>(
+      (queue) =>
+        Effect.gen(function* () {
+          const handle = yield* Effect.acquireRelease(
+            Effect.try({
+              try: () => sessions.acquire(definition),
+              catch: (cause) => sessionError(definition.key, 'acquire', cause),
+            }),
+            (active) => Effect.promise(() => active.release())
+          )
+          let terminal = false
 
-        const emitSnapshot = () => {
-          if (terminal) return
-          const snapshot = handle.getSnapshot()
-          const accepted = Queue.offerUnsafe(queue, snapshot)
-          if (!accepted) reportBufferOverflow(runtime, 'session')
+          const emitSnapshot = () => {
+            if (terminal) return
+            const snapshot = handle.getSnapshot()
+            const accepted = Queue.offerUnsafe(queue, snapshot)
+            if (!accepted) reportBufferOverflow(runtime, 'session')
 
-          if (
-            !accepted &&
-            resolved.bufferSize !== 'unbounded' &&
-            resolved.overflowStrategy === 'error'
-          ) {
-            terminal = true
-            Queue.failCauseUnsafe(
-              queue,
-              Cause.fail(
-                new NatsailStreamBufferOverflowError({
-                  stream: `session:${definition.key}`,
-                  capacity: resolved.bufferSize,
-                  message: `NATSail session ${definition.key} exceeded its ${resolved.bufferSize}-snapshot Effect buffer`,
-                })
-              )
-            )
-            return
-          }
-
-          if (snapshot.phase === 'error') {
-            terminal = true
-            Queue.failCauseUnsafe(
-              queue,
-              Cause.fail(
-                sessionError(
-                  definition.key,
-                  'source',
-                  snapshot.error ?? new Error('The session source failed')
+            if (
+              !accepted &&
+              resolved.bufferSize !== 'unbounded' &&
+              resolved.overflowStrategy === 'error'
+            ) {
+              terminal = true
+              Queue.failCauseUnsafe(
+                queue,
+                Cause.fail(
+                  new NatsailStreamBufferOverflowError({
+                    stream: `session:${definition.key}`,
+                    capacity: resolved.bufferSize,
+                    message: `NATSail session ${definition.key} exceeded its ${resolved.bufferSize}-snapshot Effect buffer`,
+                  })
                 )
               )
-            )
-          } else if (snapshot.phase === 'closed') {
-            terminal = true
-            Queue.endUnsafe(queue)
-          }
-        }
+              return
+            }
 
-        yield* Effect.acquireRelease(
-          Effect.sync(() => handle.subscribe(emitSnapshot)),
-          (unsubscribe) => Effect.sync(unsubscribe)
-        )
-        emitSnapshot()
-      }),
-    resolved.callbackOptions.bufferSize === 'unbounded'
-      ? undefined
-      : {
-          bufferSize: resolved.callbackOptions.bufferSize,
-          strategy: resolved.callbackOptions.strategy,
-        }
-  )
+            if (snapshot.phase === 'error') {
+              terminal = true
+              Queue.failCauseUnsafe(
+                queue,
+                Cause.fail(
+                  sessionError(
+                    definition.key,
+                    'source',
+                    snapshot.error ?? new Error('The session source failed')
+                  )
+                )
+              )
+            } else if (snapshot.phase === 'closed') {
+              terminal = true
+              Queue.endUnsafe(queue)
+            }
+          }
+
+          yield* Effect.acquireRelease(
+            Effect.sync(() => handle.subscribe(emitSnapshot)),
+            (unsubscribe) => Effect.sync(unsubscribe)
+          )
+          emitSnapshot()
+        }),
+      resolved.callbackOptions.bufferSize === 'unbounded'
+        ? undefined
+        : {
+            bufferSize: resolved.callbackOptions.bufferSize,
+            strategy: resolved.callbackOptions.strategy,
+          }
+    )
+  })
 }
 
 function createSessionValueStream<T>(
@@ -1044,12 +1141,13 @@ function createJetStreamStateStream<State>(
   definition: SessionDefinition<JetStreamStateSnapshot<State>>,
   options: NatsailJetStreamStateOptions = {}
 ): Stream.Stream<JetStreamStateSnapshot<State>, NatsailSessionStreamError> {
-  const { liveBatchWithin = '16 millis', ...sessionOptions } = options
-  const liveBatchMs = resolveLiveBatchMs(liveBatchWithin)
-  return coalesceJetStreamStates(
-    createSessionValueStream(runtime, sessions, definition, sessionOptions),
-    liveBatchMs
-  )
+  return Stream.suspend(() => {
+    const { liveBatchWithin = '16 millis', ...sessionOptions } = options
+    return coalesceJetStreamStates(
+      createSessionValueStream(runtime, sessions, definition, sessionOptions),
+      resolveLiveBatchMs(liveBatchWithin)
+    )
+  })
 }
 
 /** Creates a service over application-owned runtime and registry objects. */
@@ -1075,13 +1173,19 @@ export function makeNatsail(resource: NatsailResource): NatsailService {
     connection: () => tryRuntimePromise('connection', () => runtime.connection()),
     reconnect: (options) => tryRuntimePromise('reconnect', () => runtime.reconnect(options)),
     publish: (subject, data, options) =>
-      tryRuntimePromise('publish', () => runtime.publish(subject, data, options)),
+      tryRuntimePromise('publish', () => runtime.publish(subject, data, options), {
+        subject,
+        type: 'send',
+      }),
     request: <T>(options: CoreRequestOptions<T>) =>
-      tryRuntimePromise('request', (effectSignal) =>
-        runtime.request({
-          ...options,
-          signal: options.signal ? AbortSignal.any([options.signal, effectSignal]) : effectSignal,
-        })
+      tryRuntimePromise(
+        'request',
+        (effectSignal) =>
+          runtime.request({
+            ...options,
+            signal: options.signal ? AbortSignal.any([options.signal, effectSignal]) : effectSignal,
+          }),
+        { subject: options.subject, type: 'send' }
       ),
     subscribe: (options, streamOptions) => createSubjectStream(runtime, options, streamOptions),
     jetStreamEvents: (options, streamOptions) =>
@@ -1184,34 +1288,13 @@ export function makeNatsailLayer(resource: NatsailResource): Layer.Layer<Natsail
   return Layer.succeed(Natsail, makeNatsail(resource))
 }
 
-async function closeResource(resource: NatsailResource): Promise<void> {
-  if (resource.close) {
-    await resource.close()
-    return
-  }
-
-  const failures: unknown[] = []
-  try {
-    await resource.sessions.close()
-  } catch (error) {
-    failures.push(error)
-  }
-  try {
-    await resource.runtime.close()
-  } catch (error) {
-    failures.push(error)
-  }
-
-  if (failures.length === 1) throw failures[0]
-  if (failures.length > 1) {
-    throw new AggregateError(failures, 'NATSail registry and runtime shutdown both failed')
-  }
+function closeResource(resource: NatsailResource): Promise<void> {
+  return resource.close ? resource.close() : closeNatsResources(resource)
 }
 
 /**
  * Acquires one Layer-owned resource and closes it when the Layer scope exits.
- * The default finalizer closes the registry first and always attempts to close
- * the runtime, even if registry shutdown fails.
+ * The default finalizer closes the registry and runtime together.
  */
 export function makeNatsailScopedLayer<E, R>(
   acquire: Effect.Effect<NatsailResource, E, R>

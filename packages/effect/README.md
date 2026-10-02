@@ -222,7 +222,13 @@ const request = Effect.gen(function* () {
 }).pipe(Effect.provide(NatsLive))
 ```
 
-An interrupted request aborts the underlying NATS request. `makeNatsailScopedLayer()` closes the session registry and runtime when the Layer scope exits. `makeNatsailLayer()` supplies application-owned objects without closing them.
+An interrupted request aborts the underlying NATS request. `Natsail.layerScoped()` (alias `makeNatsailScopedLayer()`) closes the session registry and runtime together when the Layer scope exits. `Natsail.layer()` (alias `makeNatsailLayer()`) supplies application-owned objects without closing them.
+
+`publish()` and `request()` run in `Natsail.publish` and `Natsail.request` spans, and each processor delivery runs in a `nats.process <subject>` span, all with OpenTelemetry messaging attributes. Interrupting a processor aborts the in-flight handler before the consumer closes.
+
+`natsSchemaCodec(schema)`, imported from `@natsail/effect/schema` so Schema stays out of the main bundle, returns a JSON `NatsPayloadCodec` backed by an Effect `Schema`, for both `codec` options and publishing. A payload that fails the schema is terminal for the subscription; to skip bad messages, decode `natsCodecs.bytes` inside the Stream instead.
+
+Invalid stream options (for example `bufferSize: 0`) surface as a defect when the Stream runs, the same way through the service and the free functions.
 
 ## Shared sessions
 
