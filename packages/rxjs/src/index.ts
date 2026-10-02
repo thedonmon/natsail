@@ -1,5 +1,5 @@
 import { asyncScheduler, distinctUntilChanged, filter, Observable } from 'rxjs'
-import type { SchedulerLike, Subscription } from 'rxjs'
+import type { OperatorFunction, SchedulerLike, Subscription } from 'rxjs'
 
 import type {
   CoreSubscriptionOptions,
@@ -8,7 +8,7 @@ import type {
   NatsRuntimeEvent,
   NatsRuntimeStatusEvent,
 } from '@natsail/core'
-import { defineNatsailBatchPolicy } from '@natsail/core'
+import { defineNatsailBatchPolicy, NatsailBatchItemTooLargeError } from '@natsail/core'
 import {
   createJetStreamSessionSource,
   type JetStreamDelivery,
@@ -23,6 +23,117 @@ import type {
   SessionSnapshot,
   SessionSource,
 } from '@natsail/session'
+
+interface PolicyBuffer<T> {
+  /** Throws on an invalid or oversized item without buffering it. */
+  add(value: T): void
+  flush(): void
+  /** Drops pending values and the timer. */
+  cancel(): void
+}
+
+/** Count/byte/time bookkeeping shared by every RxJS batching entry point. */
+function createPolicyBuffer<T>(
+  policy: Readonly<NatsailBatchPolicy<T>>,
+  scheduler: SchedulerLike,
+  emit: (batch: T[]) => void
+): PolicyBuffer<T> {
+  let pending: T[] = []
+  let pendingBytes = 0
+  let timer: Subscription | undefined
+
+  const cancelTimer = () => {
+    timer?.unsubscribe()
+    timer = undefined
+  }
+  const flush = () => {
+    cancelTimer()
+    if (pending.length === 0) return
+    const batch = pending
+    pending = []
+    pendingBytes = 0
+    emit(batch)
+  }
+
+  return {
+    add: (value) => {
+      let size = 0
+      if (policy.maxBytes !== undefined) {
+        size = policy.sizeOf!(value)
+        if (!Number.isFinite(size) || size < 0) {
+          throw new TypeError('NATSail batch sizeOf must return a finite non-negative number')
+        }
+        if (size > policy.maxBytes) throw new NatsailBatchItemTooLargeError(size, policy.maxBytes)
+        if (pending.length > 0 && pendingBytes + size > policy.maxBytes) flush()
+      }
+      pending.push(value)
+      pendingBytes += size
+      if (
+        (policy.maxItems !== undefined && pending.length >= policy.maxItems) ||
+        (policy.maxBytes !== undefined && pendingBytes >= policy.maxBytes)
+      ) {
+        flush()
+      } else if (timer === undefined && policy.maxWaitMs !== undefined) {
+        let ranSynchronously = false
+        const scheduled = scheduler.schedule(() => {
+          ranSynchronously = true
+          flush()
+        }, policy.maxWaitMs)
+        if (!ranSynchronously) timer = scheduled
+      }
+    },
+    flush,
+    cancel: () => {
+      cancelTimer()
+      pending = []
+      pendingBytes = 0
+    },
+  }
+}
+
+/**
+ * Collects source values into arrays bounded by a shared NATSail batch policy.
+ *
+ * The timer starts at the first value of a batch, so an idle subscription
+ * schedules nothing and never emits an empty array. Source `error` and
+ * `complete` flush the pending batch first. An invalid or oversized item errors
+ * the stream and drops the pending batch, as unsubscribe does. Order is preserved.
+ */
+export function batchWithPolicy<T>(
+  policy: NatsailBatchPolicy<T>,
+  options: { readonly scheduler?: SchedulerLike } = {}
+): OperatorFunction<T, readonly T[]> {
+  const validated = defineNatsailBatchPolicy(policy)
+  const scheduler = options.scheduler ?? asyncScheduler
+
+  return (source) =>
+    new Observable<readonly T[]>((subscriber) => {
+      const buffer = createPolicyBuffer(validated, scheduler, (batch) => subscriber.next(batch))
+      const subscription = source.subscribe({
+        next: (value) => {
+          try {
+            buffer.add(value)
+          } catch (error) {
+            buffer.cancel()
+            subscriber.error(error)
+          }
+        },
+        error: (error) => {
+          buffer.flush()
+          subscriber.error(error)
+        },
+        complete: () => {
+          buffer.flush()
+          subscriber.complete()
+        },
+      })
+
+      return () => {
+        buffer.cancel()
+        subscription.unsubscribe()
+      }
+    })
+}
 
 /** Converts registry lifecycle and reference-count diagnostics into a cancellable Observable. */
 export function observeNatsSessionEvents(
@@ -169,38 +280,13 @@ export function observeNatsJetStreamState<State>(
 
   return new Observable((subscriber) => {
     let seenLive = false
-    let pendingLive: JetStreamStateSnapshot<State> | undefined
-    let pendingCount = 0
-    let pendingBytes = 0
-    let scheduledFlush: Subscription | undefined
-
-    const flush = () => {
-      scheduledFlush = undefined
-      if (pendingLive === undefined) return
-      const value = pendingLive
-      pendingLive = undefined
-      pendingCount = 0
-      pendingBytes = 0
-      subscriber.next(value)
-    }
-    const cancelFlush = () => {
-      scheduledFlush?.unsubscribe()
-      scheduledFlush = undefined
-    }
-    const scheduleFlush = () => {
-      if (scheduledFlush !== undefined) return
-      let ranSynchronously = false
-      const scheduled = scheduler.schedule(() => {
-        ranSynchronously = true
-        flush()
-      }, policy.maxWaitMs ?? 0)
-      if (!ranSynchronously) scheduledFlush = scheduled
-    }
+    const buffer = createPolicyBuffer(policy, scheduler, (batch) =>
+      subscriber.next(batch[batch.length - 1]!)
+    )
     const source = values.subscribe({
       next: (value) => {
         if (value.phase !== 'live') {
-          cancelFlush()
-          flush()
+          buffer.flush()
           seenLive = false
           subscriber.next(value)
           return
@@ -210,62 +296,25 @@ export function observeNatsJetStreamState<State>(
           subscriber.next(value)
           return
         }
-
-        let size = 0
-        if (policy.maxBytes !== undefined) {
-          try {
-            size = policy.sizeOf!(value)
-          } catch (error) {
-            cancelFlush()
-            subscriber.error(error)
-            return
-          }
-          if (!Number.isFinite(size) || size < 0) {
-            cancelFlush()
-            subscriber.error(
-              new TypeError('NATSail batch sizeOf must return a finite non-negative number')
-            )
-            return
-          }
-          if (size > policy.maxBytes) {
-            cancelFlush()
-            subscriber.error(
-              new RangeError(`NATSail live state size ${size} exceeds maxBytes ${policy.maxBytes}`)
-            )
-            return
-          }
-          if (pendingLive !== undefined && pendingBytes + size > policy.maxBytes) flush()
-        }
-
-        pendingLive = value
-        pendingCount += 1
-        pendingBytes += size
-        const countReached = policy.maxItems !== undefined && pendingCount >= policy.maxItems
-        const bytesReached = policy.maxBytes !== undefined && pendingBytes >= policy.maxBytes
-        if (countReached || bytesReached) {
-          cancelFlush()
-          flush()
-        } else if (policy.maxWaitMs !== undefined) {
-          scheduleFlush()
+        try {
+          buffer.add(value)
+        } catch (error) {
+          buffer.cancel()
+          subscriber.error(error)
         }
       },
       error: (error) => {
-        cancelFlush()
-        pendingLive = undefined
-        pendingCount = 0
-        pendingBytes = 0
+        buffer.cancel()
         subscriber.error(error)
       },
       complete: () => {
-        cancelFlush()
-        flush()
+        buffer.flush()
         subscriber.complete()
       },
     })
 
     return () => {
-      cancelFlush()
-      pendingLive = undefined
+      buffer.cancel()
       source.unsubscribe()
     }
   })

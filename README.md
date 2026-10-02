@@ -135,7 +135,7 @@ React, RxJS, and Effect can attach to this definition without creating duplicate
 - [`@natsail/session`](packages/session/README.md) shares keyed logical sources and closes them after the last owner leaves.
 - [`@natsail/checkpoints`](packages/checkpoints/README.md) stores monotonic cursors in memory or IndexedDB.
 - [`@natsail/react`](packages/react/README.md) provides an ownership-safe provider, status hooks, selectors, reducers, and processor hooks.
-- [`@natsail/rxjs`](packages/rxjs/README.md) exposes cancellable Observables and frame-coalesced JetStream state.
+- [`@natsail/rxjs`](packages/rxjs/README.md) exposes cancellable Observables, frame-coalesced JetStream state, and a `batchWithPolicy()` operator for the shared batch policy.
 - [`@natsail/effect`](packages/effect/README.md) provides scoped Effect v4 Streams with bounded buffers and structured interruption.
 - [`@natsail/opentelemetry`](packages/opentelemetry/README.md) maps optional dependency-free measurements to OpenTelemetry metrics.
 - [`@natsail/browser-broker`](packages/browser-broker/README.md) shares bounded, cursor-aware `SessionSource` leases across same-origin tabs through a versioned SharedWorker protocol.

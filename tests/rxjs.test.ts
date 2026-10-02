@@ -1,7 +1,16 @@
 import { describe, expect, it, vi } from 'vitest'
+import { Subject } from 'rxjs'
+import { TestScheduler } from 'rxjs/testing'
 
-import type { NatsRuntime, NatsRuntimeEvent, SubscriptionLease } from '@natsail/core'
 import {
+  NatsailBatchItemTooLargeError,
+  type NatsailBatchPolicy,
+  type NatsRuntime,
+  type NatsRuntimeEvent,
+  type SubscriptionLease,
+} from '@natsail/core'
+import {
+  batchWithPolicy,
   observeNatsCoreSubscription,
   observeNatsJetStreamReducer,
   observeNatsJetStreamState,
@@ -47,6 +56,85 @@ function controllableSource<T>(): {
     starts,
   }
 }
+
+describe('batchWithPolicy', () => {
+  const sizeOf = (value: string) => value.length
+  const run = (
+    policy: NatsailBatchPolicy<string>,
+    source: string,
+    expected: string,
+    values: Record<string, string>,
+    batches: Record<string, string[]>,
+    error?: unknown
+  ) => {
+    const scheduler = new TestScheduler((actual, want) => expect(actual).toEqual(want))
+    scheduler.run(({ cold, expectObservable }) => {
+      expectObservable(
+        cold(source, values, error).pipe(batchWithPolicy(policy, { scheduler }))
+      ).toBe(expected, batches, error)
+    })
+  }
+
+  it.each([
+    ['count', { maxItems: 2 }, 'a-b-c---', '--x-----', { x: ['a', 'b'] }],
+    ['bytes', { maxBytes: 2, sizeOf }, 'a-b-c---', '--x-----', { x: ['a', 'b'] }],
+    [
+      'overflow before add',
+      { maxBytes: 4, maxWaitMs: 5, sizeOf },
+      'A-B------',
+      '--x----y-',
+      { x: ['aa'], y: ['BBB'] },
+    ],
+    ['time', { maxWaitMs: 3 }, 'a-b---c----', '---x-----y-', { x: ['a', 'b'], y: ['c'] }],
+    ['completion', { maxItems: 5 }, 'a-b-|', '----(x|)', { x: ['a', 'b'] }],
+  ] as const)('flushes on %s in source order', (_reason, policy, source, expected, batches) => {
+    run(policy, source, expected, { a: 'a', b: 'b', c: 'c', A: 'aa', B: 'BBB' }, batches as never)
+  })
+
+  it('schedules nothing and emits nothing while idle', () => {
+    vi.useFakeTimers()
+    try {
+      const source = new Subject<number>()
+      const batches: number[][] = []
+      const subscription = source
+        .pipe(batchWithPolicy({ maxWaitMs: 16 }))
+        .subscribe((batch) => batches.push([...batch]))
+
+      vi.advanceTimersByTime(1_000)
+      expect(vi.getTimerCount()).toBe(0)
+      source.next(1)
+      expect(vi.getTimerCount()).toBe(1)
+      vi.advanceTimersByTime(16)
+      expect(batches).toEqual([[1]])
+      expect(vi.getTimerCount()).toBe(0)
+      source.next(2)
+      subscription.unsubscribe()
+      expect(vi.getTimerCount()).toBe(0)
+      expect(batches).toEqual([[1]])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('errors on an oversized item without emitting the pending batch', () => {
+    run(
+      { maxBytes: 3, sizeOf },
+      'a-b-X',
+      '----#',
+      { a: 'a', b: 'b', X: 'XXXXX' },
+      {},
+      new NatsailBatchItemTooLargeError(5, 3)
+    )
+  })
+
+  it('flushes the pending batch before a source error', () => {
+    run({ maxItems: 5 }, 'a-b-#', '----(x#)', { a: 'a', b: 'b' }, { x: ['a', 'b'] }, new Error('boom'))
+  })
+
+  it('rejects an invalid policy at operator creation', () => {
+    expect(() => batchWithPolicy({})).toThrow('at least one bound')
+  })
+})
 
 describe('RxJS session adapter', () => {
   it('opens one registry-shared Core NATS subscription for multiple subscribers', async () => {
