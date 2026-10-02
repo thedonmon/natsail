@@ -361,12 +361,12 @@ The runtime accepts any official NATS connection factory. Browser applications c
 
 ## Documentation
 
+- [Architecture](docs/architecture/overview.md) explains the package layers, ownership boundaries, sessions, replay, and recovery.
 - [Delivery model and guarantees](docs/DELIVERY.md) explains Core delivery, JetStream replay, checkpoints, acknowledgements, duplicate policy, recovery, and resource limits.
 - [Project status and roadmap](docs/STATUS.md) lists the tested capabilities, current limits, prototypes, and next proofs.
 - [Package guides](packages) document each public package and its full API surface.
-- [Examples guide](examples/README.md) explains the React, RxJS, Effect, AI transport, and Cloudflare examples.
+- [Examples guide](examples/README.md) explains the React, RxJS, Effect, AI transport, and gateway examples.
 - [Resumable-stream research](docs/research/nats-resumable-streams.md) records the problem analysis and source material.
-- [Resumable-stream architecture](docs/architecture/nats-resumable-streams-proposal.md) records the proposed protocol and tradeoffs.
 - [Release guide](docs/RELEASING.md) covers Changesets, trusted publishing, package checks, and provenance.
 
 ## Development
