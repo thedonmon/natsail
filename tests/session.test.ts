@@ -309,6 +309,24 @@ describe('session registry', () => {
     }
   )
 
+  it('keeps the error phase when ready resolves after the lease already failed', async () => {
+    const failure = new Error('source died during startup')
+    let ready!: () => void
+    const registry = createSessionRegistry()
+    const handle = registry.acquire('failed-before-ready', () => ({
+      ready: new Promise<void>((resolve) => (ready = resolve)),
+      closed: Promise.reject(failure),
+      close: async () => undefined,
+    }))
+    await vi.waitFor(() => expect(handle.getSnapshot().phase).toBe('error'))
+
+    ready()
+    await handle.ready
+
+    expect(handle.getSnapshot()).toMatchObject({ phase: 'error', error: failure })
+    await handle.release()
+  })
+
   it('recovers an errored session through restart and clears the error', async () => {
     const failure = new Error('source died')
     let failFirst!: (error: Error) => void
