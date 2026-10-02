@@ -65,13 +65,7 @@ import {
 } from './processor-admin.js'
 
 export {
-  classifyJetStreamProcessorDrift,
   createJetStreamProcessorController,
-  inspectJetStreamProcessorConsumerState,
-  jetStreamProcessorConsumerConfig,
-  normalizeJetStreamProcessorActive,
-  normalizeJetStreamProcessorDesired,
-  validateJetStreamProcessorAdminOptions,
   JetStreamProcessorConfigurationError,
   JetStreamProcessorReconciliationError,
   type JetStreamProcessorAdminOptions,
@@ -94,6 +88,8 @@ export {
 
 export type JetStreamStart = import('./processor-admin.js').JetStreamProcessorStart
 
+type MsgHdrs = NonNullable<JsMsg['headers']>
+
 export interface StreamCursor {
   stream: string
   epoch?: string
@@ -111,6 +107,8 @@ export interface JetStreamDelivery<T> {
   consumerPending: number
   /** Distinguishes the consumer's captured initial backlog from later live traffic. */
   replay: 'initial' | 'live'
+  /** Message headers, absent when the message has none. */
+  headers?: MsgHdrs
 }
 
 export interface JetStreamCatchUp {
@@ -297,6 +295,18 @@ export interface JetStreamProcessingDelivery<T> {
   cursor: StreamCursor
   redelivered: boolean
   deliveryAttempt: number
+  /** Message headers, absent when the message has none. */
+  headers?: MsgHdrs
+}
+
+export interface JetStreamProcessorDecodeFailure {
+  error: unknown
+  subject: string
+  cursor: StreamCursor
+  deliveryAttempt: number
+  /** The undecoded payload. */
+  data: Uint8Array
+  headers?: MsgHdrs
 }
 
 export interface JetStreamProcessorBaseOptions extends JetStreamProcessorAdminOptions {
@@ -307,6 +317,10 @@ export interface JetStreamProcessorBaseOptions extends JetStreamProcessorAdminOp
   progressIntervalMs?: number
   /** Reopens the named consumer after infrastructure failures. */
   recovery?: JetStreamProcessorRecoveryOptions
+  /** Decides what happens to an undecodable payload. Unset stops the processor. */
+  onDecodeFailure?: (
+    failure: JetStreamProcessorDecodeFailure
+  ) => JetStreamProcessorDisposition | Promise<JetStreamProcessorDisposition>
 }
 
 export type JetStreamProcessorOptions<T> = JetStreamProcessorBaseOptions &
@@ -849,6 +863,7 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
           redelivered: message.redelivered,
           consumerPending: message.info.pending,
           replay,
+          ...(message.headers ? { headers: message.headers } : {}),
         }
         const handlerStartedAt = this.telemetry.enabled ? this.telemetry.now() : 0
         const handleDelivery = async () => {
@@ -1231,19 +1246,7 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
         )
         let disposition: void | JetStreamProcessorDisposition
         try {
-          disposition = await this.handler(
-            {
-              value: decodeJetStreamPayload(this.options, message),
-              subject: message.subject,
-              cursor: {
-                stream: message.info.stream,
-                sequence: message.info.streamSequence,
-              },
-              redelivered: message.redelivered,
-              deliveryAttempt: message.info.deliveryCount,
-            },
-            { signal: this.cancellation.signal }
-          )
+          disposition = await this.dispatch(message)
           this.cancellation.signal.throwIfAborted()
           validateProcessorDisposition(disposition)
         } catch (error) {
@@ -1331,6 +1334,47 @@ class JetStreamProcessor<T> implements JetStreamProcessorLease {
         this.closedState.reject(failure)
       }
     }
+  }
+
+  private async dispatch(message: JsMsg): Promise<void | JetStreamProcessorDisposition> {
+    const cursor: StreamCursor = {
+      stream: message.info.stream,
+      sequence: message.info.streamSequence,
+    }
+    const headers = message.headers ? { headers: message.headers } : {}
+    let decoded: { value: T } | undefined
+    let decodeError: unknown
+    try {
+      decoded = { value: decodeJetStreamPayload(this.options, message) }
+    } catch (error) {
+      decodeError = error
+    }
+    if (decoded) {
+      return this.handler(
+        {
+          value: decoded.value,
+          subject: message.subject,
+          cursor,
+          redelivered: message.redelivered,
+          deliveryAttempt: message.info.deliveryCount,
+          ...headers,
+        },
+        { signal: this.cancellation.signal }
+      )
+    }
+    if (!this.options.onDecodeFailure) throw decodeError
+    const disposition = await this.options.onDecodeFailure({
+      error: decodeError,
+      subject: message.subject,
+      cursor,
+      deliveryAttempt: message.info.deliveryCount,
+      data: message.data,
+      ...headers,
+    })
+    if (disposition === undefined) {
+      throw new TypeError('JetStream onDecodeFailure must return retry or term')
+    }
+    return disposition
   }
 
   private resolveReady(): void {
