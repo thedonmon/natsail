@@ -1,5 +1,20 @@
 # @natsail/rxjs
 
+## 0.6.0
+
+### Minor Changes
+
+- 96d99cf: Add `batchWithPolicy(policy, { scheduler? })`, an RxJS operator that batches by the shared `NatsailBatchPolicy` (count, bytes, time). The timer starts at the first value of a batch, so idle subscriptions schedule nothing and never emit empty arrays. `observeNatsJetStreamState` now shares the same bookkeeping; Breaking: an oversized live state now errors with `NatsailBatchItemTooLargeError` instead of a `RangeError`. Migration: check `instanceof NatsailBatchItemTooLargeError` from `@natsail/core`.
+
+### Patch Changes
+
+- Updated dependencies [cb3e03c]
+- Updated dependencies [28984b3]
+- Updated dependencies [28984b3]
+  - @natsail/jetstream@0.7.0
+  - @natsail/core@0.6.0
+  - @natsail/session@0.5.1
+
 ## 0.5.2
 
 ### Patch Changes

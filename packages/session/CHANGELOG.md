@@ -1,5 +1,13 @@
 # @natsail/session
 
+## 0.5.1
+
+### Patch Changes
+
+- 28984b3: A session whose source closed or failed before it became ready now stays in the `closed` or `error` phase. Previously a late `ready` moved it back to `live`, hiding the failure from subscribers until the next restart.
+- Updated dependencies [28984b3]
+  - @natsail/core@0.6.0
+
 ## 0.5.0
 
 ### Minor Changes

@@ -1,5 +1,16 @@
 # @natsail/opentelemetry
 
+## 0.2.0
+
+### Minor Changes
+
+- cb3e03c: Adds `injectTraceContext(headers, context?)` and `extractTraceContext(headers, context?)` to carry W3C trace context in NATS message headers with the globally registered OpenTelemetry propagator.
+
+### Patch Changes
+
+- Updated dependencies [28984b3]
+  - @natsail/core@0.6.0
+
 ## 0.1.2
 
 ### Patch Changes
