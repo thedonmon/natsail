@@ -13,7 +13,6 @@ interface BrowserLoadResult {
 
 declare global {
   interface Window {
-    openNatsailBrowserConnection: () => Promise<number>
     runNatsailBrowserLoad: () => Promise<BrowserLoadResult>
   }
 }
@@ -110,23 +109,6 @@ window.runNatsailBrowserLoad = async () => {
 
       await runtime.close()
     }
-  }
-}
-
-window.openNatsailBrowserConnection = async () => {
-  let connectionRequests = 0
-  const runtime = createNatsRuntime({
-    connect: async () => {
-      connectionRequests += 1
-      return wsconnect({ servers: 'ws://127.0.0.1:9223', timeout: 2_000 })
-    },
-  })
-
-  try {
-    await runtime.connection()
-    return connectionRequests
-  } finally {
-    await runtime.close()
   }
 }
 

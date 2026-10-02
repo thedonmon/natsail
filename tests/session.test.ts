@@ -262,6 +262,94 @@ describe('session registry', () => {
     await second.release()
   })
 
+  it('moves to the error phase when startup fails and rejects ready', async () => {
+    const failure = new Error('source failed to start')
+    const registry = createSessionRegistry()
+    const handle = registry.acquire('startup-failure', () => ({
+      ready: Promise.reject(failure),
+      closed: new Promise<void>(() => undefined),
+      close: async () => undefined,
+    }))
+
+    await expect(handle.ready).rejects.toBe(failure)
+
+    expect(handle.getSnapshot()).toMatchObject({ phase: 'error', error: failure })
+    await handle.release()
+  })
+
+  it.each([
+    { mode: 'rejects', phase: 'error' },
+    { mode: 'resolves', phase: 'closed' },
+  ] as const)(
+    'ends in the $phase phase when a live lease closed promise $mode',
+    async ({ mode, phase }) => {
+      const failure = new Error('source died')
+      let settle!: { resolve(): void; reject(error: Error): void }
+      const closed = new Promise<void>((resolve, reject) => (settle = { resolve, reject }))
+      let accept!: (value: string) => Promise<void>
+      const registry = createSessionRegistry()
+      const handle = registry.acquire('live-failure', (next) => {
+        accept = next
+        return { ready: Promise.resolve(), closed, close: async () => undefined }
+      })
+      await handle.ready
+      await accept('before')
+
+      if (mode === 'rejects') settle.reject(failure)
+      else settle.resolve()
+      await vi.waitFor(() => expect(handle.getSnapshot().phase).toBe(phase))
+      await accept('ignored')
+
+      expect(handle.getSnapshot()).toMatchObject({
+        phase,
+        value: 'before',
+        ...(mode === 'rejects' ? { error: failure } : {}),
+      })
+      await handle.release()
+    }
+  )
+
+  it('keeps the error phase when ready resolves after the lease already failed', async () => {
+    const failure = new Error('source died during startup')
+    let ready!: () => void
+    const registry = createSessionRegistry()
+    const handle = registry.acquire('failed-before-ready', () => ({
+      ready: new Promise<void>((resolve) => (ready = resolve)),
+      closed: Promise.reject(failure),
+      close: async () => undefined,
+    }))
+    await vi.waitFor(() => expect(handle.getSnapshot().phase).toBe('error'))
+
+    ready()
+    await handle.ready
+
+    expect(handle.getSnapshot()).toMatchObject({ phase: 'error', error: failure })
+    await handle.release()
+  })
+
+  it('recovers an errored session through restart and clears the error', async () => {
+    const failure = new Error('source died')
+    let failFirst!: (error: Error) => void
+    const first = {
+      ready: Promise.resolve(),
+      closed: new Promise<void>((_resolve, reject) => (failFirst = reject)),
+      close: async () => undefined,
+    }
+    const leases = [first, controllableLease().lease]
+    let starts = 0
+    const registry = createSessionRegistry()
+    const handle = registry.acquire('error-restart', () => leases[starts++]!)
+    await handle.ready
+    failFirst(failure)
+    await vi.waitFor(() => expect(handle.getSnapshot().phase).toBe('error'))
+
+    await handle.restart()
+
+    expect(handle.getSnapshot().phase).toBe('live')
+    expect(handle.getSnapshot()).not.toHaveProperty('error')
+    await handle.release()
+  })
+
   it('rejects a validated key reused with different delivery semantics', async () => {
     const registry = createSessionRegistry()
     const firstSource = controllableLease()

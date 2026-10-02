@@ -33,7 +33,8 @@ describe('repository privacy', () => {
       }
     )
       .split('\0')
-      .filter(Boolean)
+      // Untracked nested git checkouts are listed as directories.
+      .filter((file) => file !== '' && !file.endsWith('/'))
     const violations: string[] = []
 
     for (const file of trackedFiles) {

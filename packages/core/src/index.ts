@@ -384,7 +384,7 @@ export function defineNatsailBatchPolicy<T>(
 }
 
 /** Validates and freezes one cooperative work budget. */
-export function defineNatsailWorkBudget(budget: NatsailWorkBudget): Readonly<NatsailWorkBudget> {
+function defineNatsailWorkBudget(budget: NatsailWorkBudget): Readonly<NatsailWorkBudget> {
   if (!Number.isFinite(budget.yieldAfterMs) || budget.yieldAfterMs <= 0) {
     throw new TypeError('NATSail work yieldAfterMs must be a positive finite number')
   }

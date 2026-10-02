@@ -2348,11 +2348,6 @@ export function defineReducingJetStreamSession<Value, State>(
   options: ReducingJetStreamSessionOptions<Value>,
   reducer: JetStreamStateReducer<Value, State>
 ): SessionDefinition<JetStreamStateSnapshot<State>> {
-  if (options.resume) {
-    throw new TypeError(
-      'A reducing JetStream session cannot resume an event cursor without restoring matching materialized state'
-    )
-  }
   const effectiveOptions = { ...options, recovery: options.recovery ?? {} }
   const resolvedBatchPolicy = reducingBatchPolicy(options)
   const batchContract = {

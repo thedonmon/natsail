@@ -1,9 +1,8 @@
-import type { Consumer, ConsumerMessages, JsMsg } from '@nats-io/jetstream'
-import type { NatsConnection } from '@nats-io/nats-core'
+import { DeliverPolicy, type Consumer, type JsMsg } from '@nats-io/jetstream'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createMemoryCheckpointStore, type CheckpointStore } from '@natsail/checkpoints'
-import { createNatsRuntime, natsCodecs } from '@natsail/core'
+import { natsCodecs } from '@natsail/core'
 import {
   createReducingJetStreamSessionSource,
   createJetStreamSessionSource,
@@ -15,6 +14,8 @@ import {
   type JetStreamDuplicateDeliveryPolicy,
   type JetStreamSubscriptionOptions,
 } from '@natsail/jetstream'
+
+import { fakeConnectionRuntime, messageSource } from './fixtures/fakes'
 
 const jetStreamMocks = vi.hoisted(() => ({
   getConsumer: vi.fn(),
@@ -41,33 +42,6 @@ function message(sequence: number, value: string, redelivered = false, pending =
   } as JsMsg
 }
 
-function messageSource(
-  deliveries: readonly JsMsg[],
-  closedError?: Error,
-  stayOpen = false
-): ConsumerMessages {
-  let closeRequested = false
-  let finish!: () => void
-  const closeSignal = new Promise<void>((resolve) => {
-    finish = resolve
-  })
-
-  return {
-    async *[Symbol.asyncIterator]() {
-      for (const delivery of deliveries) {
-        if (closeRequested) break
-        yield delivery
-      }
-      if (stayOpen && !closeRequested) await closeSignal
-    },
-    close: vi.fn(async () => {
-      closeRequested = true
-      finish()
-    }),
-    closed: vi.fn(async () => closedError),
-  } as unknown as ConsumerMessages
-}
-
 function createConsumer(deliveries: readonly JsMsg[], closedError?: Error, stayOpen = false) {
   const messages = messageSource(deliveries, closedError, stayOpen)
   const consumer = {
@@ -84,21 +58,6 @@ function arrangeConsumer(deliveries: readonly JsMsg[]) {
   return { consumer, messages }
 }
 
-function arrangeRuntime() {
-  let resolveClosed!: () => void
-  const closed = new Promise<void>((resolve) => {
-    resolveClosed = resolve
-  })
-  const connection = {
-    closed: () => closed,
-    drain: vi.fn(async () => resolveClosed()),
-    getServer: vi.fn(() => 'mock:4222'),
-    isClosed: vi.fn(() => false),
-    status: async function* () {},
-  } as unknown as NatsConnection
-  return createNatsRuntime({ connect: async () => connection })
-}
-
 function arrangeStore() {
   const save = vi.fn<CheckpointStore['save']>(async () => undefined)
   const store: CheckpointStore = {
@@ -113,7 +72,7 @@ function consumeWithPolicy(
   policy: JetStreamDuplicateDeliveryPolicy | undefined,
   handler: (delivery: JetStreamDelivery<string>) => void | Promise<void>
 ) {
-  const runtime = arrangeRuntime()
+  const runtime = fakeConnectionRuntime()
   const { save, store } = arrangeStore()
   const lease = consumeJetStream(
     runtime,
@@ -169,7 +128,7 @@ describe('JetStream duplicate-delivery policy', () => {
 
   it('marks the captured backlog and resolves caughtUp after its final accepted delivery', async () => {
     arrangeConsumer([message(1, 'one', false, 1), message(2, 'two')])
-    const runtime = arrangeRuntime()
+    const runtime = fakeConnectionRuntime()
     const deliveries: Array<JetStreamDelivery<string>> = []
     const lease = consumeJetStream(
       runtime,
@@ -197,7 +156,7 @@ describe('JetStream duplicate-delivery policy', () => {
 
   it('publishes one atomic reduced state after replay instead of every historical delivery', async () => {
     arrangeConsumer([message(1, 'one', false, 1), message(2, 'two')])
-    const runtime = arrangeRuntime()
+    const runtime = fakeConnectionRuntime()
     const snapshots: Array<{ phase: string; data: string[] }> = []
     const source = createReducingJetStreamSessionSource(
       runtime,
@@ -228,7 +187,7 @@ describe('JetStream duplicate-delivery policy', () => {
   })
 
   it('rejects an event cursor without matching materialized reducer state', () => {
-    const runtime = arrangeRuntime()
+    const runtime = fakeConnectionRuntime()
     expect(() =>
       createReducingJetStreamSessionSource(
         runtime,
@@ -249,7 +208,7 @@ describe('JetStream duplicate-delivery policy', () => {
   })
 
   it('requires a contract scope for custom recovery functions', () => {
-    const runtime = arrangeRuntime()
+    const runtime = fakeConnectionRuntime()
     expect(() =>
       defineJetStreamSession(runtime, 'events:custom-retry', {
         stream,
@@ -267,7 +226,7 @@ describe('JetStream duplicate-delivery policy', () => {
     jetStreamMocks.getConsumer
       .mockResolvedValueOnce(first.consumer)
       .mockResolvedValueOnce(second.consumer)
-    const runtime = arrangeRuntime()
+    const runtime = fakeConnectionRuntime()
     const values: string[] = []
     const source = createJetStreamSessionSource(runtime, {
       stream,
@@ -283,6 +242,10 @@ describe('JetStream duplicate-delivery policy', () => {
     await vi.waitFor(() => expect(jetStreamMocks.getConsumer).toHaveBeenCalledTimes(2))
     await vi.waitFor(() => expect(values).toEqual(['one', 'two']))
     expect(lease.inspect()).toMatchObject({ restarts: 1 })
+    expect(jetStreamMocks.getConsumer).toHaveBeenLastCalledWith(
+      stream,
+      expect.objectContaining({ deliver_policy: DeliverPolicy.StartSequence, opt_start_seq: 2 })
+    )
     await lease.close()
     await runtime.close()
   })
@@ -340,16 +303,15 @@ describe('JetStream duplicate-delivery policy', () => {
     await runtime.close()
   })
 
-  it('rejects a checkpoint created for another logical source', async () => {
-    arrangeConsumer([])
-    const runtime = arrangeRuntime()
+  it.each([
+    ['logical source', { scope: '["events.other"]:decoder-v1' }, 'checkpoint-scope-mismatch'],
+    ['stream', { stream: 'OTHER_STREAM' }, 'checkpoint-stream-mismatch'],
+    ['stream epoch (a recreated stream)', { epoch: 'recreated-epoch' }, 'checkpoint-epoch-mismatch'],
+  ] as const)('rejects a checkpoint created for another %s', async (_name, checkpoint, code) => {
+    const { consumer } = arrangeConsumer([])
+    const runtime = fakeConnectionRuntime()
     const store: CheckpointStore = {
-      load: async () => ({
-        stream,
-        epoch,
-        sequence: 2,
-        scope: '["events.other"]:decoder-v1',
-      }),
+      load: async () => ({ stream, epoch, sequence: 2, ...checkpoint }),
       save: async () => undefined,
       clear: async () => undefined,
     }
@@ -366,19 +328,20 @@ describe('JetStream duplicate-delivery policy', () => {
     )
 
     const expectedError = expect.objectContaining<Partial<JetStreamResumeError>>({
-      code: 'checkpoint-scope-mismatch',
+      code,
       checkpointSequence: 2,
     })
     await Promise.all([
       expect(lease.ready).rejects.toEqual(expectedError),
       expect(lease.closed).rejects.toEqual(expectedError),
     ])
+    expect(consumer.consume).not.toHaveBeenCalled()
     await runtime.close()
   })
 
   it('bounds pull buffers by bytes and reports the reserved capacity', async () => {
     const { consumer } = arrangeConsumer([])
-    const runtime = arrangeRuntime()
+    const runtime = fakeConnectionRuntime()
     const lease = consumeJetStream(
       runtime,
       {
@@ -409,7 +372,7 @@ describe('JetStream duplicate-delivery policy', () => {
   })
 
   it('rejects simultaneous message and byte buffer modes', () => {
-    const runtime = arrangeRuntime()
+    const runtime = fakeConnectionRuntime()
 
     expect(() =>
       consumeJetStream(
@@ -429,7 +392,7 @@ describe('JetStream duplicate-delivery policy', () => {
 
   it('adapts one JetStream consumer into a shareable session source', async () => {
     arrangeConsumer([message(1, 'one')])
-    const runtime = arrangeRuntime()
+    const runtime = fakeConnectionRuntime()
     const source = createJetStreamSessionSource(runtime, {
       stream,
       filter: 'events.>',

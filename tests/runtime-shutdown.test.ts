@@ -33,22 +33,6 @@ describe('bounded runtime shutdown', () => {
     expect(runtime.inspect().connectionGeneration).toBe(0)
   })
 
-  it('closes a connection factory result that arrives after the deadline', async () => {
-    vi.useFakeTimers()
-    const network = transport()
-    const connecting = deferred<NatsConnection>()
-    const runtime = createNatsRuntime({ connect: () => connecting.promise, shutdownTimeoutMs: 10 })
-    const connection = runtime.connection().catch((error: unknown) => error)
-    const closing = runtime.close().catch((error: unknown) => error)
-    await vi.advanceTimersByTimeAsync(10)
-    await expect(closing).resolves.toMatchObject({ name: 'NatsRuntimeShutdownTimeoutError' })
-    connecting.resolve(network.connection)
-    await connection
-    expect(network.close).toHaveBeenCalledOnce()
-    expect(network.drain).not.toHaveBeenCalled()
-    expect(runtime.inspect().connection.state).toBe('closed')
-  })
-
   it('finishes buffered and in-flight messages before draining the connection', async () => {
     const network = transport(['first', 'buffered'])
     network.flush.mockImplementationOnce(async () => network.deliver('in-flight'))

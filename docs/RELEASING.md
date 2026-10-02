@@ -1,34 +1,24 @@
 # Release NATSail packages
 
-NATSail uses Changesets for versions and changelogs. The release workflow publishes through npm trusted publishing. Version `0.1.0` was the one manual bootstrap release; version `0.2.0` proved the trusted workflow end to end.
+NATSail uses Changesets for versions and changelogs. The release workflow publishes through npm trusted publishing and does not use an npm token. npm creates provenance automatically for trusted publication from this public repository.
 
-The workflow does not use an npm token. npm creates provenance automatically for trusted publication from this public repository.
+## Trusted publisher settings
 
-NATSail used the manual bootstrap path for version `0.1.0`. Trusted publishing is active and produced the public `0.2.0` release with provenance.
+Each package has a GitHub Actions trusted publisher with these exact values:
 
-## Completed bootstrap
+- Organization or user: `thedonmon`
+- Repository: `natsail`
+- Workflow filename: `release.yml`
+- Environment name: leave blank
+- Allowed action: `npm publish`
 
-The following setup is complete. Keep this section as a record of the package ownership and trusted-publisher settings.
+Each package also requires two-factor authentication and disallows tokens. The GitHub repository variable `NPM_RELEASES_ENABLED` must be `true`:
 
-1. Create the npm organization named `natsail` while signed in as `0xdon0`. This organization owns the `@natsail` scope.
-2. Keep `0xdon0` as an organization owner for the first publication.
-3. Version `0.1.0` was published manually. It does not include provenance.
-4. Each package has a GitHub Actions trusted publisher with these exact values:
-   - Organization or user: `thedonmon`
-   - Repository: `natsail`
-   - Workflow filename: `release.yml`
-   - Environment name: leave blank
-   - Allowed action: `npm publish`
+```sh
+gh variable set NPM_RELEASES_ENABLED --body true --repo thedonmon/natsail
+```
 
-5. The GitHub repository variable `NPM_RELEASES_ENABLED` is `true`.
-
-   ```sh
-   gh variable set NPM_RELEASES_ENABLED --body true --repo thedonmon/natsail
-   ```
-
-6. Each npm package requires two-factor authentication and disallows tokens.
-
-Read the [npm trusted-publishing guide](https://docs.npmjs.com/trusted-publishers/) before you configure the package settings.
+Read the [npm trusted-publishing guide](https://docs.npmjs.com/trusted-publishers/) before you change the package settings.
 
 ## Routine release
 
@@ -36,8 +26,9 @@ Read the [npm trusted-publishing guide](https://docs.npmjs.com/trusted-publisher
 2. Select all affected packages and the correct semantic-version change.
 3. Describe the consumer-visible result and migration in the changeset.
 4. Merge the pull request after CI passes.
-5. Review the Changesets version pull request.
-6. Merge the version pull request after its package and changelog changes are correct.
+5. Review the Changesets version pull request. The release workflow creates it as a draft.
+6. Mark the draft version pull request ready for review. Until then CI does not run on it, because the bot-created pull request cannot start the workflow. The `ready_for_review` event starts a real CI run.
+7. Merge the version pull request after CI passes and its package and changelog changes are correct. The Resilience workflow does not listen for `ready_for_review`, so it can stay red on version pull requests.
 
 The release workflow builds and packs all nine packages. It installs every tarball together before publication.
 
@@ -53,7 +44,7 @@ Read the [Changesets guide](https://github.com/changesets/changesets/blob/main/d
 
 ## Safety gates
 
-`NPM_RELEASES_ENABLED` is false or absent during bootstrap. In this mode, the workflow creates only the version pull request.
+When `NPM_RELEASES_ENABLED` is false or absent, the workflow creates only the version pull request.
 
 The publish step requires all of these conditions:
 
@@ -74,18 +65,17 @@ A new package needs one manual bootstrap publication before npm exposes package 
 
 Keep a new package at `0.0.0` in its implementation pull request and add a minor Changeset. After merging the implementation, manually publish that `0.0.0` bootstrap from `main`, configure its trusted publisher, and then merge the version pull request. The version pull request produces `0.1.0`, which the routine OIDC workflow publishes with provenance.
 
-For the current `@natsail/browser-broker` and `@natsail/opentelemetry` additions, check out the merged `main` commit with a clean worktree, authenticate the npm CLI as an `@natsail` owner with two-factor authentication, and run:
+To publish the bootstrap, check out the merged `main` commit with a clean worktree, authenticate the npm CLI as an `@natsail` owner with two-factor authentication, and run:
 
 ```sh
 pnpm install --frozen-lockfile
 pnpm release:check
 
 bootstrap_dir=$(mktemp -d "${TMPDIR:-/tmp}/natsail-bootstrap.XXXXXX")
-pnpm --filter @natsail/browser-broker pack --pack-destination "$bootstrap_dir"
-pnpm --filter @natsail/opentelemetry pack --pack-destination "$bootstrap_dir"
-
-npm publish "$bootstrap_dir/natsail-browser-broker-0.0.0.tgz" --access public
-npm publish "$bootstrap_dir/natsail-opentelemetry-0.0.0.tgz" --access public
+pnpm --filter @natsail/<package> pack --pack-destination "$bootstrap_dir"
+npm publish "$bootstrap_dir/natsail-<package>-0.0.0.tgz" --access public
 ```
 
-Do not run `pnpm release:publish` locally. That command intentionally accepts only the trusted GitHub Actions environment on `main`. After both bootstrap publications, configure each package's trusted publisher and security settings before merging the Changesets version pull request.
+Do not run `pnpm release:publish` locally. That command intentionally accepts only the trusted GitHub Actions environment on `main`. After the bootstrap publication, configure the package's trusted publisher and security settings before merging the Changesets version pull request.
+
+Also add the package to the hand-maintained lists: `releasePackages` in `scripts/publish-packages.mjs`, `scripts/verify-package-tarballs.mjs`, the aliases in `vitest.config.ts`, and the paths in `tsconfig.tests.json`.

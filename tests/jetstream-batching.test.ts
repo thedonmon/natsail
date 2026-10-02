@@ -1,14 +1,15 @@
 import type { Consumer, ConsumerMessages, JsMsg } from '@nats-io/jetstream'
-import type { NatsConnection } from '@nats-io/nats-core'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { natsCodecs } from '@natsail/core'
 import {
-  createNatsRuntime,
-  natsCodecs,
-  type NatsailScheduledTask,
-  type NatsailScheduler,
-} from '@natsail/core'
-import { createReducingJetStreamSessionSource } from '@natsail/jetstream'
+  createReducingJetStreamSessionSource,
+  defineReducingJetStreamSession,
+  JetStreamCatchUpCancelledError,
+} from '@natsail/jetstream'
+import { createSessionRegistry, SessionContractMismatchError } from '@natsail/session'
+
+import { fakeConnectionRuntime, ManualScheduler } from './fixtures/fakes'
 
 const mocks = vi.hoisted(() => ({
   getConsumer: vi.fn(),
@@ -43,25 +44,6 @@ function deferred() {
   let resolve!: () => void
   const promise = new Promise<void>((done) => (resolve = done))
   return { promise, resolve }
-}
-
-class ManualScheduler implements NatsailScheduler {
-  time = 0
-  tasks: Array<{ at: number; cancelled: boolean; task: () => void }> = []
-  now = () => this.time
-  yield = async () => undefined
-  schedule(task: () => void, delayMs: number): NatsailScheduledTask {
-    const scheduled = { at: this.time + delayMs, cancelled: false, task }
-    this.tasks.push(scheduled)
-    return { cancel: () => (scheduled.cancelled = true) }
-  }
-  advance(ms: number): void {
-    this.time += ms
-    for (const scheduled of this.tasks.splice(0)) {
-      if (!scheduled.cancelled && scheduled.at <= this.time) scheduled.task()
-      else this.tasks.push(scheduled)
-    }
-  }
 }
 
 function controlledMessages() {
@@ -110,18 +92,6 @@ function controlledMessages() {
   }
 }
 
-function runtime() {
-  const closed = deferred()
-  const connection = {
-    closed: () => closed.promise,
-    drain: vi.fn(async () => closed.resolve()),
-    getServer: () => 'mock:4222',
-    isClosed: () => false,
-    status: async function* () {},
-  } as unknown as NatsConnection
-  return createNatsRuntime({ connect: async () => connection })
-}
-
 async function turn(): Promise<void> {
   for (let index = 0; index < 64; index += 1) await Promise.resolve()
 }
@@ -140,7 +110,7 @@ describe('reducing JetStream batch barriers', () => {
       info: async () => ({ num_pending: 0 }),
       delete: async () => true,
     } as unknown as Consumer)
-    const active = runtime()
+    const active = fakeConnectionRuntime()
     const firstApplication = deferred()
     const snapshots: number[][] = []
     const source = createReducingJetStreamSessionSource(
@@ -189,7 +159,7 @@ describe('reducing JetStream batch barriers', () => {
       info: async () => ({ num_pending: 0 }),
       delete: async () => true,
     } as unknown as Consumer)
-    const active = runtime()
+    const active = fakeConnectionRuntime()
     const snapshots: number[][] = []
     const source = createReducingJetStreamSessionSource(
       active,
@@ -230,7 +200,7 @@ describe('reducing JetStream batch barriers', () => {
       info: async () => ({ num_pending: 0 }),
       delete: async () => true,
     } as unknown as Consumer)
-    const active = runtime()
+    const active = fakeConnectionRuntime()
     const scheduler = new ManualScheduler()
     const firstApplication = deferred()
     const snapshots: number[][] = []
@@ -278,7 +248,7 @@ describe('reducing JetStream batch barriers', () => {
       info: async () => ({ num_pending: 0 }),
       delete: async () => true,
     } as unknown as Consumer)
-    const active = runtime()
+    const active = fakeConnectionRuntime()
     const scheduler = new ManualScheduler()
     const application = deferred()
     const snapshots: number[][] = []
@@ -328,7 +298,7 @@ describe('reducing JetStream batch barriers', () => {
       info: async () => ({ num_pending: 2 }),
       delete: async () => true,
     } as unknown as Consumer)
-    const active = runtime()
+    const active = fakeConnectionRuntime()
     const snapshots: number[][] = []
     const source = createReducingJetStreamSessionSource(
       active,
@@ -367,7 +337,7 @@ describe('reducing JetStream batch barriers', () => {
       delete: async () => true,
     } as unknown as Consumer)
     mocks.checkpointSave.mockRejectedValueOnce(new Error('checkpoint unavailable'))
-    const active = runtime()
+    const active = fakeConnectionRuntime()
     const reduced: number[] = []
     const snapshots: number[][] = []
     const source = createReducingJetStreamSessionSource(
@@ -417,7 +387,7 @@ describe('reducing JetStream batch barriers', () => {
         info: async () => ({ num_pending: 0 }),
         delete: async () => true,
       } as unknown as Consumer)
-    const active = runtime()
+    const active = fakeConnectionRuntime()
     const snapshots: number[][] = []
     const source = createReducingJetStreamSessionSource(
       active,
@@ -449,6 +419,101 @@ describe('reducing JetStream batch barriers', () => {
     await vi.waitFor(() => expect(snapshots.at(-1)).toEqual([1, 2]))
 
     await lease.close()
+    await active.close()
+  })
+})
+
+describe('defineReducingJetStreamSession', () => {
+  const reducer = {
+    scope: 'numbers:v1',
+    initial: () => [] as number[],
+    reduce: (state: number[], delivery: { value: string }) => [...state, Number(delivery.value)],
+  }
+  const streamOptions = {
+    stream: 'EVENTS',
+    filter: 'events.>',
+    start: 'all' as const,
+    codec: natsCodecs.text,
+  }
+
+  function arrangeConsumer(controlled: ReturnType<typeof controlledMessages>, pending = 0) {
+    mocks.getConsumer.mockReset().mockResolvedValue({
+      consume: async () => controlled.messages,
+      info: async () => ({ num_pending: pending }),
+      delete: async () => true,
+    } as unknown as Consumer)
+  }
+
+  it('shares one consumer and one reduced state across handles of the same definition', async () => {
+    const controlled = controlledMessages()
+    arrangeConsumer(controlled)
+    const active = fakeConnectionRuntime()
+    const registry = createSessionRegistry()
+    const definition = () => defineReducingJetStreamSession(active, 'numbers', streamOptions, reducer)
+    const first = registry.acquire(definition())
+    const second = registry.acquire(definition())
+    await first.ready
+
+    controlled.push(1)
+    controlled.push(2)
+
+    await vi.waitFor(() => expect(second.getSnapshot().value?.data).toEqual([1, 2]))
+    expect(first.getSnapshot().value?.data).toEqual([1, 2])
+    expect(mocks.getConsumer).toHaveBeenCalledOnce()
+    await first.release()
+    await second.release()
+    await registry.close()
+    await active.close()
+  })
+
+  it.each([
+    ['reducer scope', { ...reducer, scope: 'numbers:v2' }, streamOptions],
+    ['batch policy', reducer, { ...streamOptions, batchPolicy: { maxItems: 3 } }],
+  ])('rejects reusing one key with a different %s', async (_name, otherReducer, otherOptions) => {
+    const controlled = controlledMessages()
+    arrangeConsumer(controlled)
+    const active = fakeConnectionRuntime()
+    const registry = createSessionRegistry()
+    const first = registry.acquire(
+      defineReducingJetStreamSession(active, 'numbers', streamOptions, reducer)
+    )
+
+    expect(() =>
+      registry.acquire(defineReducingJetStreamSession(active, 'numbers', otherOptions, otherReducer))
+    ).toThrow(SessionContractMismatchError)
+
+    await first.release()
+    await registry.close()
+    await active.close()
+  })
+
+  it('refuses an event-cursor resume because reduced state is not persisted with it', () => {
+    const active = fakeConnectionRuntime()
+    const store = { load: vi.fn(), save: vi.fn(), clear: vi.fn() }
+
+    expect(() =>
+      defineReducingJetStreamSession(
+        active,
+        'numbers',
+        { ...streamOptions, resume: { key: 'numbers', store } } as never,
+        reducer
+      )
+    ).toThrow('cannot resume')
+  })
+
+  it('rejects caughtUp when the lease closes before replay catches up', async () => {
+    const controlled = controlledMessages()
+    arrangeConsumer(controlled, 5)
+    const active = fakeConnectionRuntime()
+    const lease = createReducingJetStreamSessionSource(active, streamOptions, reducer)(
+      async () => undefined
+    )
+    await vi.waitFor(() => expect(lease.inspect().phase).toBe('replaying'))
+
+    const caughtUp = expect(lease.caughtUp).rejects.toBeInstanceOf(JetStreamCatchUpCancelledError)
+    await lease.close()
+
+    await caughtUp
     await active.close()
   })
 })

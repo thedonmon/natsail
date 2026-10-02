@@ -471,22 +471,6 @@ export function useNatsJetStreamProcessor<T>(
   return active?.key === key ? active.snapshot : { phase: 'connecting', restarts: 0 }
 }
 
-/** Selects state from one registry-shared checkpointed JetStream session. */
-export function useNatsJetStreamSubscriptionSelector<T, Selected>(
-  key: string,
-  options: JetStreamSessionSourceOptions<T>,
-  selector: (snapshot: SessionSnapshot<JetStreamDelivery<T>>) => Selected,
-  isEqual?: (previous: Selected, next: Selected) => boolean
-): Selected {
-  const { runtime } = useRequiredContext()
-  return useNatsSessionSelector(
-    key,
-    createJetStreamSessionSource(runtime, options),
-    selector,
-    isEqual
-  )
-}
-
 /**
  * Folds every Core NATS delivery into one shared session snapshot.
  *

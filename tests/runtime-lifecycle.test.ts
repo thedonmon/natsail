@@ -231,6 +231,7 @@ it.each(['resolve', 'reject', 'cleanup-reject'] as const)(
     expect(await connecting).toBeInstanceOf(Error)
     await watching
     expect(network.close).toHaveBeenCalledTimes(mode === 'reject' ? 0 : 1)
+    expect(network.drain).not.toHaveBeenCalled()
     expect(events.some((event) => event.type === 'status' && event.state === 'connected')).toBe(
       false
     )

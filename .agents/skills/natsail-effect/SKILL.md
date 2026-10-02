@@ -21,10 +21,10 @@ Prefer a scoped Layer when Effect should own the runtime and registry:
 import { Effect, Stream } from 'effect'
 
 import { createNatsRuntime, natsCodecs } from '@natsail/core'
-import { makeNatsailScopedLayer, subscribe } from '@natsail/effect'
+import { Natsail, subscribe } from '@natsail/effect'
 import { createSessionRegistry } from '@natsail/session'
 
-const NatsLive = makeNatsailScopedLayer(
+const NatsLive = Natsail.layerScoped(
   Effect.sync(() => ({
     runtime: createNatsRuntime({ connect: connectToNats }),
     sessions: createSessionRegistry(),
@@ -32,7 +32,7 @@ const NatsLive = makeNatsailScopedLayer(
 )
 ```
 
-`makeNatsailScopedLayer()` closes the registry and runtime when its scope exits. `makeNatsailLayer()` wraps application-owned objects and does not close them. The `Natsail` service also exposes publish, request/reply, reconnect, runtime events/status, connection, and session diagnostics.
+`Natsail.layerScoped()` closes the registry and runtime when its scope exits. `Natsail.layer()` wraps application-owned objects and does not close them. The `Natsail` service also exposes publish, request/reply, reconnect, runtime events/status, connection, and session diagnostics.
 
 ## Choose a Stream or processor
 

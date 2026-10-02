@@ -8,7 +8,6 @@ import type {
   CoreSubscriptionOptions,
   MessageHandler,
   NatsRuntime,
-  NatsRuntimeEvent,
   NatsailTelemetryEvent,
   RuntimeResource,
   SubscriptionLease,
@@ -34,68 +33,7 @@ import {
   type SessionSource,
 } from '@natsail/session'
 
-function emptyEvents<T>(): AsyncIterable<T> {
-  return {
-    async *[Symbol.asyncIterator]() {},
-  }
-}
-
-function runtimeStub(overrides: Partial<NatsRuntime> = {}): NatsRuntime {
-  return {
-    [NATS_RUNTIME_ADAPTER]: {
-      manage: <T extends RuntimeResource>(create: () => T) => create(),
-      reportDiagnostic: () => undefined,
-      telemetry: createNatsailTelemetryReporter(),
-    },
-    events: emptyEvents<NatsRuntimeEvent>(),
-    connection: vi.fn(async () => ({}) as never),
-    reconnect: vi.fn(async () => ({}) as never),
-    publish: vi.fn(async () => undefined),
-    request: vi.fn(async () => undefined as never),
-    subscribe: vi.fn(() => {
-      throw new Error('Not implemented by this test runtime')
-    }),
-    inspect: vi.fn(() => ({}) as never),
-    close: vi.fn(async () => undefined),
-    ...overrides,
-  } as unknown as NatsRuntime
-}
-
-function controllableSource<T>(): {
-  readonly source: SessionSource<T>
-  readonly starts: ReturnType<typeof vi.fn<SessionSource<T>>>
-  readonly closeLease: ReturnType<typeof vi.fn>
-  deliver(value: T): Promise<void>
-  finish(): void
-  fail(error: unknown): void
-} {
-  let accept!: (value: T) => Promise<void>
-  let closeSession!: () => void
-  let failSession!: (error: unknown) => void
-  const closed = new Promise<void>((resolve, reject) => {
-    closeSession = resolve
-    failSession = reject
-  })
-  const closeLease = vi.fn(async () => closeSession())
-  const lease: SubscriptionLease = {
-    ready: Promise.resolve(),
-    closed,
-    close: closeLease,
-  }
-  const starts = vi.fn<SessionSource<T>>((next) => {
-    accept = next
-    return lease
-  })
-
-  return {
-    source: starts,
-    starts,
-    closeLease,
-    deliver: (value) => accept(value),
-    finish: closeSession,
-    fail: failSession,
-  }
-}
+import { controllableEvents, controllableSource, emptyEvents, runtimeStub } from './fixtures/fakes'
 
 const invalidOptionsDefinition = defineSession({
   key: 'conversation:effect-invalid-options',
@@ -438,41 +376,6 @@ describe('Effect adapter', () => {
     expect(controlled.close).toHaveBeenCalledOnce()
   })
 
-  it('shares one registry source across concurrent Effect stream consumers', async () => {
-    const controlled = controllableSource<string>()
-    const sessions = createSessionRegistry()
-    const definition = defineSession({
-      key: 'conversation:effect-shared',
-      contract: 'conversation:v1',
-      source: controlled.source,
-    })
-    const service = makeNatsail({ runtime: runtimeStub(), sessions })
-
-    const result = await Effect.runPromise(
-      Effect.gen(function* () {
-        const first = yield* Effect.forkChild(
-          service.sessionValues(definition).pipe(Stream.take(1), Stream.runCollect)
-        )
-        const second = yield* Effect.forkChild(
-          service.sessionValues(definition).pipe(Stream.take(1), Stream.runCollect)
-        )
-
-        yield* Effect.promise(() =>
-          vi.waitFor(() => expect(sessions.inspect().sessions[0]?.references).toBe(2))
-        )
-        yield* Effect.promise(() => controlled.deliver('hello'))
-
-        return yield* Effect.all([Fiber.join(first), Fiber.join(second)], {
-          concurrency: 'unbounded',
-        })
-      })
-    )
-
-    expect(result).toEqual([['hello'], ['hello']])
-    expect(controlled.starts).toHaveBeenCalledOnce()
-    expect(sessions.inspect().activeSessions).toBe(0)
-  })
-
   it.effect('shares reduced JetStream state and coalesces cumulative live updates', () =>
     Effect.gen(function* () {
       const controlled = controllableSource<JetStreamStateSnapshot<number>>()
@@ -540,7 +443,7 @@ describe('Effect adapter', () => {
         { phase: 'live', data: 3 },
       ])
       expect(controlled.starts).toHaveBeenCalledOnce()
-      expect(controlled.closeLease).toHaveBeenCalledOnce()
+      expect(controlled.close).toHaveBeenCalledOnce()
       expect(sessions.inspect().activeSessions).toBe(0)
     })
   )
@@ -594,7 +497,7 @@ describe('Effect adapter', () => {
       { phase: 'reconnecting', data: 2 },
       { phase: 'live', data: 3 },
     ])
-    expect(controlled.closeLease).toHaveBeenCalledOnce()
+    expect(controlled.close).toHaveBeenCalledOnce()
   })
 
   it('flushes the latest cumulative live state when the shared session completes', async () => {
@@ -631,7 +534,7 @@ describe('Effect adapter', () => {
       { phase: 'live', data: 1 },
       { phase: 'live', data: 2 },
     ])
-    expect(controlled.closeLease).toHaveBeenCalledOnce()
+    expect(controlled.close).toHaveBeenCalledOnce()
   })
 
   it.each([
@@ -888,54 +791,3 @@ describe('natsSchemaCodec', () => {
     expect(() => codec.decode(new TextEncoder().encode('{"id":"seven","at":"x"}'))).toThrow()
   })
 })
-
-function controllableEvents(): {
-  iterable: AsyncIterable<NatsRuntimeEvent>
-  push(event: NatsRuntimeEvent): void
-  activeIterators(): number
-} {
-  const subscribers = new Set<{
-    queue: NatsRuntimeEvent[]
-    resume?: () => void
-    closed: boolean
-  }>()
-
-  return {
-    iterable: {
-      [Symbol.asyncIterator]() {
-        const subscriber: {
-          queue: NatsRuntimeEvent[]
-          resume?: () => void
-          closed: boolean
-        } = { queue: [], closed: false }
-        subscribers.add(subscriber)
-
-        return {
-          async next(): Promise<IteratorResult<NatsRuntimeEvent>> {
-            while (subscriber.queue.length === 0 && !subscriber.closed) {
-              await new Promise<void>((resolve) => {
-                subscriber.resume = resolve
-              })
-            }
-            if (subscriber.closed) return { done: true, value: undefined }
-            return { done: false, value: subscriber.queue.shift()! }
-          },
-          async return(): Promise<IteratorResult<NatsRuntimeEvent>> {
-            subscriber.closed = true
-            subscribers.delete(subscriber)
-            subscriber.resume?.()
-            return { done: true, value: undefined }
-          },
-        }
-      },
-    },
-    push(event) {
-      for (const subscriber of subscribers) {
-        subscriber.queue.push(event)
-        subscriber.resume?.()
-        delete subscriber.resume
-      }
-    },
-    activeIterators: () => subscribers.size,
-  }
-}

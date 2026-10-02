@@ -11,7 +11,7 @@ NATSail manages application lifecycle around the official NATS clients. Choose t
 | NATS server             | Tests use 2.14.4, including a three-node JetStream cluster; older servers are not covered by this matrix                                                              |
 | React                   | Peer range 18 or 19; repository tests currently use 19                                                                                                                |
 | RxJS                    | Peer range 7; repository lockfile supplies the tested patch                                                                                                           |
-| Effect                  | Exactly `4.0.0-rc.112`, published under `next`; another release candidate requires separate validation                                                                |
+| Effect                  | Peer range `^4.0.0` (stable); tests lock 4.0.0, published under `latest`                                                                                              |
 | Browser broker          | CI exercises module SharedWorkers in Chromium, Firefox, and WebKit on Linux; mobile browsers, OS suspension, and browser-specific eviction require deployment testing |
 
 The package manifests are authoritative for installable dependency ranges. Package versions are independent. Do not upgrade an Effect peer separately from its adapter.

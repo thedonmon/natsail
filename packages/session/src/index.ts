@@ -305,6 +305,8 @@ class SharedSession<T> {
 
       await lease.ready
       if (generation !== this.generation || this.closeRequested) return
+      // A lease that already closed or failed stays terminal.
+      if (this.snapshot.phase === 'closed' || this.snapshot.phase === 'error') return
       this.update({
         ...this.snapshot,
         phase: 'live',

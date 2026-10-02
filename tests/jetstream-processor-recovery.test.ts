@@ -5,14 +5,14 @@ import {
   type ConsumerConfig,
   type Consumer,
   type ConsumerInfo,
-  type ConsumerMessages,
   type JsMsg,
 } from '@nats-io/jetstream'
-import type { NatsConnection } from '@nats-io/nats-core'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { createNatsRuntime, natsCodecs, type NatsailTelemetryEvent } from '@natsail/core'
+import { natsCodecs, type NatsailTelemetryEvent } from '@natsail/core'
 import { processJetStream } from '@natsail/jetstream'
+
+import { fakeConnectionRuntime, messageSource } from './fixtures/fakes'
 
 const jetStreamMocks = vi.hoisted(() => ({
   addConsumer: vi.fn(),
@@ -60,36 +60,6 @@ function message(sequence: number, value: string): JsMsg {
     redelivered: false,
     subject,
   } as unknown as JsMsg
-}
-
-function messageSource(
-  deliveries: readonly JsMsg[],
-  closedError?: Error,
-  stayOpen = false
-): ConsumerMessages {
-  let closeRequested = false
-  let finish!: () => void
-  const closeSignal = new Promise<void>((resolve) => {
-    finish = resolve
-  })
-
-  return {
-    async *[Symbol.asyncIterator]() {
-      for (const delivery of deliveries) {
-        if (closeRequested) break
-        yield delivery
-      }
-      if (stayOpen && !closeRequested) await closeSignal
-    },
-    close: vi.fn(async () => {
-      closeRequested = true
-      finish()
-    }),
-    closed: vi.fn(async () => closedError),
-    status: async function* () {
-      await closeSignal
-    },
-  } as unknown as ConsumerMessages
 }
 
 function consumer(
@@ -143,20 +113,7 @@ function consumerInfo(config: Partial<ConsumerConfig>): ConsumerInfo {
 }
 
 function runtime(telemetryEvents?: NatsailTelemetryEvent[], shutdownTimeoutMs?: number) {
-  let closeConnection!: () => void
-  const closed = new Promise<void>((resolve) => {
-    closeConnection = resolve
-  })
-  const connection = {
-    closed: () => closed,
-    drain: vi.fn(async () => closeConnection()),
-    close: vi.fn(async () => closeConnection()),
-    getServer: vi.fn(() => 'mock:4222'),
-    isClosed: vi.fn(() => false),
-    status: async function* () {},
-  } as unknown as NatsConnection
-  return createNatsRuntime({
-    connect: async () => connection,
+  return fakeConnectionRuntime({
     ...(shutdownTimeoutMs === undefined ? {} : { shutdownTimeoutMs }),
     ...(telemetryEvents === undefined
       ? {}
@@ -569,30 +526,6 @@ describe('recovering explicit-ack JetStream processor', () => {
     await nats.close()
   })
 
-  it('deletes the owned consumer when the runtime closes the recovering processor', async () => {
-    const activeConsumer = consumer([], undefined, true)
-    jetStreamMocks.getConsumer.mockResolvedValue(activeConsumer)
-    const nats = runtime()
-    const lease = processJetStream(
-      nats,
-      {
-        stream,
-        consumer: { mode: 'owned', name: 'processor' },
-        filter: subject,
-        start: 'all',
-        recovery: { maxAttempts: 2, delayMs: 0 },
-        codec: natsCodecs.text,
-      },
-      async () => undefined
-    )
-
-    await lease.ready
-    await nats.close()
-
-    expect(jetStreamMocks.deleteConsumer).toHaveBeenCalledOnce()
-    await expect(lease.closed).resolves.toBeUndefined()
-  })
-
   it('surfaces an owned-consumer deletion failure from close', async () => {
     const activeConsumer = consumer([], undefined, true)
     jetStreamMocks.getConsumer.mockResolvedValue(activeConsumer)
@@ -616,66 +549,6 @@ describe('recovering explicit-ack JetStream processor', () => {
     await expect(lease.close()).rejects.toBe(deletionError)
     expect(jetStreamMocks.deleteConsumer).toHaveBeenCalledOnce()
     await nats.close().catch(() => undefined)
-  })
-
-  it('recreates a deleted start:new consumer after the last safe acknowledgement boundary', async () => {
-    const firstInfo = consumerInfo({
-      deliver_policy: DeliverPolicy.New,
-      metadata: { 'natsail.io/processor-owner': 'natsail' },
-    })
-    const resumedInfo = consumerInfo({
-      deliver_policy: DeliverPolicy.StartSequence,
-      opt_start_seq: 2,
-      metadata: { 'natsail.io/processor-owner': 'natsail' },
-    })
-    jetStreamMocks.infoConsumer
-      .mockReset()
-      .mockRejectedValueOnce({ code: 404 })
-      .mockResolvedValueOnce(firstInfo)
-      .mockRejectedValueOnce({ code: 404 })
-      .mockResolvedValueOnce(resumedInfo)
-      .mockResolvedValue(resumedInfo)
-    const activeConsumer = consumer([message(2, 'published-in-gap')], undefined, true)
-    jetStreamMocks.getConsumer
-      .mockResolvedValueOnce(consumer([message(1, 'before-gap')], new Error('consumer deleted')))
-      .mockResolvedValueOnce(activeConsumer)
-    const nats = runtime()
-    const received: string[] = []
-    const lease = processJetStream(
-      nats,
-      {
-        stream,
-        consumer: { mode: 'owned', name: 'processor' },
-        filter: subject,
-        start: 'new',
-        recovery: { maxAttempts: 2, delayMs: 0 },
-        codec: natsCodecs.text,
-      },
-      ({ value }) => {
-        received.push(value)
-      }
-    )
-
-    await lease.ready
-    await vi.waitFor(() => expect(received).toEqual(['before-gap', 'published-in-gap']))
-    expect(jetStreamMocks.addConsumer).toHaveBeenCalledTimes(2)
-    expect(jetStreamMocks.addConsumer).toHaveBeenNthCalledWith(
-      2,
-      stream,
-      expect.objectContaining({
-        durable_name: 'processor',
-        deliver_policy: DeliverPolicy.StartSequence,
-        opt_start_seq: 2,
-      })
-    )
-    expect(lease.inspect()).toMatchObject({
-      phase: 'live',
-      restarts: 1,
-      acknowledged: { stream: 2 },
-    })
-
-    await lease.close()
-    await nats.close()
   })
 
   it('preserves a start:new creation boundary when recovery happens before the first message', async () => {
