@@ -34,6 +34,28 @@ Use the lower-level `decode(message)` option only when decoding depends on NATS 
 
 The runtime replaces a permanently closed connection by default. Set `connectionRecovery.onPermanentClose` to `wait` to defer replacement until the next caller.
 
+### Rotating credentials
+
+nats.js calls a function authenticator on every connect and reconnect, and the function must be synchronous. Refresh asynchronously into a variable that the authenticator reads. Then call `runtime.reconnect()` before the old credentials expire so the server never has to disconnect you:
+
+```ts
+let creds = await fetchCreds()
+const runtime = createNatsRuntime({
+  connect: async () => {
+    creds = await fetchCreds() // fresh credentials for every new connection
+    return connect({ servers, authenticator: credsAuthenticator(() => creds) })
+  },
+})
+
+// Your own timer: only the application knows when its token expires.
+async function rotate() {
+  creds = await fetchCreds()
+  await runtime.reconnect({ reason: 'rotation' })
+}
+```
+
+`tests/integration/authentication.test.ts` proves the authenticator runs again after `runtime.reconnect()`. For a browser broker, call `refreshCredentials()` on the client instead (see its README).
+
 Call `runtime.reconnect()` after an authenticator receives new credentials. A live connection starts a new handshake and calls the authenticator again. The promise resolves after the runtime observes the disconnect-to-connected cycle, so a subsequent publish does not race the offline socket.
 
 The reconnect can interrupt in-flight messages and requests. Normal NATS reconnect settings still apply.

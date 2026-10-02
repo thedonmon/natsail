@@ -8,7 +8,7 @@ pnpm add @natsail/core @natsail/checkpoints @natsail/session @natsail/jetstream
 
 `consumeJetStream()` uses an ordered consumer with `AckPolicy.None`. It saves the application checkpoint only after the handler succeeds. Its lease exposes `caughtUp`, `inspect()`, and lifecycle notifications. Every delivery includes the server pending count and a stable `replay: 'initial' | 'live'` classification based on the backlog captured when the consumer opens.
 
-`createJetStreamSessionSource()` adapts the consumer for one shared React and RxJS session. Set `recovery` to let the package replace a failed ordered consumer after its last successfully processed cursor. Permanent configuration, retention, decode, duplicate, and application-handler failures stay terminal by default.
+`createJetStreamSessionSource()` adapts the consumer for one shared React and RxJS session. Set `recovery` to let the package replace a failed ordered consumer after its last successfully processed cursor. Permanent configuration, retention, duplicate, and application-handler failures stay terminal by default. A decode error is not marked terminal; see [Decode failures](#decode-failures).
 
 Custom `recovery.delayMs` or `recovery.shouldRetry` functions require a stable `recovery.scope` when used in a validated definition. The scope prevents two callers from sharing a key while silently using different retry semantics.
 
@@ -98,3 +98,89 @@ Forced runtime shutdown preserves owned consumers and prevents late handler resu
 ## License
 
 Apache-2.0
+
+## Decode failures
+
+A payload that the `codec` or `decode` function rejects stops a processor by default, like a handler failure. With an unlimited `maxDeliver`, restarting it replays the same message and stalls again. Set `onDecodeFailure` to decide per message instead. It receives `{ error, subject, cursor, deliveryAttempt, data, headers }` and returns the same `retry` or `term` disposition as a handler:
+
+```ts
+processJetStream(runtime, {
+  stream: 'JOBS',
+  consumer: { mode: 'ensure', name: 'billing' },
+  filter: 'jobs.billing',
+  start: 'all',
+  codec: natsCodecs.json<BillingJob>(),
+  onDecodeFailure: ({ error, data, cursor }) => {
+    quarantine(cursor, data, error)
+    return { action: 'term', reason: 'malformed payload' }
+  },
+}, handle)
+```
+
+A throwing hook stops the processor. `consumeJetStream()` and reducing sessions have no disposition to return because ordered consumers do not acknowledge. A decode error there ends the lease with that error. With session `recovery` it counts as a retryable source failure unless it is a `TypeError`, so the replacement consumer meets the same message again. Decode defensively in a `decode` function that returns a tagged value, and let the handler or reducer skip the bad entry.
+
+## Delivery headers
+
+Every JetStream delivery, from `consumeJetStream()`, `processJetStream()`, and reducing sessions, carries `headers?: MsgHdrs`. It is absent when the message has no headers. Use `@natsail/opentelemetry` to continue a trace from `headers`.
+
+## Dead-letter recipe
+
+NATSail has no built-in dead-letter publisher. `term` discards the message, and publish-then-`term` is not atomic. Persist the failure first, then terminate:
+
+```ts
+const maxAttempts = 5
+
+processJetStream(
+  runtime,
+  { stream: 'JOBS', consumer: { mode: 'ensure', name: 'billing' }, filter: 'jobs.billing',
+    start: 'all', maxDeliver: maxAttempts, backoffMs: [1_000, 5_000, 30_000], codec },
+  async (delivery) => {
+    try {
+      await work(delivery.value)
+    } catch (error) {
+      if (delivery.deliveryAttempt < maxAttempts) return { action: 'retry', delayMs: 1_000 }
+      const hdrs = headers()
+      hdrs.set('x-original-sequence', String(delivery.cursor.sequence))
+      await js.publish('dlq.jobs.billing', codec.encode(delivery.value), { headers: hdrs })
+      return { action: 'term', reason: 'exhausted' }
+    }
+  }
+)
+```
+
+Add a safety net for deliveries that never reach the handler's last attempt, such as repeated ack-wait timeouts. Capture the server's max-deliveries advisory in a stream, with the subject `$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.<stream>.<consumer>`. Each advisory carries `stream_seq`, and `jsm.streams.getMessage(stream, { seq })` returns the original.
+
+Do not rely on the advisory alone for `term`. The server treats `term` like an acknowledgement, so on `WorkQueue` and `Interest` retention streams the original can be removed before a dead-letter worker fetches it. Limits and age can also remove it. The handler-side publish above is the reliable path. `tests/integration/jetstream-failure-handling.test.ts` runs both against a real server.
+
+## Watching a KV bucket
+
+A KV bucket is a stream named `KV_<bucket>` with subjects `$KV.<bucket>.<key>` and a `KV-Operation` header (`PUT`, `DEL`, or `PURGE`). A reducing session over that stream replays the current entries, goes live, and gives React, RxJS, and Effect the same shared map, with no extra package:
+
+```ts
+const settings = defineReducingJetStreamSession(
+  runtime,
+  'kv:settings',
+  {
+    stream: 'KV_settings',
+    filter: '$KV.settings.>',
+    start: 'all',
+    decode: (message): KvChange => ({
+      key: message.subject.slice('$KV.settings.'.length),
+      operation: message.headers?.get('KV-Operation') || 'PUT',
+      value: new TextDecoder().decode(message.data),
+    }),
+  },
+  {
+    scope: 'kv-map:v1',
+    initial: () => new Map<string, string>(),
+    reduce: (state, { value: change }) => {
+      const next = new Map(state)
+      if (change.operation === 'PUT') next.set(change.key, change.value)
+      else next.delete(change.key)
+      return next
+    },
+  }
+)
+```
+
+`start: 'all'` yields the last value per key only for buckets with the default `history: 1`. Buckets with more history replay every revision, and the reducer keeps the last. Write with `@nats-io/kv` as usual. `tests/integration/jetstream-kv.test.ts` covers put, delete, and purge.

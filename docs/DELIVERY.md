@@ -20,6 +20,8 @@ The consumer captures the initial pending count when it opens. Each delivery ide
 
 The `caughtUp` promise resolves after the consumer processes its captured replay. New messages can arrive during that replay without changing its boundary.
 
+Ordered deliveries carry `headers`. A decode error on an ordered consumer ends the lease; there is no per-message disposition because nothing is acknowledged. With session `recovery`, the replacement consumer meets the same message again, so decode defensively. A KV bucket can be watched with a reducing session over its `KV_<bucket>` stream; see the [KV recipe](../packages/jetstream/README.md#watching-a-kv-bucket).
+
 Ordered consumers use `AckPolicy.None`. Their saved application cursor is not a durable server acknowledgement.
 
 If a consumer has a resume configuration, NATSail saves its checkpoint after the handler succeeds. A failed handler does not advance the checkpoint.
@@ -35,6 +37,8 @@ Memory and IndexedDB stores reject sequence regressions. A stale writer cannot r
 `processJetStream()` uses a named pull consumer with `AckPolicy.Explicit`. It acknowledges a message after the handler succeeds.
 
 Handlers may explicitly return a delayed `retry` or a terminal `term` disposition instead of success. Thrown errors still stop the processor. Optional progress heartbeats cover active handlers, and confirmed acknowledgements wait for the server before advancing the local acknowledgement position. See the [production guide](./PRODUCTION.md) for tuning, cancellation, and idempotency requirements.
+
+An undecodable payload also stops the processor unless `onDecodeFailure` returns `retry` or `term` for it. Deliveries include `headers` when the message has any. `term` is not a dead-letter queue; see the [dead-letter recipe](../packages/jetstream/README.md#dead-letter-recipe) for persisting a failure first and for the max-deliveries advisory safety net. Do not rely on the advisory alone for `term` on `WorkQueue` or `Interest` streams, where the server can remove the original.
 
 A failed handler leaves the message unacknowledged for server redelivery. The application can configure acknowledgement wait/backoff, maximum deliveries, maximum pending acknowledgements, metadata, acknowledgement sampling, replicas, memory storage, replay policy, and start position.
 
@@ -85,6 +89,8 @@ Named explicit-ack processors can also use package-owned recovery. They resume f
 Configuration, decode, retention-gap, duplicate-policy, and application-handler failures remain terminal by default.
 
 Call `runtime.reconnect()` after an authenticator receives new credentials. The promise resolves after the runtime observes a new connected generation.
+
+For the full rotation pattern (refresh into a variable, synchronous authenticator, async connect factory), see [rotating credentials](../packages/core/README.md#rotating-credentials).
 
 A reconnect can interrupt in-flight messages and requests. The configured nats.js reconnect behavior still applies.
 
