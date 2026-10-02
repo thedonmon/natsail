@@ -56,8 +56,9 @@ The test suite uses NATS 2.14.4. Separate fixtures cover anonymous, token, user/
 - RxJS runtime, session, Core, and JetStream Observables
 - Frame-coalesced RxJS cumulative state
 - Stable Effect 4.0.0 Layers, bounded Streams, replay materialization, and processors
-- Effect Streams that stop cleanly on early termination or interruption, fail with a typed acquire error, and emit publish, request, and per-delivery spans
-- Effect `Natsail.layer` and `Natsail.layerScoped` constructors and a Schema-backed payload codec
+- Effect Streams that stop cleanly on early termination or interruption and fail with a typed acquire error
+- Effect publish and request spans, plus a root span per processor delivery linked to the incoming W3C `traceparent`
+- Effect `Natsail.layer` and `Natsail.layerScoped` constructors (replacing `makeNatsailLayer` and `makeNatsailScopedLayer`), ManagedRuntime-based example wiring, and a Schema-backed JSON payload codec that supports non-JSON schemas such as dates, bigints and classes
 - RxJS `batchWithPolicy` operator on the shared count, bytes, and time batch policy
 - One logical session shared by Effect, React, and RxJS
 - One physical SessionSource shared across same-origin tabs with per-tab cursor acknowledgements
@@ -115,7 +116,7 @@ Shared count/byte/time batching and cooperative work budgets are implemented in 
 
 ### Processor policy
 
-Named processors support progress heartbeats, optional confirmed acknowledgements, and explicit delayed-retry or terminal handler results. Thrown handler errors remain terminal. External side effects still need idempotency; terminal results do not create a dead-letter record automatically. The JetStream package guide documents a tested recipe that publishes to a dead-letter subject before returning `term`, and decode failures stay terminal unless `onDecodeFailure` chooses `retry`.
+Named processors support progress heartbeats, optional confirmed acknowledgements, and explicit delayed-retry or terminal handler results. Thrown handler errors remain terminal. External side effects still need idempotency; terminal results do not create a dead-letter record automatically. The JetStream package guide documents a tested recipe that publishes to a dead-letter subject before returning `term`, and decode failures stay terminal unless `onDecodeFailure` chooses `retry`. Decode error messages never include payload text.
 
 ## Roadmap
 
