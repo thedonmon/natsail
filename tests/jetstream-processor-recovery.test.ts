@@ -5,14 +5,14 @@ import {
   type ConsumerConfig,
   type Consumer,
   type ConsumerInfo,
-  type ConsumerMessages,
   type JsMsg,
 } from '@nats-io/jetstream'
-import type { NatsConnection } from '@nats-io/nats-core'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { createNatsRuntime, natsCodecs, type NatsailTelemetryEvent } from '@natsail/core'
+import { natsCodecs, type NatsailTelemetryEvent } from '@natsail/core'
 import { processJetStream } from '@natsail/jetstream'
+
+import { fakeConnectionRuntime, messageSource } from './fixtures/fakes'
 
 const jetStreamMocks = vi.hoisted(() => ({
   addConsumer: vi.fn(),
@@ -60,36 +60,6 @@ function message(sequence: number, value: string): JsMsg {
     redelivered: false,
     subject,
   } as unknown as JsMsg
-}
-
-function messageSource(
-  deliveries: readonly JsMsg[],
-  closedError?: Error,
-  stayOpen = false
-): ConsumerMessages {
-  let closeRequested = false
-  let finish!: () => void
-  const closeSignal = new Promise<void>((resolve) => {
-    finish = resolve
-  })
-
-  return {
-    async *[Symbol.asyncIterator]() {
-      for (const delivery of deliveries) {
-        if (closeRequested) break
-        yield delivery
-      }
-      if (stayOpen && !closeRequested) await closeSignal
-    },
-    close: vi.fn(async () => {
-      closeRequested = true
-      finish()
-    }),
-    closed: vi.fn(async () => closedError),
-    status: async function* () {
-      await closeSignal
-    },
-  } as unknown as ConsumerMessages
 }
 
 function consumer(
@@ -143,20 +113,7 @@ function consumerInfo(config: Partial<ConsumerConfig>): ConsumerInfo {
 }
 
 function runtime(telemetryEvents?: NatsailTelemetryEvent[], shutdownTimeoutMs?: number) {
-  let closeConnection!: () => void
-  const closed = new Promise<void>((resolve) => {
-    closeConnection = resolve
-  })
-  const connection = {
-    closed: () => closed,
-    drain: vi.fn(async () => closeConnection()),
-    close: vi.fn(async () => closeConnection()),
-    getServer: vi.fn(() => 'mock:4222'),
-    isClosed: vi.fn(() => false),
-    status: async function* () {},
-  } as unknown as NatsConnection
-  return createNatsRuntime({
-    connect: async () => connection,
+  return fakeConnectionRuntime({
     ...(shutdownTimeoutMs === undefined ? {} : { shutdownTimeoutMs }),
     ...(telemetryEvents === undefined
       ? {}

@@ -5,38 +5,10 @@ import {
   createNatsailTelemetryReporter,
   createNatsailWorkController,
   defineNatsailBatchPolicy,
-  type NatsailScheduledTask,
-  type NatsailScheduler,
   type NatsailTelemetryEvent,
 } from '@natsail/core'
 
-class ManualScheduler implements NatsailScheduler {
-  time = 0
-  yields = 0
-  private tasks: Array<{ at: number; cancelled: boolean; task: () => void }> = []
-
-  now(): number {
-    return this.time
-  }
-
-  schedule(task: () => void, delayMs: number): NatsailScheduledTask {
-    const scheduled = { at: this.time + delayMs, cancelled: false, task }
-    this.tasks.push(scheduled)
-    return { cancel: () => (scheduled.cancelled = true) }
-  }
-
-  async yield(): Promise<void> {
-    this.yields += 1
-  }
-
-  advance(ms: number): void {
-    this.time += ms
-    for (const scheduled of this.tasks.splice(0)) {
-      if (!scheduled.cancelled && scheduled.at <= this.time) scheduled.task()
-      else this.tasks.push(scheduled)
-    }
-  }
-}
+import { ManualScheduler } from './fixtures/fakes'
 
 describe('shared batching and cooperative work', () => {
   it('flushes by count and preserves serial application order', async () => {

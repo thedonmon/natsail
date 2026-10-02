@@ -1,14 +1,10 @@
 import type { Consumer, ConsumerMessages, JsMsg } from '@nats-io/jetstream'
-import type { NatsConnection } from '@nats-io/nats-core'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import {
-  createNatsRuntime,
-  natsCodecs,
-  type NatsailScheduledTask,
-  type NatsailScheduler,
-} from '@natsail/core'
+import { natsCodecs } from '@natsail/core'
 import { createReducingJetStreamSessionSource } from '@natsail/jetstream'
+
+import { fakeConnectionRuntime, ManualScheduler } from './fixtures/fakes'
 
 const mocks = vi.hoisted(() => ({
   getConsumer: vi.fn(),
@@ -43,25 +39,6 @@ function deferred() {
   let resolve!: () => void
   const promise = new Promise<void>((done) => (resolve = done))
   return { promise, resolve }
-}
-
-class ManualScheduler implements NatsailScheduler {
-  time = 0
-  tasks: Array<{ at: number; cancelled: boolean; task: () => void }> = []
-  now = () => this.time
-  yield = async () => undefined
-  schedule(task: () => void, delayMs: number): NatsailScheduledTask {
-    const scheduled = { at: this.time + delayMs, cancelled: false, task }
-    this.tasks.push(scheduled)
-    return { cancel: () => (scheduled.cancelled = true) }
-  }
-  advance(ms: number): void {
-    this.time += ms
-    for (const scheduled of this.tasks.splice(0)) {
-      if (!scheduled.cancelled && scheduled.at <= this.time) scheduled.task()
-      else this.tasks.push(scheduled)
-    }
-  }
 }
 
 function controlledMessages() {
@@ -110,18 +87,6 @@ function controlledMessages() {
   }
 }
 
-function runtime() {
-  const closed = deferred()
-  const connection = {
-    closed: () => closed.promise,
-    drain: vi.fn(async () => closed.resolve()),
-    getServer: () => 'mock:4222',
-    isClosed: () => false,
-    status: async function* () {},
-  } as unknown as NatsConnection
-  return createNatsRuntime({ connect: async () => connection })
-}
-
 async function turn(): Promise<void> {
   for (let index = 0; index < 64; index += 1) await Promise.resolve()
 }
@@ -140,7 +105,7 @@ describe('reducing JetStream batch barriers', () => {
       info: async () => ({ num_pending: 0 }),
       delete: async () => true,
     } as unknown as Consumer)
-    const active = runtime()
+    const active = fakeConnectionRuntime()
     const firstApplication = deferred()
     const snapshots: number[][] = []
     const source = createReducingJetStreamSessionSource(
@@ -189,7 +154,7 @@ describe('reducing JetStream batch barriers', () => {
       info: async () => ({ num_pending: 0 }),
       delete: async () => true,
     } as unknown as Consumer)
-    const active = runtime()
+    const active = fakeConnectionRuntime()
     const snapshots: number[][] = []
     const source = createReducingJetStreamSessionSource(
       active,
@@ -230,7 +195,7 @@ describe('reducing JetStream batch barriers', () => {
       info: async () => ({ num_pending: 0 }),
       delete: async () => true,
     } as unknown as Consumer)
-    const active = runtime()
+    const active = fakeConnectionRuntime()
     const scheduler = new ManualScheduler()
     const firstApplication = deferred()
     const snapshots: number[][] = []
@@ -278,7 +243,7 @@ describe('reducing JetStream batch barriers', () => {
       info: async () => ({ num_pending: 0 }),
       delete: async () => true,
     } as unknown as Consumer)
-    const active = runtime()
+    const active = fakeConnectionRuntime()
     const scheduler = new ManualScheduler()
     const application = deferred()
     const snapshots: number[][] = []
@@ -328,7 +293,7 @@ describe('reducing JetStream batch barriers', () => {
       info: async () => ({ num_pending: 2 }),
       delete: async () => true,
     } as unknown as Consumer)
-    const active = runtime()
+    const active = fakeConnectionRuntime()
     const snapshots: number[][] = []
     const source = createReducingJetStreamSessionSource(
       active,
@@ -367,7 +332,7 @@ describe('reducing JetStream batch barriers', () => {
       delete: async () => true,
     } as unknown as Consumer)
     mocks.checkpointSave.mockRejectedValueOnce(new Error('checkpoint unavailable'))
-    const active = runtime()
+    const active = fakeConnectionRuntime()
     const reduced: number[] = []
     const snapshots: number[][] = []
     const source = createReducingJetStreamSessionSource(
@@ -417,7 +382,7 @@ describe('reducing JetStream batch barriers', () => {
         info: async () => ({ num_pending: 0 }),
         delete: async () => true,
       } as unknown as Consumer)
-    const active = runtime()
+    const active = fakeConnectionRuntime()
     const snapshots: number[][] = []
     const source = createReducingJetStreamSessionSource(
       active,

@@ -5,11 +5,13 @@ import { act, createElement } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { describe, expect, it, vi } from 'vitest'
 
-import type { NatsRuntime, NatsRuntimeEvent, SubscriptionLease } from '@natsail/core'
+import type { NatsRuntime, SubscriptionLease } from '@natsail/core'
 import { makeNatsail } from '@natsail/effect'
 import { NatsProvider, useNatsSession } from '@natsail/react'
 import { observeNatsSessionValues } from '@natsail/rxjs'
 import { createCoreSessionSource, createSessionRegistry, defineSession } from '@natsail/session'
+
+import { emptyEvents } from './fixtures/fakes'
 
 describe('Effect, React, and RxJS adapter composition', () => {
   it('shares one validated source across a Stream, hook, and Observable', async () => {
@@ -79,8 +81,3 @@ describe('Effect, React, and RxJS adapter composition', () => {
   })
 })
 
-function emptyEvents(): AsyncIterable<NatsRuntimeEvent> {
-  return {
-    async *[Symbol.asyncIterator]() {},
-  }
-}

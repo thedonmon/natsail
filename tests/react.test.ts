@@ -26,6 +26,8 @@ import {
 } from '@natsail/session'
 import type { JetStreamStateSnapshot } from '@natsail/jetstream'
 
+import { emptyEvents } from './fixtures/fakes'
+
 function controllableSource<T>(): {
   source: SessionSource<T>
   deliver(value: T): Promise<void>
@@ -505,12 +507,6 @@ describe('React session adapter', () => {
     }
   })
 })
-
-function emptyEvents(): AsyncIterable<NatsRuntimeEvent> {
-  return {
-    async *[Symbol.asyncIterator]() {},
-  }
-}
 
 function controllableEvents(): {
   iterable: AsyncIterable<NatsRuntimeEvent>

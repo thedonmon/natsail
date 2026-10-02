@@ -8,12 +8,13 @@ import {
   type ConsumerMessages,
   type JsMsg,
 } from '@nats-io/jetstream'
-import type { NatsConnection } from '@nats-io/nats-core'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { CheckpointStore } from '@natsail/checkpoints'
 import { createNatsRuntime, natsCodecs, type NatsailTelemetryEvent } from '@natsail/core'
 import { consumeJetStream, processJetStream } from '@natsail/jetstream'
+
+import { fakeConnectionRuntime } from './fixtures/fakes'
 
 const mocks = vi.hoisted(() => ({
   addConsumer: vi.fn(),
@@ -97,19 +98,8 @@ function runtime(
   events: NatsailTelemetryEvent[],
   clock: { value: number }
 ): ReturnType<typeof createNatsRuntime> {
-  let finish!: () => void
-  const closed = new Promise<void>((resolve) => {
-    finish = resolve
-  })
-  const connection = {
-    closed: () => closed,
-    drain: vi.fn(async () => finish()),
-    getServer: () => 'nats://private.example',
-    isClosed: () => false,
-    status: async function* () {},
-  } as unknown as NatsConnection
-  return createNatsRuntime({
-    connect: async () => connection,
+  return fakeConnectionRuntime({
+    server: 'nats://private.example',
     telemetry: { record: (event) => events.push(event) },
     telemetryClock: { now: () => clock.value },
   })

@@ -13,6 +13,8 @@ import type {
 import { NatsProvider, useNatsJetStreamProcessor } from '@natsail/react'
 import { createSessionRegistry } from '@natsail/session'
 
+import { emptyEvents } from './fixtures/fakes'
+
 const mocks = vi.hoisted(() => ({
   processJetStream: vi.fn(),
 }))
@@ -313,8 +315,3 @@ function processorInspection(
   }
 }
 
-function emptyEvents(): AsyncIterable<never> {
-  return {
-    async *[Symbol.asyncIterator]() {},
-  }
-}
