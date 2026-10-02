@@ -8,6 +8,19 @@ pnpm add rxjs @natsail/core @natsail/session @natsail/jetstream @natsail/rxjs
 
 The adapter uses the framework-neutral session registry. React and RxJS consumers can share one source without a bridge package.
 
+`batchWithPolicy()` groups any Observable into arrays bounded by the same `NatsailBatchPolicy` that Core, React, and Effect use. The timer starts at the first value of a batch, so an idle subscription schedules nothing and never emits an empty array:
+
+```ts
+import { batchWithPolicy, observeNatsCoreSubscription } from '@natsail/rxjs'
+
+const batches$ = observeNatsCoreSubscription(sessions, runtime, 'tokens:room-1', {
+  subject: 'chat.tokens.room-1',
+  decode: decodeToken,
+}).pipe(batchWithPolicy({ maxItems: 500, maxWaitMs: 50 }))
+```
+
+A batch flushes when `maxItems` or `maxBytes` is reached, before a value that would overflow `maxBytes`, and when `maxWaitMs` elapses. Source completion and source errors flush the pending batch first. A `sizeOf` that throws or returns a negative or non-finite number, or one item larger than `maxBytes` (`NatsailBatchItemTooLargeError`), errors the stream and drops the pending batch, as unsubscribe does. The policy is validated when the operator is created. Pass `{ scheduler }` to use a custom RxJS scheduler.
+
 `observeNatsJetStreamSubscription()` emits full deliveries from the same keyed session that React hooks use. `observeNatsJetStreamReducer()` consumes the same validated atomic state definition as `useNatsJetStreamReducer()` and exposes exact session lifecycle snapshots.
 
 For rendering cumulative application state, prefer `observeNatsJetStreamState()`. It removes duplicate session-lifecycle notifications, emits replay and the first hydrated live state immediately, and coalesces subsequent cumulative live states to the latest value once per 16ms window:
