@@ -1,4 +1,4 @@
-import type { Consumer, JsMsg } from '@nats-io/jetstream'
+import { DeliverPolicy, type Consumer, type JsMsg } from '@nats-io/jetstream'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createMemoryCheckpointStore, type CheckpointStore } from '@natsail/checkpoints'
@@ -242,6 +242,10 @@ describe('JetStream duplicate-delivery policy', () => {
     await vi.waitFor(() => expect(jetStreamMocks.getConsumer).toHaveBeenCalledTimes(2))
     await vi.waitFor(() => expect(values).toEqual(['one', 'two']))
     expect(lease.inspect()).toMatchObject({ restarts: 1 })
+    expect(jetStreamMocks.getConsumer).toHaveBeenLastCalledWith(
+      stream,
+      expect.objectContaining({ deliver_policy: DeliverPolicy.StartSequence, opt_start_seq: 2 })
+    )
     await lease.close()
     await runtime.close()
   })
@@ -299,16 +303,15 @@ describe('JetStream duplicate-delivery policy', () => {
     await runtime.close()
   })
 
-  it('rejects a checkpoint created for another logical source', async () => {
-    arrangeConsumer([])
+  it.each([
+    ['logical source', { scope: '["events.other"]:decoder-v1' }, 'checkpoint-scope-mismatch'],
+    ['stream', { stream: 'OTHER_STREAM' }, 'checkpoint-stream-mismatch'],
+    ['stream epoch (a recreated stream)', { epoch: 'recreated-epoch' }, 'checkpoint-epoch-mismatch'],
+  ] as const)('rejects a checkpoint created for another %s', async (_name, checkpoint, code) => {
+    const { consumer } = arrangeConsumer([])
     const runtime = fakeConnectionRuntime()
     const store: CheckpointStore = {
-      load: async () => ({
-        stream,
-        epoch,
-        sequence: 2,
-        scope: '["events.other"]:decoder-v1',
-      }),
+      load: async () => ({ stream, epoch, sequence: 2, ...checkpoint }),
       save: async () => undefined,
       clear: async () => undefined,
     }
@@ -325,13 +328,14 @@ describe('JetStream duplicate-delivery policy', () => {
     )
 
     const expectedError = expect.objectContaining<Partial<JetStreamResumeError>>({
-      code: 'checkpoint-scope-mismatch',
+      code,
       checkpointSequence: 2,
     })
     await Promise.all([
       expect(lease.ready).rejects.toEqual(expectedError),
       expect(lease.closed).rejects.toEqual(expectedError),
     ])
+    expect(consumer.consume).not.toHaveBeenCalled()
     await runtime.close()
   })
 
