@@ -92,7 +92,8 @@ describe('JetStream failure handling and delivery headers', () => {
 
       await expect.poll(() => handled).toEqual(['good-2'])
       await expect.poll(() => ackFloor(manager, stream, consumer)).toBe(2)
-      expect(lease.inspect()).toMatchObject({ phase: 'live', handlerFailure: undefined })
+      expect(lease.inspect()).toMatchObject({ phase: 'live' })
+      expect(lease.inspect()).not.toHaveProperty('handlerFailure')
       expect(failures).toHaveLength(1)
       expect(failures[0]).toMatchObject({
         subject,
