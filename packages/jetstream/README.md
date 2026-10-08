@@ -85,6 +85,18 @@ When the runtime has a telemetry sink, this package reports replay duration and 
 
 The checkpoint scope includes normalized filters. Set `resume.scope` when a codec, decoder, or domain-model change must invalidate an old checkpoint.
 
+By default the checkpoint is saved after every delivery. For high-rate subjects such as streamed model tokens, set `resume.coalesce` to save at most once per window:
+
+```ts
+resume: {
+  key: 'conversation-123',
+  store: checkpoints,
+  coalesce: { maxWaitMs: 250, maxItems: 64 },
+}
+```
+
+The newest handled cursor is saved when either bound is reached, before `caughtUp` resolves, when the lease closes, and when it stops with an error. If the page closes or crashes between saves, the next open redelivers the deliveries handled since the last save, so the handler must tolerate repeats.
+
 See the [NATSail README](https://github.com/thedonmon/natsail#explicit-ack-processing-example) for the explicit-ack example and the separate ordered-consumer acknowledgement boundary.
 
 ## Long-running and failure-aware processors

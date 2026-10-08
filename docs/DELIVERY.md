@@ -26,6 +26,8 @@ Ordered consumers use `AckPolicy.None`. Their saved application cursor is not a 
 
 If a consumer has a resume configuration, NATSail saves its checkpoint after the handler succeeds. A failed handler does not advance the checkpoint.
 
+With `resume.coalesce`, NATSail saves the newest handled cursor once per item or time window, at catch-up, and when the lease stops. A crash between saves redelivers the deliveries handled since the last save.
+
 The checkpoint contains the stream name, stream epoch, sequence, and source scope. The epoch identifies a recreated stream.
 
 The source scope includes normalized filters and an optional application version. A mismatched scope stops resume with a typed error.

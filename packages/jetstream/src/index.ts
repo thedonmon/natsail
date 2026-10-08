@@ -241,6 +241,21 @@ export interface JetStreamResumeOptions {
   scope?: string
   /** Action when stream retention removed unprocessed sequences. Defaults to `error`. */
   retentionGapPolicy?: 'error' | 'continue'
+  /**
+   * Saves the checkpoint once per window instead of after every delivery.
+   * A restart can redeliver the deliveries handled since the last save.
+   */
+  coalesce?: JetStreamCheckpointCoalescing
+}
+
+/** At least one bound must be supplied. */
+export interface JetStreamCheckpointCoalescing {
+  /** Saves after this many handled deliveries. */
+  readonly maxItems?: number
+  /** Saves this long after the first unsaved delivery. */
+  readonly maxWaitMs?: number
+  /** Timer host for `maxWaitMs`. Defaults to the host scheduler. */
+  readonly scheduler?: NatsailScheduler
 }
 
 export type JetStreamResumeErrorCode =
@@ -656,6 +671,70 @@ function reportConsumerBufferSignal(
   })
 }
 
+/**
+ * Saves handled checkpoints in order. Without coalescing, every record waits
+ * for its save. With coalescing, only the newest pending checkpoint is saved
+ * when a bound is reached, on catch-up, and when the subscription stops.
+ */
+class CheckpointWriter {
+  private pending: StreamCheckpoint | undefined
+  private unsaved = 0
+  private timer: { cancel(): void } | undefined
+  private saving = Promise.resolve()
+  private failure: { error: unknown } | undefined
+
+  constructor(
+    private readonly telemetry: NatsailTelemetryReporter,
+    private readonly resume: JetStreamResumeOptions,
+    private readonly onTimedFailure: () => void
+  ) {}
+
+  async record(checkpoint: StreamCheckpoint): Promise<void> {
+    this.throwFailure()
+    const coalesce = this.resume.coalesce
+    this.pending = checkpoint
+    this.unsaved += 1
+    if (!coalesce || (coalesce.maxItems !== undefined && this.unsaved >= coalesce.maxItems)) {
+      await this.flush()
+      return
+    }
+    if (coalesce.maxWaitMs !== undefined && !this.timer) {
+      const scheduler = coalesce.scheduler ?? natsailDefaultScheduler
+      this.timer = scheduler.schedule(() => {
+        this.timer = undefined
+        void this.flush().catch(() => this.onTimedFailure())
+      }, coalesce.maxWaitMs)
+    }
+  }
+
+  /** Saves the pending checkpoint, then rejects if any earlier save failed. */
+  async flush(): Promise<void> {
+    this.timer?.cancel()
+    this.timer = undefined
+    const checkpoint = this.pending
+    this.pending = undefined
+    this.unsaved = 0
+    if (checkpoint) {
+      this.saving = this.saving.then(async () => {
+        if (this.failure) return
+        try {
+          await measureCheckpoint(this.telemetry, 'save', () =>
+            this.resume.store.save(this.resume.key, checkpoint)
+          )
+        } catch (error) {
+          this.failure = { error }
+        }
+      })
+    }
+    await this.saving
+    this.throwFailure()
+  }
+
+  private throwFailure(): void {
+    if (this.failure) markApplicationDeliveryFailure(this.failure.error)
+  }
+}
+
 interface JetStreamBatchHandlerControl {
   flush(): Promise<void>
   backpressure(): Promise<void> | undefined
@@ -739,6 +818,7 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
 
   private async start(runtime: NatsRuntime): Promise<void> {
     let abort: (() => void) | undefined
+    let checkpoints: CheckpointWriter | undefined
 
     try {
       const connection = await runtime.connection()
@@ -757,6 +837,9 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
         checkpoint = storedCheckpoint
         streamEpoch = streamInfo.created
         streamScope = checkpointScope(this.options)
+        checkpoints = new CheckpointWriter(this.telemetry, this.options.resume, () => {
+          void this.messages?.close().catch(() => undefined)
+        })
 
         if (checkpoint && checkpoint.stream !== this.options.stream) {
           throw new JetStreamResumeError(
@@ -912,21 +995,17 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
 
         const commitDelivery = async (handled?: Promise<void>) => {
           await handled
-          if (!duplicate && this.options.resume && streamEpoch) {
+          if (!duplicate && checkpoints && streamEpoch) {
             checkpoint = {
               stream: this.options.stream,
               epoch: streamEpoch,
               sequence: cursor.sequence,
               ...(streamScope === undefined ? {} : { scope: streamScope }),
             }
-            try {
-              await measureCheckpoint(this.telemetry, 'save', () =>
-                this.options.resume!.store.save(this.options.resume!.key, checkpoint!)
-              )
-            } catch (error) {
-              markApplicationDeliveryFailure(error)
-            }
+            await checkpoints.record(checkpoint)
           }
+          // Save before the last replayed delivery resolves `caughtUp`.
+          if (this.remaining === 1) await checkpoints?.flush()
           this.cursor = cursor
           this.advanceInitialReplay(cursor)
           if (!duplicate) committedSequence = cursor.sequence
@@ -975,6 +1054,7 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
         await this.batchControl.settled()
         await this.batchSettlement
       }
+      await checkpoints?.flush()
 
       const messageError = await this.messages.closed()
       if (messageError) {
@@ -987,6 +1067,8 @@ class JetStreamSubscription<T> implements JetStreamLease<T> {
       this.batchControl?.cancel()
       await this.batchControl?.settled()
       await this.batchSettlement
+      // Keep handled progress so a recovery attempt reopens after it.
+      await checkpoints?.flush().catch(() => undefined)
       this.error = error
       this.setPhase('error')
       if (!this.readySettled) {
@@ -1711,6 +1793,24 @@ class RecoveringJetStreamProcessor<T> implements JetStreamProcessorLease {
   }
 }
 
+function validateCheckpointCoalescing(coalesce: JetStreamCheckpointCoalescing): void {
+  if (coalesce.maxItems === undefined && coalesce.maxWaitMs === undefined) {
+    throw new TypeError('JetStream resume coalesce must define maxItems or maxWaitMs')
+  }
+  if (
+    coalesce.maxItems !== undefined &&
+    (!Number.isSafeInteger(coalesce.maxItems) || coalesce.maxItems <= 0)
+  ) {
+    throw new TypeError('JetStream resume coalesce maxItems must be a positive safe integer')
+  }
+  if (
+    coalesce.maxWaitMs !== undefined &&
+    (!Number.isFinite(coalesce.maxWaitMs) || coalesce.maxWaitMs <= 0)
+  ) {
+    throw new TypeError('JetStream resume coalesce maxWaitMs must be a positive finite number')
+  }
+}
+
 /**
  * Opens one ordered JetStream consumer for replay and live delivery.
  *
@@ -1728,6 +1828,7 @@ export function consumeJetStream<T>(
   if (options.resume?.scope !== undefined && options.resume.scope.length === 0) {
     throw new TypeError('JetStream resume scope must not be empty')
   }
+  if (options.resume?.coalesce) validateCheckpointCoalescing(options.resume.coalesce)
 
   if (
     options.duplicateDeliveryPolicy !== undefined &&
@@ -2090,6 +2191,12 @@ function sessionContract<T>(options: JetStreamSessionSourceOptions<T>): string {
     resumeKey: options.resume?.key ?? null,
     scope: options.resume?.scope ?? null,
     retentionGapPolicy: options.resume?.retentionGapPolicy ?? 'error',
+    checkpointCoalesce: options.resume?.coalesce
+      ? {
+          maxItems: options.resume.coalesce.maxItems ?? null,
+          maxWaitMs: options.resume.coalesce.maxWaitMs ?? null,
+        }
+      : null,
     recovery: options.recovery
       ? {
           scope: options.recovery.scope ?? null,
