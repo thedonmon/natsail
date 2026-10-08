@@ -1,5 +1,11 @@
 # @natsail/jetstream
 
+## 0.8.0
+
+### Minor Changes
+
+- 27beeff: Add `resume.coalesce` to `consumeJetStream` and JetStream sessions. It saves the checkpoint once per item or time window instead of after every delivery, which cuts IndexedDB writes on high-rate subjects such as streamed model tokens. The default still saves after every delivery.
+
 ## 0.7.0
 
 ### Minor Changes

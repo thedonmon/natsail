@@ -1,5 +1,12 @@
 # @natsail/effect
 
+## 0.7.1
+
+### Patch Changes
+
+- Updated dependencies [27beeff]
+  - @natsail/jetstream@0.8.0
+
 ## 0.7.0
 
 ### Minor Changes
