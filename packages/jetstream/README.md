@@ -95,7 +95,20 @@ resume: {
 }
 ```
 
-The newest handled cursor is saved when either bound is reached, before `caughtUp` resolves, when the lease closes, and when it stops with an error. If the page closes or crashes between saves, the next open redelivers the deliveries handled since the last save, so the handler must tolerate repeats.
+The newest handled cursor is saved when either bound is reached, before `caughtUp` resolves, when the lease closes, and when it stops with an error.
+
+Delivery is at-least-once either way: a page can close after a handler runs and before its save lands. Coalescing widens that window from one delivery to a few. Most handlers already cope, because they rebuild state from replay. A handler that appends to saved state should skip sequences it has already applied:
+
+```ts
+async ({ value, cursor }) => {
+  const draft = await drafts.get(value.messageId)
+  if (draft && draft.sequence >= cursor.sequence) return // applied before the reload
+  await drafts.put(value.messageId, {
+    text: (draft?.text ?? '') + value.delta,
+    sequence: cursor.sequence,
+  })
+}
+```
 
 See the [NATSail README](https://github.com/thedonmon/natsail#explicit-ack-processing-example) for the explicit-ack example and the separate ordered-consumer acknowledgement boundary.
 
