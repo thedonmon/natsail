@@ -10,6 +10,9 @@ export default defineConfig({
   testDir: './tests/browser',
   testMatch: 'shared-worker.spec.ts',
   fullyParallel: false,
+  // Every browser project uses the same NATS subjects, so parallel projects
+  // receive each other's messages.
+  workers: 1,
   reporter: process.env.CI ? 'github' : 'list',
   use: {
     baseURL: `http://127.0.0.1:${port}`,
