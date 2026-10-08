@@ -32,7 +32,8 @@ No model, route, external API, or API key is required. The local responder uses 
 - The browser restores its stable client ID, selected framework, messages, and active-run identity after a page reload.
 - The AI SDK adapter implements `reconnectToStream()` and replays the complete retained run from its native `start` event.
 - The TanStack AI adapter persists messages and continues strictly after its IndexedDB checkpoint.
-- `consumeJetStream()` checkpoints each native frame only after the framework adapter processes it and resumes strictly after that cursor.
+- The responder publishes the first three chunks of a reply right away, then batches the chunks from each 120 ms window into one frame. Each JetStream frame has a one-hour per-message TTL, so finished replies expire without a stream-wide `max_age`.
+- `consumeJetStream()` checkpoints each native frame only after the framework adapter processes it and resumes strictly after that cursor. The example keeps one save per frame because TanStack page recovery depends on an exact checkpoint.
 - Closing and recreating the ordered consumer during an active answer recovers frames retained during the two-second gap without replacing already-rendered messages.
 - `start: "all"` reconstructs earlier application-level conversation messages; the native reply consumers use `start: "new"` until a checkpoint exists.
 - Filtered consumers expose global stream-sequence units, including jumps caused by other filtered subjects.

@@ -44,9 +44,10 @@ export interface PageRecoveryState {
 
 export type PageRecoveryListener = (state: PageRecoveryState) => void
 
+/** The responder buffers chunks, so one frame carries one or more of them. */
 interface WireChunkFrame {
-  type: 'chunk'
-  chunk: unknown
+  type: 'chunks'
+  chunks: unknown[]
   publishedAt?: number
 }
 
@@ -67,7 +68,7 @@ const jsonCodec = natsCodecs.json<unknown>()
 const decodeWireFrame = (value: unknown): WireFrame => {
   if (!value || typeof value !== 'object') throw new Error('Invalid AI transport frame')
   const frame = value as Partial<WireFrame>
-  if (frame.type === 'chunk' && 'chunk' in frame) return frame as WireChunkFrame
+  if (frame.type === 'chunks' && Array.isArray(frame.chunks)) return frame as WireChunkFrame
   if (frame.type === 'end') return frame as WireEndFrame
   if (frame.type === 'error' && typeof frame.message === 'string') return frame as WireErrorFrame
   throw new Error('Unknown AI transport frame')
@@ -186,18 +187,19 @@ export class NatsAiSdkChatTransport<UI_MESSAGE extends UIMessage = UIMessage>
     return new ReadableStream<UIMessageChunk>({
       start: async (controller) => {
         const handleFrame = async (frame: WireFrame, metadata: DeliveryMetadata) => {
-          if (frame.type === 'chunk') {
-            const chunk = frame.chunk as UIMessageChunk
-            this.onReceipt?.({
-              framework: 'ai-sdk',
-              delivery: this.delivery,
-              direction: 'receive',
-              event: eventType(chunk),
-              subject: replySubject,
-              ...metadata,
-              ...(frame.publishedAt === undefined ? {} : { publishedAt: frame.publishedAt }),
-            })
-            controller.enqueue(chunk)
+          if (frame.type === 'chunks') {
+            for (const chunk of frame.chunks as UIMessageChunk[]) {
+              this.onReceipt?.({
+                framework: 'ai-sdk',
+                delivery: this.delivery,
+                direction: 'receive',
+                event: eventType(chunk),
+                subject: replySubject,
+                ...metadata,
+                ...(frame.publishedAt === undefined ? {} : { publishedAt: frame.publishedAt }),
+              })
+              controller.enqueue(chunk)
+            }
             return
           }
           if (frame.type === 'error') {
@@ -347,18 +349,19 @@ export class NatsAiSdkChatTransport<UI_MESSAGE extends UIMessage = UIMessage>
                   firstRecoveredSequence,
                 })
               }
-              if (frame.type === 'chunk') {
-                const chunk = frame.chunk as UIMessageChunk
-                this.onReceipt?.({
-                  framework: 'ai-sdk',
-                  delivery: this.delivery,
-                  direction: 'receive',
-                  event: eventType(chunk),
-                  subject: activeRun.replySubject,
-                  ...metadata,
-                  ...(frame.publishedAt === undefined ? {} : { publishedAt: frame.publishedAt }),
-                })
-                controller.enqueue(chunk)
+              if (frame.type === 'chunks') {
+                for (const chunk of frame.chunks as UIMessageChunk[]) {
+                  this.onReceipt?.({
+                    framework: 'ai-sdk',
+                    delivery: this.delivery,
+                    direction: 'receive',
+                    event: eventType(chunk),
+                    subject: activeRun.replySubject,
+                    ...metadata,
+                    ...(frame.publishedAt === undefined ? {} : { publishedAt: frame.publishedAt }),
+                  })
+                  controller.enqueue(chunk)
+                }
               } else if (frame.type === 'error') {
                 clearActiveRun('ai-sdk', this.delivery)
                 controller.error(new Error(frame.message))
@@ -496,18 +499,19 @@ export class NatsTanStackConnection implements SubscribeConnectionAdapter {
             firstRecoveredSequence: this.firstRecoveredSequence,
           })
         }
-        if (frame.type === 'chunk') {
-          const chunk = frame.chunk as StreamChunk
-          this.onReceipt?.({
-            framework: 'tanstack-ai',
-            delivery: this.delivery,
-            direction: 'receive',
-            event: eventType(chunk),
-            subject: this.replySubject,
-            ...metadata,
-            ...(frame.publishedAt === undefined ? {} : { publishedAt: frame.publishedAt }),
-          })
-          this.queue.push(chunk)
+        if (frame.type === 'chunks') {
+          for (const chunk of frame.chunks as StreamChunk[]) {
+            this.onReceipt?.({
+              framework: 'tanstack-ai',
+              delivery: this.delivery,
+              direction: 'receive',
+              event: eventType(chunk),
+              subject: this.replySubject,
+              ...metadata,
+              ...(frame.publishedAt === undefined ? {} : { publishedAt: frame.publishedAt }),
+            })
+            this.queue.push(chunk)
+          }
         } else if (frame.type === 'error') {
           clearActiveRun('tanstack-ai', this.delivery)
           this.queue.fail(new Error(frame.message))

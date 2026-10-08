@@ -21,6 +21,8 @@ const responseStreamSubjects = 'natsail.examples.ai.responses.jetstream.>'
 const conversationStream = 'NATSAIL_AI_CONVERSATIONS'
 const conversationSubject = 'natsail.examples.ai.conversations.release-room'
 const jsonCodec = natsCodecs.json()
+const replyBuffer = { immediateChunks: 3, windowMs: 120 }
+const replyTtl = '1h'
 const gatewayPrompt = 'Help me plan the gateway release.'
 const reconnectPrompt = "What happens if the connection drops while you're answering?"
 
@@ -125,14 +127,55 @@ const publishFrame = async (subject, frame, delivery) => {
   if (stopping) return
   const data = jsonCodec.encode({ ...frame, publishedAt: Date.now() })
   if (delivery === 'jetstream') {
-    await responderJetStream.publish(subject, data)
+    // Reply frames only matter while a browser can still resume the run.
+    await responderJetStream.publish(subject, data, { ttl: replyTtl })
   } else {
     responder.publish(subject, data)
   }
 }
 
+// Publishing every model chunk as its own message multiplies broker traffic.
+// Send the first few right away so the first words appear quickly, then send
+// whatever arrived during each window as one frame.
+const createReplyWriter = (subject, delivery) => {
+  let written = 0
+  let pending = []
+  let timer
+  let publishing = Promise.resolve()
+  let failure
+
+  const flush = () => {
+    clearTimeout(timer)
+    timer = undefined
+    if (pending.length > 0) {
+      const chunks = pending
+      pending = []
+      publishing = publishing
+        .then(() => publishFrame(subject, { type: 'chunks', chunks }, delivery))
+        .catch((error) => {
+          failure ??= error
+        })
+    }
+    return publishing.then(() => {
+      if (failure) throw failure
+    })
+  }
+
+  return {
+    async write(chunk) {
+      if (failure) throw failure
+      pending.push(chunk)
+      written += 1
+      if (written <= replyBuffer.immediateChunks) await flush()
+      else timer ??= setTimeout(() => void flush().catch(() => undefined), replyBuffer.windowMs)
+    },
+    flush,
+  }
+}
+
 const handleRequest = async (message) => {
   let request
+  let reply
   try {
     request = jsonCodec.decode(message.data)
     if (!request || typeof request.replySubject !== 'string') {
@@ -142,14 +185,13 @@ const handleRequest = async (message) => {
       throw new Error(`Unknown delivery mode ${String(request.delivery)}`)
     }
 
+    reply = createReplyWriter(request.replySubject, request.delivery)
     if (request.framework === 'ai-sdk') {
       const stream = await aiSdkTransports[request.delivery].sendMessages({
         ...request.payload,
         abortSignal: undefined,
       })
-      for await (const chunk of stream) {
-        await publishFrame(request.replySubject, { type: 'chunk', chunk }, request.delivery)
-      }
+      for await (const chunk of stream) await reply.write(chunk)
     } else if (request.framework === 'tanstack-ai') {
       const stream = tanStackTransports[request.delivery].connect(
         request.payload.messages,
@@ -157,19 +199,19 @@ const handleRequest = async (message) => {
         undefined,
         request.payload.runContext
       )
-      for await (const chunk of stream) {
-        await publishFrame(request.replySubject, { type: 'chunk', chunk }, request.delivery)
-      }
+      for await (const chunk of stream) await reply.write(chunk)
     } else {
       throw new Error(`Unknown framework ${String(request.framework)}`)
     }
 
+    await reply.flush()
     await publishFrame(request.replySubject, { type: 'end' }, request.delivery)
     if (!stopping) await responder.flush()
   } catch (error) {
     if (stopping) return
     if (request?.replySubject) {
       try {
+        await reply?.flush().catch(() => undefined)
         await publishFrame(
           request.replySubject,
           {
@@ -236,15 +278,19 @@ try {
 
   responder = await connect({ servers: 'nats://127.0.0.1:4223' })
   responderManager = await jetstreamManager(responder)
-  try {
-    await responderManager.streams.info(responseStream)
-  } catch {
+  const responseInfo = await responderManager.streams
+    .info(responseStream)
+    .catch(() => undefined)
+  if (!responseInfo) {
     await responderManager.streams.add({
       name: responseStream,
       subjects: [responseStreamSubjects],
       storage: StorageType.Memory,
+      allow_msg_ttl: true,
     })
     createdResponseStream = true
+  } else if (!responseInfo.config.allow_msg_ttl) {
+    await responderManager.streams.update(responseStream, { allow_msg_ttl: true })
   }
   let conversationInfo
   try {
